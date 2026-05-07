@@ -6,7 +6,7 @@ from fastapi import FastAPI
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
-# Setup Path: Memastikan folder 'module' terbaca sebagai package
+# Setup Path: Memastikan folder 'modules' terbaca sebagai package
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
@@ -37,10 +37,11 @@ def check_system():
 
 def load_modules():
     """Import router dari ytdl.py dan igdl.py secara dinamis."""
+    # Pastikan folder di GitHub/Local lo namanya 'modules'
     for mod_name in ["ytdl", "igdl"]:
         try:
-            # Gunakan importlib untuk menghindari masalah cache
-            module = importlib.import_module(f"module.{mod_name}")
+            # UPDATE: Menggunakan 'modules' bukan 'module'
+            module = importlib.import_module(f"modules.{mod_name}")
             if hasattr(module, "router"):
                 app.include_router(module.router)
                 status_module["modules"][mod_name] = "Success"
