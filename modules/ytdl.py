@@ -2,7 +2,11 @@ import os
 import yt_dlp
 import uuid
 import random
+import subprocess
+import tempfile
+import requests
 from fastapi import APIRouter
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/extract")
@@ -61,22 +65,7 @@ def extract_video_logic(url: str):
             mp4_formats = []
             seen = set()
 
-            for f in sorted(video_only, key=lambda x: x.get('height') or 0, reverse=True):
-                height = f.get('height') or 0
-                res = f"{height}p" if height > 0 else "hd"
-                if res in seen:
-                    continue
-                seen.add(res)
-                mp4_formats.append({
-                    "resolution": res,
-                    "ext": "mp4",
-                    "video_url": f.get('url'),
-                    "audio_url": best_audio.get('url') if best_audio else None,
-                    "needs_mux": best_audio is not None,
-                    "note": "mp4",
-                    "height": height,
-                })
-
+            # Combined dulu (video+audio langsung)
             for f in sorted(combined, key=lambda x: x.get('height') or 0, reverse=True):
                 height = f.get('height') or 0
                 res = f"{height}p" if height > 0 else "hd"
@@ -89,6 +78,23 @@ def extract_video_logic(url: str):
                     "video_url": f.get('url'),
                     "audio_url": None,
                     "needs_mux": False,
+                    "note": "mp4",
+                    "height": height,
+                })
+
+            # Video-only + best_audio (perlu mux)
+            for f in sorted(video_only, key=lambda x: x.get('height') or 0, reverse=True):
+                height = f.get('height') or 0
+                res = f"{height}p" if height > 0 else "hd"
+                if res in seen:
+                    continue
+                seen.add(res)
+                mp4_formats.append({
+                    "resolution": res,
+                    "ext": "mp4",
+                    "video_url": f.get('url'),
+                    "audio_url": best_audio.get('url') if best_audio else None,
+                    "needs_mux": best_audio is not None,
                     "note": "mp4",
                     "height": height,
                 })
@@ -139,6 +145,46 @@ def extract_video_logic(url: str):
             return {"success": False, "error": "unavailable", "message": "video tidak tersedia atau sudah dihapus"}
 
         return {"success": False, "error": "fault", "message": err[:150]}
+
+
+class MuxRequest(BaseModel):
+    video_url: str
+    audio_url: str
+    resolution: str
+
+@router.post("/mux")
+async def mux_video(request: MuxRequest):
+    tmp_dir = tempfile.mkdtemp()
+    output_path = os.path.join(tmp_dir, f"output_{request.resolution}.mp4")
+
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", request.video_url,
+            "-i", request.audio_url,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            output_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode != 0:
+            return {"success": False, "error": "mux_failed", "message": result.stderr[-200:]}
+
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename=f"video_{request.resolution}.mp4",
+            background=None
+        )
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "timeout", "message": "ffmpeg timeout"}
+    except Exception as e:
+        return {"success": False, "error": "fault", "message": str(e)[:150]}
+
 
 @router.post("/ytdl")
 async def handle_ytdl(request: VideoRequest):
