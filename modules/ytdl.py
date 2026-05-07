@@ -51,7 +51,7 @@ def extract_video_logic(url: str):
     target_url = url.strip()
     if '/shorts/' in target_url:
         target_url = target_url.replace('/shorts/', '/watch?v=')
-    
+
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(target_url, download=False)
@@ -65,19 +65,15 @@ def extract_video_logic(url: str):
             mp4_formats = []
             seen_res = set()
             video_formats = [f for f in raw_formats if f.get('vcodec') != 'none']
-            
-            # Sortir berdasarkan resolusi asli (H x W)
+
             for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('width') or 0, x.get('tbr') or 0), reverse=True):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
-                if h == 0 or w == 0: continue
-                
-                # DETEKSI VERTIKAL
+                if h == 0 or w == 0:
+                    continue
+
                 is_vertical = h > w
-                
-                # PENENTUAN LABEL BERDASARKAN SISI TERPENDEK (Agar 720p gak jadi 1080p)
                 short_side = w if is_vertical else h
-                long_side = h if is_vertical else w
 
                 if short_side >= 2160: base_label = f"4K ({short_side}p)"
                 elif short_side >= 1440: base_label = f"2K ({short_side}p)"
@@ -88,11 +84,12 @@ def extract_video_logic(url: str):
                 orientation = "Vertical " if is_vertical else ""
                 res_label = f"{orientation}{base_label}"
 
-                if res_label in seen_res: continue
+                if res_label in seen_res:
+                    continue
                 seen_res.add(res_label)
 
                 is_combined = f.get('acodec') != 'none' and f.get('acodec') != 'unknown'
-                
+
                 mp4_formats.append({
                     "resolution": res_label,
                     "video_url": f.get('url'),
@@ -106,14 +103,17 @@ def extract_video_logic(url: str):
             return {
                 "success": True,
                 "title": info.get('title'),
+                "uploader": info.get('uploader') or info.get('channel') or info.get('creator') or None,
                 "duration": info.get('duration_string'),
                 "thumbnail": info.get('thumbnail'),
                 "mp4_formats": mp4_formats[:12],
                 "mp3_formats": [{"quality": "HQ", "audio_url": f.get('url')} for f in audio_only[:2]],
                 "platform": info.get('extractor_key'),
             }
+
     except Exception as e:
         return {"success": False, "message": str(e)[:150]}
+
 
 @router.post("/mux")
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
@@ -121,25 +121,24 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     output_path = os.path.join(tmp_dir, "output.mp4")
     background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
     try:
-        # Gunakan pemetaan stream yang ketat agar orientasi tidak berubah
         cmd = [
-            "ffmpeg", "-y", 
-            "-i", request.video_url, 
-            "-i", request.audio_url, 
-            "-c:v", "copy", 
-            "-c:a", "aac", 
-            "-map", "0:v:0", 
-            "-map", "1:a:0", 
-            "-shortest", 
+            "ffmpeg", "-y",
+            "-i", request.video_url,
+            "-i", request.audio_url,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
             output_path
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
-        
-        # Nama file hasil download akan menyertakan resolusi asli
+
         filename = f"video_{request.resolution.replace(' ', '_')}.mp4"
         return FileResponse(output_path, media_type="video/mp4", filename=filename)
     except Exception as e:
         return {"success": False, "message": str(e)}
+
 
 @router.post("/ytdl")
 async def handle_ytdl(request: VideoRequest):
