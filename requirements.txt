@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic
+yt-dlp
+requests
+python-multipart
+# instaloader (Saran: Hapus saja, pakai yt-dlp untuk IG biar satu pintu)
