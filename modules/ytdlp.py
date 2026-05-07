@@ -30,19 +30,18 @@ def get_ydl_opts():
         'skip_download': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'socket_timeout': 20,
-        'retries': 5,
-        # Mengutamakan format mp4 agar lebih kompatibel
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'socket_timeout': 30,
+        'retries': 10,
+        # Mengizinkan format video terbaik tanpa batas resolusi
+        'format': 'bestvideo+bestaudio/best',
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios', 'web'],
             }
         },
         'http_headers': {
-            'User-Agent': f'Mozilla/5.0 (iPhone; CPU iPhone OS 17_{random.randint(0,5)} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
-            'X-IG-Device-ID': generate_random_device_id(),
         }
     }
 
@@ -52,115 +51,79 @@ def extract_video_logic(url: str):
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                return {"success": False, "error": "empty data"}
+                return {"success": False, "error": "No data found"}
 
-            raw_formats = info.get('formats', []) or [info]
+            raw_formats = info.get('formats', [])
             
-            # Pisahkan format
+            # Ambil audio terbaik (M4A/MP4 audio biasanya paling stabil buat dimux)
             audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-            best_audio = next(iter(sorted(audio_only, key=lambda x: x.get('abr') or 0, reverse=True)), None)
+            best_audio = next(iter(sorted(audio_only, key=lambda x: (x.get('abr') or 0, x.get('tbr') or 0), reverse=True)), None)
 
             mp4_formats = []
             seen_res = set()
 
-            # 1. Prioritaskan format yang sudah ada Video + Audio (Langsung bunyi)
-            combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-            for f in sorted(combined, key=lambda x: x.get('height') or 0, reverse=True):
+            # Sortir semua format video dari yang tertinggi (8K -> 4K -> 1080p -> dst)
+            video_formats = [f for f in raw_formats if f.get('vcodec') != 'none']
+            
+            for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True):
                 height = f.get('height') or 0
-                res = f"{height}p" if height > 0 else "hd"
-                if res in seen_res: continue
-                seen_res.add(res)
+                if height == 0: continue
+                
+                # Labeling Resolusi (4K, 2K, 1080p, dll)
+                if height >= 2160: res_label = "4K (2160p)"
+                elif height >= 1440: res_label = "2K (1440p)"
+                elif height >= 1080: res_label = "1080p"
+                elif height >= 720: res_label = "720p"
+                else: res_label = f"{height}p"
+
+                fps = f.get('fps')
+                if fps and fps > 30:
+                    res_label += f" {int(fps)}fps"
+
+                if res_label in seen_res: continue
+                seen_res.add(res_label)
+
+                # Cek apakah sudah ada audio bawaan (biasanya cuma ada di 720p kebawah)
+                is_combined = f.get('acodec') != 'none' and f.get('acodec') != 'unknown'
+                
                 mp4_formats.append({
-                    "resolution": res,
+                    "resolution": res_label,
                     "ext": "mp4",
                     "video_url": f.get('url'),
-                    "audio_url": None,
-                    "needs_mux": False, # Ini langsung ada suaranya
-                    "note": "direct",
+                    "audio_url": None if is_combined else (best_audio.get('url') if best_audio else None),
+                    "needs_mux": not is_combined,
+                    "note": f"{f.get('vcodec', 'video')} | {'Direct' if is_combined else 'High Quality (Mux)'}",
                     "height": height
-                })
-
-            # 2. Ambil Video Only yang resolusinya belum ada di 'combined'
-            video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
-            for f in sorted(video_only, key=lambda x: x.get('height') or 0, reverse=True):
-                height = f.get('height') or 0
-                res = f"{height}p" if height > 0 else "hd"
-                if res in seen_res: continue
-                seen_res.add(res)
-                mp4_formats.append({
-                    "resolution": res,
-                    "ext": "mp4",
-                    "video_url": f.get('url'),
-                    "audio_url": best_audio.get('url') if best_audio else None,
-                    "needs_mux": True, # Perlu panggil endpoint /mux biar ada suara
-                    "note": "needs_mux",
-                    "height": height
-                })
-
-            mp4_formats.sort(key=lambda x: x['height'], reverse=True)
-
-            # MP3 Formats
-            mp3_formats = []
-            seen_abr = set()
-            for f in sorted(audio_only, key=lambda x: x.get('abr') or 0, reverse=True):
-                abr = int(f.get('abr') or 0)
-                label = f"{abr}kbps" if abr > 0 else "audio"
-                if label in seen_abr: continue
-                seen_abr.add(label)
-                mp3_formats.append({
-                    "resolution": label,
-                    "ext": "mp3",
-                    "audio_url": f.get('url'),
-                    "note": "mp3"
                 })
 
             return {
                 "success": True,
                 "title": info.get('title'),
+                "duration": info.get('duration_string'),
                 "thumbnail": info.get('thumbnail'),
-                "mp4_formats": mp4_formats[:10],
-                "mp3_formats": mp3_formats[:5],
+                "mp4_formats": mp4_formats[:15], # Nampilin lebih banyak opsi sampai resolusi terendah
+                "mp3_formats": [
+                    {
+                        "quality": f"{int(f.get('abr', 0))}kbps" if f.get('abr') else "HQ",
+                        "url": f.get('url'),
+                    } for f in audio_only[:3]
+                ],
                 "platform": info.get('extractor_key'),
             }
     except Exception as e:
-        return {"success": False, "message": str(e)[:150]}
+        return {"success": False, "message": str(e)}
 
-def remove_temp_dir(path: str):
-    import shutil
-    if os.path.exists(path):
-        shutil.rmtree(path)
-
+# --- Endpoint Mux tetap sama ---
 @router.post("/mux")
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     tmp_dir = tempfile.mkdtemp()
-    output_path = os.path.join(tmp_dir, f"result_{uuid.uuid4().hex[:8]}.mp4")
-    # Hapus folder temp setelah kirim file
-    background_tasks.add_task(remove_temp_dir, tmp_dir)
-
+    output_path = os.path.join(tmp_dir, f"wartha_res.mp4")
+    background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
     try:
-        # Gunakan filter aac agar kompatibel di semua HP
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", request.video_url,
-            "-i", request.audio_url,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-strict", "experimental",
-            "-shortest",
-            output_path
-        ]
-        
-        # Penambahan timeout lebih lama buat video durasi panjang
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        
-        if process.returncode != 0:
-            return {"success": False, "error": "FFmpeg error", "log": process.stderr[-200:]}
-
-        return FileResponse(
-            output_path,
-            media_type="video/mp4",
-            filename=f"wartha_{request.resolution}.mp4"
-        )
+        # Gunakan -shortest biar durasi audio gak kelebihan dari video
+        cmd = ["ffmpeg", "-y", "-i", request.video_url, "-i", request.audio_url, "-c:v", "copy", "-c:a", "aac", "-shortest", output_path]
+        subprocess.run(cmd, capture_output=True, timeout=300)
+        return FileResponse(output_path, media_type="video/mp4", filename=f"video_{request.resolution}.mp4")
     except Exception as e:
         return {"success": False, "message": str(e)}
 
