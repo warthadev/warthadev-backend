@@ -1,4 +1,4 @@
-import oss
+import os
 import yt_dlp
 import uuid
 import random
