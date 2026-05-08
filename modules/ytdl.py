@@ -36,8 +36,8 @@ def get_ydl_opts():
         'format': 'bestvideo+bestaudio/best',
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv', 'ios', 'android', 'mweb'],
-                'skip': ['dash', 'hls'],
+                # Fokus ke iOS untuk menghindari 'Sign in to confirm you are not a bot'
+                'player_client': ['ios'], 
             }
         },
         'http_headers': {
@@ -60,24 +60,28 @@ def extract_video_logic(url: str):
 
             raw_formats = info.get('formats', [])
             
-            # Deteksi audio: Mencari stream yang tidak memiliki video (acodec ok, vcodec none/null)
+            # Deteksi audio murni
             audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and (f.get('vcodec') == 'none' or f.get('vcodec') is None)]
             best_audio = next(iter(sorted(audio_only, key=lambda x: (x.get('abr') or 0), reverse=True)), None)
 
             mp4_formats = []
             seen_res = set()
             
-            # Filter Video: Mengambil semua format yang memiliki resolusi tinggi (height)
-            # Ini memperbaiki masalah format 0 pada banyak situs non-YouTube
-            video_formats = [f for f in raw_formats if f.get('height') is not None]
+            # Filter Video Universal: Support height 0 (FB) dan vcodec non-none
+            video_formats = [f for f in raw_formats if f.get('height') is not None or f.get('vcodec') != 'none']
 
             for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
                 
-                if h == 0: continue
+                # Fallback Resolusi untuk Facebook (HD/SD)
+                if h == 0:
+                    format_id = (f.get('format_id') or '').lower()
+                    if 'hd' in format_id: h = 720
+                    elif 'sd' in format_id: h = 360
+                    else: continue
 
-                # Penentuan Label Resolusi
+                # Penentuan Label
                 if h >= 2160: base_label = "4K"
                 elif h >= 1440: base_label = "2K"
                 elif h >= 1080: base_label = "1080p FHD"
@@ -92,7 +96,7 @@ def extract_video_logic(url: str):
                     continue
                 seen_res.add(res_label)
 
-                # Cek apakah format sudah "Combined" (Video + Audio jadi satu)
+                # Cek apakah sudah Combined (Video + Audio)
                 has_audio = f.get('acodec') not in [None, 'none', 'unknown']
 
                 mp4_formats.append({
@@ -112,7 +116,7 @@ def extract_video_logic(url: str):
                 "duration": info.get('duration_string'),
                 "thumbnail": info.get('thumbnail'),
                 "mp4_formats": mp4_formats[:12],
-                "mp3_formats": [{"quality": f"HQ ({f.get('abr', 0)}kbps)" if f.get('abr') else "HQ", "audio_url": f.get('url')} for f in audio_only[:2]],
+                "mp3_formats": [{"quality": "HQ", "audio_url": f.get('url')} for f in audio_only[:2]],
                 "platform": info.get('extractor_key'),
             }
 
@@ -124,8 +128,6 @@ def extract_video_logic(url: str):
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     tmp_dir = tempfile.mkdtemp()
     output_path = os.path.join(tmp_dir, "output.mp4")
-    
-    # Cleanup task
     background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
     
     try:
@@ -141,7 +143,6 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
             output_path
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
-
         filename = f"video_{request.resolution.replace(' ', '_')}.mp4"
         return FileResponse(output_path, media_type="video/mp4", filename=filename)
     except Exception as e:
