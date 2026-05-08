@@ -24,8 +24,8 @@ class MuxRequest(BaseModel):
 
 def get_ydl_opts():
     user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     ]
     return {
         'quiet': True,
@@ -36,34 +36,35 @@ def get_ydl_opts():
         'socket_timeout': 30,
         'retries': 5,
         'format': 'bestvideo+bestaudio/best',
-        # Menambahkan dukungan cookies agar FB tidak memblokir bot (opsional)
-        # 'cookiefile': 'cookies.txt', 
         'http_headers': {
             'User-Agent': random.choice(user_agents),
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.facebook.com/',
         }
     }
 
 def extract_video_logic(url: str):
     target_url = url.strip()
     
-    # --- LOGIKA KHUSUS FACEBOOK & UNIVERSAL CLEANING ---
-    # 1. Tangani link shorts YouTube
+    # --- LOGIKA PEMBERSIHAN URL ---
     if '/shorts/' in target_url:
         target_url = target_url.replace('/shorts/', '/watch?v=')
     
-    # 2. Tangani FB Share/Reels agar tidak terbaca 'Generic'
-    # Hapus parameter tracking (fbclid, d, dll) agar URL bersih
-    if 'facebook.com' in target_url or 'fb.watch' in target_url:
+    # Pembersihan parameter sampah (tracking)
+    if 'facebook.com' in target_url or 'tiktok.com' in target_url:
         target_url = target_url.split('?')[0]
 
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            # Ekstraksi pertama
+        opts = get_ydl_opts()
+        
+        # Tambahkan referer dinamis jika mendeteksi tiktok
+        if 'tiktok.com' in target_url:
+            opts['http_headers']['Referer'] = 'https://www.tiktok.com/'
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            # Ekstraksi informasi
             info = ydl.extract_info(target_url, download=False)
             
-            # Jika terdeteksi 'Generic' (biasanya pada link redirect), ambil URL asli dari info
+            # Re-ekstraksi jika link TikTok masih berupa redirect/generic
             if info.get('extractor_key') == 'Generic' and info.get('url'):
                 info = ydl.extract_info(info.get('url'), download=False)
 
@@ -84,7 +85,7 @@ def extract_video_logic(url: str):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
                 
-                # Penentu resolusi berdasarkan sisi terpendek (Fix Portrait/Landscape)
+                # Sisi terpendek sebagai penentu label (Fix Portrait TikTok)
                 shorter_side = min(w, h) if w > 0 and h > 0 else h
 
                 if h == 0:
@@ -93,7 +94,7 @@ def extract_video_logic(url: str):
                     elif 'sd' in format_id: shorter_side = 360
                     else: continue
 
-                # Labeling Resolusi
+                # Labeling
                 if shorter_side >= 2160: res_label = "4K"
                 elif shorter_side >= 1440: res_label = "2K"
                 elif shorter_side >= 1080: res_label = "1080p FHD"
@@ -151,7 +152,6 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
         
-        # Nama file rapi (Judul + Resolusi)
         clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
         
