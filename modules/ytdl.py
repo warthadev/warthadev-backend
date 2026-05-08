@@ -23,9 +23,11 @@ class MuxRequest(BaseModel):
     title: str
 
 def get_ydl_opts():
+    # User agent terbaru untuk mengelabui deteksi bot
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1'
     ]
     return {
         'quiet': True,
@@ -39,37 +41,38 @@ def get_ydl_opts():
         'http_headers': {
             'User-Agent': random.choice(user_agents),
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         }
     }
 
 def extract_video_logic(url: str):
     target_url = url.strip()
     
-    # --- LOGIKA PEMBERSIHAN URL ---
+    # 1. Konversi YouTube Shorts
     if '/shorts/' in target_url:
         target_url = target_url.replace('/shorts/', '/watch?v=')
     
-    # Pembersihan parameter sampah (tracking)
+    # 2. Bersihkan parameter tracking (Krusial untuk FB & TikTok)
     if 'facebook.com' in target_url or 'tiktok.com' in target_url:
         target_url = target_url.split('?')[0]
 
     try:
         opts = get_ydl_opts()
         
-        # Tambahkan referer dinamis jika mendeteksi tiktok
+        # 3. Handling Referer Khusus TikTok
         if 'tiktok.com' in target_url:
             opts['http_headers']['Referer'] = 'https://www.tiktok.com/'
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # Ekstraksi informasi
+            # Ekstraksi pertama
             info = ydl.extract_info(target_url, download=False)
             
-            # Re-ekstraksi jika link TikTok masih berupa redirect/generic
+            # 4. Resolve Redirect (Khusus link vt.tiktok.com)
             if info.get('extractor_key') == 'Generic' and info.get('url'):
                 info = ydl.extract_info(info.get('url'), download=False)
 
             if not info:
-                return {"success": False, "error": "No data found"}
+                return {"success": False, "error": "Metadata tidak ditemukan"}
 
             raw_formats = info.get('formats', [])
             
@@ -85,7 +88,7 @@ def extract_video_logic(url: str):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
                 
-                # Sisi terpendek sebagai penentu label (Fix Portrait TikTok)
+                # FIX LOGIKA: Gunakan sisi terpendek agar video Vertikal terdeteksi benar
                 shorter_side = min(w, h) if w > 0 and h > 0 else h
 
                 if h == 0:
@@ -94,7 +97,7 @@ def extract_video_logic(url: str):
                     elif 'sd' in format_id: shorter_side = 360
                     else: continue
 
-                # Labeling
+                # Penentuan Label Resolusi
                 if shorter_side >= 2160: res_label = "4K"
                 elif shorter_side >= 1440: res_label = "2K"
                 elif shorter_side >= 1080: res_label = "1080p FHD"
@@ -130,6 +133,7 @@ def extract_video_logic(url: str):
             }
 
     except Exception as e:
+        # Menangkap error spesifik untuk debugging
         return {"success": False, "message": str(e)[:150]}
 
 @router.post("/mux")
@@ -152,6 +156,7 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
         
+        # Bersihkan judul dari karakter terlarang OS
         clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
         
