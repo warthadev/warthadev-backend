@@ -20,12 +20,12 @@ class MuxRequest(BaseModel):
     video_url: str
     audio_url: str
     resolution: str
-    title: str  # Ditambahkan agar nama file hasil download sesuai judul
+    title: str
 
 def get_ydl_opts():
     user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     ]
     return {
         'quiet': True,
@@ -33,18 +33,20 @@ def get_ydl_opts():
         'skip_download': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'socket_timeout': 60,
-        'retries': 10,
+        'socket_timeout': 30,
+        'retries': 5,
         'format': 'bestvideo+bestaudio/best',
+        # Penambahan cookies-from-browser (opsional jika dijalankan lokal) 
+        # atau pembaruan player_client untuk menghindari blokir
         'extractor_args': {
-            'youtube': {
-                'player_client': ['ios'], 
-            }
+            'youtube': {'player_client': ['ios', 'web', 'mweb']},
+            'instagram': {'check_headers': True}
         },
         'http_headers': {
             'User-Agent': random.choice(user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.google.com/',
+            'Sec-Fetch-Mode': 'navigate',
         }
     }
 
@@ -55,26 +57,23 @@ def extract_video_logic(url: str):
 
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            # Re-attempt untuk menangani error spesifik parser
             info = ydl.extract_info(target_url, download=False)
+            
             if not info:
                 return {"success": False, "error": "No data found"}
 
             raw_formats = info.get('formats', [])
-            
             audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and (f.get('vcodec') == 'none' or f.get('vcodec') is None)]
             best_audio = next(iter(sorted(audio_only, key=lambda x: (x.get('abr') or 0), reverse=True)), None)
 
             mp4_formats = []
             seen_res = set()
-            
             video_formats = [f for f in raw_formats if f.get('height') is not None or f.get('vcodec') != 'none']
 
             for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
-                
-                # FIX: Penentu resolusi berdasarkan sisi terpendek (shorter side)
-                # Menghindari kesalahan deteksi 2K pada video Portrait 1080p
                 shorter_side = min(w, h) if w > 0 and h > 0 else h
 
                 if h == 0:
@@ -83,21 +82,14 @@ def extract_video_logic(url: str):
                     elif 'sd' in format_id: shorter_side = 360
                     else: continue
 
-                if shorter_side >= 2160: 
-                    res_label = "4K"
-                elif shorter_side >= 1440: 
-                    res_label = "2K"
-                elif shorter_side >= 1080: 
-                    res_label = "1080p FHD"
-                elif shorter_side >= 720: 
-                    res_label = "720p HD"
-                elif shorter_side >= 480: 
-                    res_label = "480p"
-                else: 
-                    res_label = f"{shorter_side}p"
+                if shorter_side >= 2160: res_label = "4K"
+                elif shorter_side >= 1440: res_label = "2K"
+                elif shorter_side >= 1080: res_label = "1080p FHD"
+                elif shorter_side >= 720: res_label = "720p HD"
+                elif shorter_side >= 480: res_label = "480p"
+                else: res_label = f"{shorter_side}p"
 
-                if res_label in seen_res:
-                    continue
+                if res_label in seen_res: continue
                 seen_res.add(res_label)
 
                 has_audio = f.get('acodec') not in [None, 'none', 'unknown']
@@ -115,7 +107,7 @@ def extract_video_logic(url: str):
             return {
                 "success": True,
                 "title": info.get('title'),
-                "uploader": info.get('uploader') or info.get('channel') or info.get('creator') or None,
+                "uploader": info.get('uploader') or info.get('channel'),
                 "duration": info.get('duration_string'),
                 "thumbnail": info.get('thumbnail'),
                 "mp4_formats": mp4_formats[:12],
@@ -124,8 +116,12 @@ def extract_video_logic(url: str):
             }
 
     except Exception as e:
-        return {"success": False, "message": str(e)[:150]}
-
+        error_msg = str(e)
+        if "Cannot parse data" in error_msg:
+            return {"success": False, "message": "Facebook data format changed. Please update yt-dlp library."}
+        if "content isn't available to everyone" in error_msg:
+            return {"success": False, "message": "Instagram content is private or age-restricted."}
+        return {"success": False, "message": error_msg[:150]}
 
 @router.post("/mux")
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
@@ -135,26 +131,16 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     
     try:
         cmd = [
-            "ffmpeg", "-y",
-            "-i", request.video_url,
-            "-i", request.audio_url,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-shortest",
-            output_path
+            "ffmpeg", "-y", "-i", request.video_url, "-i", request.audio_url,
+            "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest", output_path
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
-        
-        # Membersihkan judul dari karakter yang dilarang oleh sistem operasi
         clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
-        
         return FileResponse(output_path, media_type="video/mp4", filename=filename)
     except Exception as e:
         return {"success": False, "message": str(e)}
-
 
 @router.post("/ytdl")
 async def handle_ytdl(request: VideoRequest):
