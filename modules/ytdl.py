@@ -25,8 +25,7 @@ class MuxRequest(BaseModel):
 def get_ydl_opts():
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1'
     ]
     return {
         'quiet': True,
@@ -39,60 +38,50 @@ def get_ydl_opts():
         'format': 'bestvideo+bestaudio/best',
         'http_headers': {
             'User-Agent': random.choice(user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Sec-Fetch-Mode': 'navigate',
+            'Referer': 'https://www.tiktok.com/',
         }
     }
 
 def extract_video_logic(url: str):
     target_url = url.strip()
     
-    # Pre-cleaning URL
+    # Cleaning YouTube & Social Media URL
     if '/shorts/' in target_url:
         target_url = target_url.replace('/shorts/', '/watch?v=')
     
-    # Hapus parameter tracking agar URL bersih
+    # Pembersihan parameter tracking
     if any(x in target_url for x in ['facebook.com', 'tiktok.com', 'instagram.com']):
         target_url = target_url.split('?')[0]
 
     try:
-        opts = get_ydl_opts()
-        
-        # Suntikkan Referer sesuai platform
-        if 'tiktok.com' in target_url:
-            opts['http_headers']['Referer'] = 'https://www.tiktok.com/'
-        elif 'facebook.com' in target_url:
-            opts['http_headers']['Referer'] = 'https://www.facebook.com/'
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            # Ekstraksi Utama
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(target_url, download=False)
             
-            # Jika masih 'Generic', coba ambil redirect URL-nya
+            # Resolve redirect untuk link vt.tiktok.com
             if info.get('extractor_key') == 'Generic' and info.get('url'):
                 info = ydl.extract_info(info.get('url'), download=False)
 
             if not info:
-                return {"success": False, "error": "No data found"}
+                return {"success": False, "error": "Metadata tidak ditemukan"}
 
             raw_formats = info.get('formats', [])
             
-            # Cari Audio Terbaik
+            # Ambil audio terbaik sebagai fallback
             audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and (f.get('vcodec') == 'none' or f.get('vcodec') is None)]
             best_audio = next(iter(sorted(audio_only, key=lambda x: (x.get('abr') or 0), reverse=True)), None)
 
             mp4_formats = []
             seen_res = set()
             
-            # Filter hanya format video
             video_formats = [f for f in raw_formats if f.get('height') is not None or f.get('vcodec') != 'none']
 
             for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
                 
-                # Sisi terpendek sebagai patokan resolusi (Fix Portrait)
+                # Sisi terpendek sebagai patokan (Fix Portrait/Landscape)
                 shorter_side = min(w, h) if w > 0 and h > 0 else h
 
                 if h == 0:
@@ -146,21 +135,25 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
     
     try:
-        # Gunakan ffmpeg untuk menggabungkan tanpa render ulang
+        # Menambahkan User-Agent ke FFmpeg agar tidak diblokir saat menarik stream
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        
         cmd = [
             "ffmpeg", "-y",
-            "-i", request.video_url,
-            "-i", request.audio_url,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-shortest",
-            output_path
+            "-user_agent", user_agent,
+            "-i", request.video_url
         ]
+        
+        if request.audio_url:
+            cmd.extend(["-user_agent", user_agent, "-i", request.audio_url])
+            cmd.extend(["-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0"])
+        else:
+            cmd.extend(["-c", "copy"])
+            
+        cmd.extend(["-shortest", output_path])
+        
         subprocess.run(cmd, capture_output=True, timeout=300)
         
-        # Bersihkan judul dari karakter terlarang
         clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
         
