@@ -5,6 +5,7 @@ import random
 import subprocess
 import tempfile
 import importlib
+import re
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -19,6 +20,7 @@ class MuxRequest(BaseModel):
     video_url: str
     audio_url: str
     resolution: str
+    title: str  # Ditambahkan agar nama file hasil download sesuai judul
 
 def get_ydl_opts():
     user_agents = [
@@ -71,27 +73,28 @@ def extract_video_logic(url: str):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
                 
+                # FIX: Penentu resolusi berdasarkan sisi terpendek (shorter side)
+                # Menghindari kesalahan deteksi 2K pada video Portrait 1080p
+                shorter_side = min(w, h) if w > 0 and h > 0 else h
+
                 if h == 0:
                     format_id = (f.get('format_id') or '').lower()
-                    if 'hd' in format_id: 
-                        h = 720
-                    elif 'sd' in format_id: 
-                        h = 360
-                    else: 
-                        continue
+                    if 'hd' in format_id: shorter_side = 720
+                    elif 'sd' in format_id: shorter_side = 360
+                    else: continue
 
-                if h >= 2160: 
+                if shorter_side >= 2160: 
                     res_label = "4K"
-                elif h >= 1440: 
+                elif shorter_side >= 1440: 
                     res_label = "2K"
-                elif h >= 1080: 
+                elif shorter_side >= 1080: 
                     res_label = "1080p FHD"
-                elif h >= 720: 
+                elif shorter_side >= 720: 
                     res_label = "720p HD"
-                elif h >= 480: 
+                elif shorter_side >= 480: 
                     res_label = "480p"
                 else: 
-                    res_label = f"{h}p"
+                    res_label = f"{shorter_side}p"
 
                 if res_label in seen_res:
                     continue
@@ -143,7 +146,11 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
             output_path
         ]
         subprocess.run(cmd, capture_output=True, timeout=300)
-        filename = f"video_{request.resolution.replace(' ', '_')}.mp4"
+        
+        # Membersihkan judul dari karakter yang dilarang oleh sistem operasi
+        clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
+        filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
+        
         return FileResponse(output_path, media_type="video/mp4", filename=filename)
     except Exception as e:
         return {"success": False, "message": str(e)}
