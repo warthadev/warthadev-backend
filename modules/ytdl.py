@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import importlib
 import re
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTasks
@@ -36,8 +36,6 @@ def get_ydl_opts():
         'socket_timeout': 30,
         'retries': 5,
         'format': 'bestvideo+bestaudio/best',
-        # Penambahan cookies-from-browser (opsional jika dijalankan lokal) 
-        # atau pembaruan player_client untuk menghindari blokir
         'extractor_args': {
             'youtube': {'player_client': ['ios', 'web', 'mweb']},
             'instagram': {'check_headers': True}
@@ -57,9 +55,7 @@ def extract_video_logic(url: str):
 
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            # Re-attempt untuk menangani error spesifik parser
             info = ydl.extract_info(target_url, download=False)
-            
             if not info:
                 return {"success": False, "error": "No data found"}
 
@@ -118,29 +114,64 @@ def extract_video_logic(url: str):
     except Exception as e:
         error_msg = str(e)
         if "Cannot parse data" in error_msg:
-            return {"success": False, "message": "Facebook data format changed. Please update yt-dlp library."}
-        if "content isn't available to everyone" in error_msg:
-            return {"success": False, "message": "Instagram content is private or age-restricted."}
+            return {"success": False, "message": "Facebook data format changed. Update yt-dlp."}
+        if "content isn't available" in error_msg:
+            return {"success": False, "message": "Instagram content private/restricted."}
         return {"success": False, "message": error_msg[:150]}
 
 @router.post("/mux")
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     tmp_dir = tempfile.mkdtemp()
     output_path = os.path.join(tmp_dir, "output.mp4")
-    background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
+    
+    # Task pembersihan folder setelah response dikirim
+    def cleanup():
+        if os.path.exists(tmp_dir):
+            import shutil
+            shutil.rmtree(tmp_dir)
+
+    background_tasks.add_task(cleanup)
     
     try:
+        # Pengecekan apakah URL video/audio kosong
+        if not request.video_url or not request.audio_url:
+            raise Exception("URL video atau audio tidak valid/kosong.")
+
+        # Command FFMPEG dengan log error yang lebih lengkap
         cmd = [
-            "ffmpeg", "-y", "-i", request.video_url, "-i", request.audio_url,
-            "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
-            "-shortest", output_path
+            "ffmpeg", "-y",
+            "-i", request.video_url,
+            "-i", request.audio_url,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
+            output_path
         ]
-        subprocess.run(cmd, capture_output=True, timeout=300)
-        clean_title = re.sub(r'[\\/*?:"<>|]', "", request.title)
+        
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if process.returncode != 0:
+            # Jika ffmpeg gagal (misal: 403 Forbidden pada URL)
+            print(f"FFMPEG Error: {process.stderr}")
+            return {"success": False, "message": "Gagal menggabungkan file. URL mungkin sudah kedaluwarsa."}
+        
+        # Bersihkan judul dari emoji dan karakter non-ASCII untuk keamanan nama file
+        clean_title = re.sub(r'[^\x00-\x7F]+', '', request.title) # Hapus emoji
+        clean_title = re.sub(r'[\\/*?:"<>|]', "", clean_title) # Hapus karakter ilegal
+        clean_title = clean_title[:50].strip() or "video_result"
+        
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
-        return FileResponse(output_path, media_type="video/mp4", filename=filename)
+        
+        return FileResponse(
+            output_path, 
+            media_type="video/mp4", 
+            filename=filename,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
     except Exception as e:
-        return {"success": False, "message": str(e)}
+        return {"success": False, "message": f"Mux gagal: {str(e)}"}
 
 @router.post("/ytdl")
 async def handle_ytdl(request: VideoRequest):
