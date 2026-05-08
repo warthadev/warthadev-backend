@@ -59,42 +59,47 @@ def extract_video_logic(url: str):
                 return {"success": False, "error": "No data found"}
 
             raw_formats = info.get('formats', [])
-            audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+            
+            # Deteksi audio: Mencari stream yang tidak memiliki video (acodec ok, vcodec none/null)
+            audio_only = [f for f in raw_formats if f.get('acodec') != 'none' and (f.get('vcodec') == 'none' or f.get('vcodec') is None)]
             best_audio = next(iter(sorted(audio_only, key=lambda x: (x.get('abr') or 0), reverse=True)), None)
 
             mp4_formats = []
             seen_res = set()
-            video_formats = [f for f in raw_formats if f.get('vcodec') != 'none']
+            
+            # Filter Video: Mengambil semua format yang memiliki resolusi tinggi (height)
+            # Ini memperbaiki masalah format 0 pada banyak situs non-YouTube
+            video_formats = [f for f in raw_formats if f.get('height') is not None]
 
-            for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('width') or 0, x.get('tbr') or 0), reverse=True):
+            for f in sorted(video_formats, key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True):
                 h = f.get('height') or 0
                 w = f.get('width') or 0
-                if h == 0 or w == 0:
-                    continue
+                
+                if h == 0: continue
 
-                is_vertical = h > w
-                short_side = w if is_vertical else h
+                # Penentuan Label Resolusi
+                if h >= 2160: base_label = "4K"
+                elif h >= 1440: base_label = "2K"
+                elif h >= 1080: base_label = "1080p FHD"
+                elif h >= 720: base_label = "720p HD"
+                elif h >= 480: base_label = "480p"
+                else: base_label = f"{h}p"
 
-                if short_side >= 2160: base_label = f"4K ({short_side}p)"
-                elif short_side >= 1440: base_label = f"2K ({short_side}p)"
-                elif short_side >= 1080: base_label = "1080p FHD"
-                elif short_side >= 720: base_label = "720p HD"
-                else: base_label = f"{short_side}p"
-
-                orientation = "Vertical " if is_vertical else ""
+                orientation = "Vertical " if h > w else ""
                 res_label = f"{orientation}{base_label}"
 
                 if res_label in seen_res:
                     continue
                 seen_res.add(res_label)
 
-                is_combined = f.get('acodec') != 'none' and f.get('acodec') != 'unknown'
+                # Cek apakah format sudah "Combined" (Video + Audio jadi satu)
+                has_audio = f.get('acodec') not in [None, 'none', 'unknown']
 
                 mp4_formats.append({
                     "resolution": res_label,
                     "video_url": f.get('url'),
-                    "audio_url": None if is_combined else (best_audio.get('url') if best_audio else None),
-                    "needs_mux": not is_combined,
+                    "audio_url": None if has_audio else (best_audio.get('url') if best_audio else None),
+                    "needs_mux": not has_audio,
                     "height": h,
                     "width": w,
                     "real_res": f"{w}x{h}"
@@ -107,7 +112,7 @@ def extract_video_logic(url: str):
                 "duration": info.get('duration_string'),
                 "thumbnail": info.get('thumbnail'),
                 "mp4_formats": mp4_formats[:12],
-                "mp3_formats": [{"quality": "HQ", "audio_url": f.get('url')} for f in audio_only[:2]],
+                "mp3_formats": [{"quality": f"HQ ({f.get('abr', 0)}kbps)" if f.get('abr') else "HQ", "audio_url": f.get('url')} for f in audio_only[:2]],
                 "platform": info.get('extractor_key'),
             }
 
@@ -119,7 +124,10 @@ def extract_video_logic(url: str):
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     tmp_dir = tempfile.mkdtemp()
     output_path = os.path.join(tmp_dir, "output.mp4")
+    
+    # Cleanup task
     background_tasks.add_task(lambda: (importlib.import_module('shutil').rmtree(tmp_dir) if os.path.exists(tmp_dir) else None))
+    
     try:
         cmd = [
             "ffmpeg", "-y",
