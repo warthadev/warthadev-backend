@@ -53,7 +53,7 @@ class MuxRequest(BaseModel):
 
 def get_ydl_opts() -> Dict[str, Any]:
     """
-    yt-dlp configuration with retry and safe headers for Instagram/YouTube.
+    yt-dlp configuration with retry and safe headers for major sites.
     Public mode only (no cookies / auth).
     """
     user_agents = [
@@ -91,6 +91,8 @@ def get_ydl_opts() -> Dict[str, Any]:
             "instagram": {
                 "check_headers": True,
             },
+            # added to mimic your Colab script behaviour
+            "generic": ["impersonate"],
         },
         "http_headers": {
             "User-Agent": random.choice(user_agents),
@@ -233,17 +235,27 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("Format %s has no URL, skipping", res_label)
             continue
 
+        size = f.get("filesize") or f.get("filesize_approx")
+        # skip obviously broken / zero-size formats
+        if size is not None and size <= 0:
+            logger.warning(
+                "Format %s has invalid filesize=%s, skipping", res_label, size
+            )
+            continue
+
         mp4_formats.append(
             {
                 "resolution": res_label,
                 "video_url": video_url,
                 # If video already has audio, no separate audio_url is needed
-                "audio_url": None if has_audio else (best_audio.get("url") if best_audio else None),
+                "audio_url": None
+                if has_audio
+                else (best_audio.get("url") if best_audio else None),
                 "needs_mux": not has_audio,
                 "height": h,
                 "width": w,
                 "real_res": f"{w}x{h}",
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
+                "filesize": size,
                 "format_note": f.get("format_note", ""),
                 "format_id": f.get("format_id"),
                 "ext": f.get("ext"),
@@ -278,6 +290,13 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             "resolution": f"{best_muxed.get('width')}x{best_muxed.get('height')}",
             "ext": best_muxed.get("ext"),
             "filesize": best_muxed.get("filesize") or best_muxed.get("filesize_approx"),
+        }
+
+    # If nothing usable, treat as error
+    if not mp4_formats and not mp3_formats:
+        return {
+            "success": False,
+            "message": "No playable formats could be selected for this video.",
         }
 
     return result
@@ -322,14 +341,19 @@ def extract_video_logic(url: str) -> Dict[str, Any]:
             len(selected["mp3_formats"]),
         )
 
+        duration_val = info.get("duration") or 0
+        if duration_val and duration_val > 0:
+            duration_str = info.get("duration_string") or f"{duration_val}s"
+        else:
+            duration_str = "unknown"
+
         base: Dict[str, Any] = {
             "success": True,
             "title": info.get("title", "Video"),
             "uploader": info.get("uploader")
             or info.get("channel")
             or info.get("uploader_id"),
-            "duration": info.get("duration_string")
-            or f"{info.get('duration', 0)}s",
+            "duration": duration_str,
             "thumbnail": info.get("thumbnail"),
             "platform": info.get("extractor_key"),
             "view_count": info.get("view_count"),
@@ -400,7 +424,9 @@ async def download_with_retry(url: str, output_path: str, max_retries: int = 3) 
     """
     for attempt in range(max_retries):
         try:
-            logger.info("Download attempt %s/%s: %s...", attempt + 1, max_retries, url[:50])
+            logger.info(
+                "Download attempt %s/%s: %s...", attempt + 1, max_retries, url[:50]
+            )
 
             cmd = [
                 "curl",
@@ -421,7 +447,9 @@ async def download_with_retry(url: str, output_path: str, max_retries: int = 3) 
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=150)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=150
+            )
 
             if process.returncode == 0 and os.path.exists(output_path):
                 file_size = os.path.getsize(output_path)
@@ -439,7 +467,9 @@ async def download_with_retry(url: str, output_path: str, max_retries: int = 3) 
         except asyncio.TimeoutError:
             logger.warning("Download timeout on attempt %s", attempt + 1)
         except Exception as e:
-            logger.error("Download error on attempt %s: %s", attempt + 1, str(e))
+            logger.error(
+                "Download error on attempt %s: %s", attempt + 1, str(e)
+            )
 
         if attempt < max_retries - 1:
             await asyncio.sleep(2**attempt)
@@ -531,7 +561,9 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=300
+            )
         except asyncio.TimeoutError:
             process.kill()
             raise HTTPException(
@@ -556,7 +588,9 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
         clean_title = sanitize_filename(request.title)
         filename = f"{clean_title}_{request.resolution.replace(' ', '_')}.mp4"
 
-        logger.info("Mux successful: %s (%s bytes)", filename, os.path.getsize(output_path))
+        logger.info(
+            "Mux successful: %s (%s bytes)", filename, os.path.getsize(output_path)
+        )
 
         return FileResponse(
             output_path,
@@ -608,5 +642,8 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "video-extractor",
-        "ffmpeg": subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0,
+        "ffmpeg": subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True
+        ).returncode
+        == 0,
     }
