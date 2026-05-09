@@ -1,6 +1,5 @@
 import os
 import yt_dlp
-import uuid
 import random
 import subprocess
 import tempfile
@@ -70,7 +69,6 @@ def get_ydl_opts():
     ]
 
     return {
-        # Biar kelihatan error‑nya kalau ada masalah
         "quiet": False,
         "no_warnings": False,
         "skip_download": True,
@@ -79,7 +77,6 @@ def get_ydl_opts():
         "socket_timeout": 30,
         "retries": 10,
         "fragment_retries": 10,
-        # Default format: best video+audio, kalau tidak ada, pakai best muxed
         "format": "bv*+ba/b",
         "extractor_args": {
             "youtube": {
@@ -111,11 +108,9 @@ def _normalize_url(url: str) -> str:
     if "/shorts/" in target_url:
         target_url = target_url.replace("/shorts/", "/watch?v=")
 
-    # Instagram: buang query string, pastikan bentuk /reel/{id}/ kalau memang reels
+    # Instagram: buang query string, normalisasi /reel/{id}/
     if "instagram.com" in target_url:
-        # buang query string
         base = target_url.split("?", 1)[0]
-        # normalisasi reels yang kadang /reel/ID/?...
         m = re.search(r"(https://www\.instagram\.com/reel/[^/?#]+)", base)
         if m:
             target_url = m.group(1) + "/"
@@ -128,9 +123,9 @@ def _normalize_url(url: str) -> str:
 def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
     """
     Dari info yt-dlp, pilih:
-      - best muxed mp4 (video+audio) sebagai kualitas terbaik
-      - fallback: kombinasi video-only + audio-only terbaik
-      - list beberapa resolusi lain untuk pilihan user
+    - best muxed mp4 (video+audio) sebagai kualitas terbaik
+    - fallback: kombinasi video-only + audio-only terbaik
+    - list beberapa resolusi lain untuk pilihan user
     """
     raw_formats = info.get("formats", []) or []
 
@@ -166,7 +161,7 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
         if f.get("height") is not None and f.get("vcodec") not in [None, "none"]
     ]
 
-    # --- 1. Cari best muxed mp4 (punya audio & container mp4) ---
+    # 1. Cari best muxed mp4 (punya audio & container mp4)
     muxed_candidates = [
         f
         for f in video_formats
@@ -185,11 +180,10 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             f"{best_muxed.get('width')}x{best_muxed.get('height')}"
         )
 
-    # --- 2. Build list resolusi (utamakan mp4 & muxed dulu) ---
+    # 2. Build list resolusi
     mp4_formats = []
     seen_res = set()
 
-    # sortir semua format video berdasarkan height, tbr
     sorted_videos = sorted(
         video_formats,
         key=lambda x: (x.get("height") or 0, x.get("tbr") or 0),
@@ -233,6 +227,7 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "resolution": res_label,
                 "video_url": video_url,
+                # kalau sudah punya audio -> audio_url None, needs_mux False
                 "audio_url": None if has_audio else (best_audio.get("url") if best_audio else None),
                 "needs_mux": not has_audio,
                 "height": h,
@@ -245,10 +240,9 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    # batasi list ke 12 resolusi
     mp4_formats = mp4_formats[:12]
 
-    # Format audio-only (MP3)
+    # Format audio only (MP3)
     mp3_formats = []
     for idx, f in enumerate(audio_only[:3], 1):
         quality = "HQ" if idx == 1 else f"Quality {idx}"
@@ -266,7 +260,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
         "mp3_formats": mp3_formats,
     }
 
-    # Info best overall untuk “download kualitas terbaik”
     if best_muxed is not None and best_muxed.get("url"):
         result["best_muxed"] = {
             "video_url": best_muxed.get("url"),
@@ -404,7 +397,8 @@ async def download_with_retry(url: str, output_path: str, max_retries: int = 3) 
                     logger.warning("File downloaded tapi ukurannya 0")
 
             logger.warning(
-                f"Download gagal (attempt {attempt + 1}): {stderr.decode(errors='ignore')[:200]}"
+                f"Download gagal (attempt {attempt + 1}): "
+                f"{stderr.decode(errors='ignore')[:200]}"
             )
 
         except asyncio.TimeoutError:
@@ -441,6 +435,7 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     try:
         logger.info(f"Starting mux for resolution: {request.resolution}")
 
+        # double check, walaupun sudah divalidate Pydantic
         if not request.video_url or not request.audio_url:
             raise HTTPException(
                 status_code=400,
@@ -453,7 +448,7 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
             download_with_retry(request.audio_url, audio_path),
         ]
 
-        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+        results = await asyncio.gather(*download_tasks, return_exceptions=False)
 
         if not all(results):
             failed = []
@@ -571,6 +566,5 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "video-extractor",
-        "ffmpeg": subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode
-        == 0,
+        "ffmpeg": subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0,
     }
