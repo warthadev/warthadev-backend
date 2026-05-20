@@ -6,3 +6,5 @@ requests
 python-multipart
 starlette
 # instaloader (Saran: Hapus saja, pakai yt-dlp untuk IG biar satu pintu)
+pyrogram
+tgcrypto
