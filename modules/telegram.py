@@ -1,4 +1,3 @@
-import os
 import logging
 from typing import List, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query
@@ -11,18 +10,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/telegram")
 
-# ========== KONFIGURASI (SALIN DARI COLAB KAMU) ==========
+# ========== KONFIGURASI (SALIN DARI COLAB) ==========
 API_ID = 25590547
 API_HASH = 'cea88887e3f1eca7b048bb85fe97f5be'
 SESSION_STRING = 'BQGGexMATYDTitbHfX-xdLrAob2StdELEBSI281hi7tzYqM2F9IANhltWG9pU2eFNch-dwLAWBsJGTacHUlzWl3EHw2Gt2hzH7M1Uya74QyquOm7lGa3Zfz2iIfl4CmZkQ4taZkM1Tr2pBfSWNtIEoRLArgGfrl0-jDdsPx_kKPOpEftdgFidrPmVUv9rS1OHLKXCrGF3KhV9AZIqNw5cS5TqiHTtiubkD-ECSYL9RtcG-wbY3flfXyRjel5X1SULwzBQBC2PyhTdHwZCENa-FzodMv9Wcym6NQV9tsqyQ19o_lEstkQ2mWiFR6zJR4S9bwDtVJaJ4aYOeW4VzG_OvjfGoAyrwAAAAGQadPXAA'
 
-# 🔥 GANTI INI DENGAN ID CHANNEL DARI COLAB (jalankan kode list channel dulu)
-# Contoh: RECIPIENT = -1002123456789  (tanpa tanda kutip)
-RECIPIENT = -1002123456789  # <-- GANTI DENGAN ID MILIKMU
+# 🔥 PAKAI CHANNEL_ID DARI COLAB (tanpa tanda kutip)
+RECIPIENT = -1002466984537
 
 
 async def get_client():
-    """Membuat koneksi Pyrogram (in-memory)"""
     return Client(
         "telegram_stream",
         api_id=API_ID,
@@ -34,7 +31,6 @@ async def get_client():
 
 @router.get("/files", response_model=List[Dict])
 async def get_files(limit: int = Query(100, ge=1, le=500)):
-    """Mengambil daftar file video dari channel Telegram"""
     try:
         async with await get_client() as client:
             logger.info(f"Mencoba mengakses channel ID: {RECIPIENT}")
@@ -43,12 +39,6 @@ async def get_files(limit: int = Query(100, ge=1, le=500)):
             try:
                 chat = await client.get_chat(RECIPIENT)
                 logger.info(f"✅ Channel ditemukan: {chat.title} (ID: {chat.id})")
-            except errors.PeerIdInvalid:
-                logger.error("❌ Peer ID invalid - Channel tidak dikenal")
-                raise HTTPException(
-                    status_code=404,
-                    detail="Channel tidak ditemukan. Jalankan kode list channel di Colab untuk mendapatkan ID yang benar."
-                )
             except Exception as e:
                 logger.error(f"❌ Gagal akses channel: {e}")
                 raise HTTPException(
@@ -78,8 +68,7 @@ async def get_files(limit: int = Query(100, ge=1, le=500)):
     except HTTPException:
         raise
     except errors.Unauthorized:
-        logger.error("❌ SESSION_STRING tidak valid")
-        raise HTTPException(status_code=401, detail="Session string tidak valid. Generate ulang di Colab.")
+        raise HTTPException(status_code=401, detail="Session string tidak valid")
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -87,33 +76,26 @@ async def get_files(limit: int = Query(100, ge=1, le=500)):
 
 @router.get("/stream/{file_id}")
 async def stream_video(file_id: str, range: Optional[str] = None):
-    """Streaming video dengan dukungan HTTP Range (bisa lompat-lompat)"""
     try:
         async with await get_client() as client:
-            logger.info(f"Streaming file: {file_id}")
-            
-            # Download file ke memory
             file_stream = io.BytesIO()
             await client.download_media(file_id, file=file_stream)
             file_stream.seek(0)
             file_size = file_stream.getbuffer().nbytes
-            
-            logger.info(f"File size: {file_size} bytes")
-            
-            # Handle range request (untuk seeking video)
+
             if range and range.startswith("bytes="):
                 range_value = range.replace("bytes=", "")
                 parts = range_value.split("-")
                 start = int(parts[0])
                 end = int(parts[1]) if parts[1] and parts[1].strip() else file_size - 1
-                
+
                 if start >= file_size or end >= file_size:
                     raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-                
+
                 chunk_size = end - start + 1
                 file_stream.seek(start)
                 data = file_stream.read(chunk_size)
-                
+
                 headers = {
                     "Content-Range": f"bytes {start}-{end}/{file_size}",
                     "Accept-Ranges": "bytes",
@@ -122,19 +104,11 @@ async def stream_video(file_id: str, range: Optional[str] = None):
                 }
                 return Response(content=data, status_code=206, headers=headers)
             else:
-                # Kirim seluruh file
                 return StreamingResponse(
                     file_stream,
                     media_type="video/mp4",
-                    headers={
-                        "Accept-Ranges": "bytes",
-                        "Content-Length": str(file_size)
-                    }
+                    headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)}
                 )
-                
-    except errors.exceptions.not_acceptable_406.MediaEmpty:
-        logger.error(f"❌ File tidak ditemukan: {file_id}")
-        raise HTTPException(status_code=404, detail="File tidak ditemukan")
     except Exception as e:
         logger.error(f"❌ Streaming error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -142,7 +116,6 @@ async def stream_video(file_id: str, range: Optional[str] = None):
 
 @router.get("/health")
 async def health_check():
-    """Cek koneksi ke Telegram"""
     try:
         async with await get_client() as client:
             me = await client.get_me()
@@ -153,7 +126,4 @@ async def health_check():
                 "user_id": me.id
             }
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
