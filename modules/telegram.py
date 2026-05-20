@@ -4,19 +4,21 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse, Response
 from pyrogram import Client, errors
 import io
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/telegram")
 
-# ========== KONFIGURASI (SALIN DARI COLAB) ==========
+# ========== KONFIGURASI ==========
 API_ID = 25590547
 API_HASH = 'cea88887e3f1eca7b048bb85fe97f5be'
 SESSION_STRING = 'BQGGexMATYDTitbHfX-xdLrAob2StdELEBSI281hi7tzYqM2F9IANhltWG9pU2eFNch-dwLAWBsJGTacHUlzWl3EHw2Gt2hzH7M1Uya74QyquOm7lGa3Zfz2iIfl4CmZkQ4taZkM1Tr2pBfSWNtIEoRLArgGfrl0-jDdsPx_kKPOpEftdgFidrPmVUv9rS1OHLKXCrGF3KhV9AZIqNw5cS5TqiHTtiubkD-ECSYL9RtcG-wbY3flfXyRjel5X1SULwzBQBC2PyhTdHwZCENa-FzodMv9Wcym6NQV9tsqyQ19o_lEstkQ2mWiFR6zJR4S9bwDtVJaJ4aYOeW4VzG_OvjfGoAyrwAAAAGQadPXAA'
+RECIPIENT = -1002466984537  # ID channel private kamu
 
-# 🔥 PAKAI CHANNEL_ID DARI COLAB (tanpa tanda kutip)
-RECIPIENT = -1002466984537
+# Flag untuk tracking apakah sudah pernah kirim pesan
+PESAN_TERKIRIM_FILE = "/tmp/telegram_pesan_terkirim.txt"
 
 
 async def get_client():
@@ -29,46 +31,57 @@ async def get_client():
     )
 
 
+async def ensure_channel_recognized(client):
+    """Pastikan channel sudah 'dikenal' dengan mengirim pesan sekali saja"""
+    # Cek apakah sudah pernah kirim pesan
+    if os.path.exists(PESAN_TERKIRIM_FILE):
+        logger.info("✅ Sudah pernah kirim pesan ke channel sebelumnya")
+        return
+    
+    try:
+        logger.info(f"📤 Mencoba mengirim pesan test ke channel {RECIPIENT}...")
+        await client.send_message(RECIPIENT, "Connection test from Wartha Sensei API")
+        
+        # Tandai sudah pernah kirim
+        with open(PESAN_TERKIRIM_FILE, "w") as f:
+            f.write("done")
+        logger.info("✅ Pesan test berhasil dikirim. Channel sekarang dikenal!")
+    except Exception as e:
+        logger.warning(f"⚠️ Gagal kirim pesan test: {e}")
+        # Lanjutkan saja, mungkin channel sudah dikenal
+
+
 @router.get("/files", response_model=List[Dict])
 async def get_files(limit: int = Query(100, ge=1, le=500)):
     try:
         async with await get_client() as client:
-            logger.info(f"Mencoba mengakses channel ID: {RECIPIENT}")
+            # 🔥 KRUSIAL: Pastikan channel dikenal
+            await ensure_channel_recognized(client)
             
-            # Cek apakah channel bisa diakses
-            try:
-                chat = await client.get_chat(RECIPIENT)
-                logger.info(f"✅ Channel ditemukan: {chat.title} (ID: {chat.id})")
-            except Exception as e:
-                logger.error(f"❌ Gagal akses channel: {e}")
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Channel tidak dapat diakses: {str(e)}"
-                )
+            # Sekarang ambil chat
+            chat = await client.get_chat(RECIPIENT)
+            logger.info(f"✅ Channel ditemukan: {chat.title}")
             
-            # Ambil pesan dari channel
+            # Ambil pesan
             messages = []
             async for message in client.get_chat_history(chat.id, limit=limit):
-                if message.document and message.document.mime_type:
-                    mime = message.document.mime_type.lower()
-                    if mime.startswith('video/'):
-                        messages.append({
-                            "id": message.id,
-                            "name": message.document.file_name or f"video_{message.id}.mp4",
-                            "size": message.document.file_size,
-                            "mime_type": mime,
-                            "file_id": message.document.file_id,
-                            "date": message.date.timestamp() if message.date else None,
-                            "caption": message.caption or ""
-                        })
+                if message.document and message.document.mime_type and message.document.mime_type.startswith('video/'):
+                    messages.append({
+                        "id": message.id,
+                        "name": message.document.file_name or f"video_{message.id}.mp4",
+                        "size": message.document.file_size,
+                        "file_id": message.document.file_id,
+                        "date": message.date.timestamp() if message.date else None,
+                    })
             
             logger.info(f"✅ Ditemukan {len(messages)} video")
             return messages
             
-    except HTTPException:
-        raise
-    except errors.Unauthorized:
-        raise HTTPException(status_code=401, detail="Session string tidak valid")
+    except errors.PeerIdInvalid:
+        raise HTTPException(
+            status_code=404,
+            detail="Channel tidak dikenal. Coba jalankan ulang atau pastikan akun Telegram adalah admin channel."
+        )
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
