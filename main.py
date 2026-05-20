@@ -36,11 +36,9 @@ def check_system():
             status_module["system_tools"][name] = "Not Found"
 
 def load_modules():
-    """Import router dari ytdl.py dan igdl.py secara dinamis."""
-    # Pastikan folder di GitHub/Local lo namanya 'modules'
-    for mod_name in ["ytdl", "igdl"]:
+    """Import router dari ytdl.py, igdl.py, dan telegram.py secara dinamis."""
+    for mod_name in ["ytdl", "igdl", "telegram"]:
         try:
-            # UPDATE: Menggunakan 'modules' bukan 'module'
             module = importlib.import_module(f"modules.{mod_name}")
             if hasattr(module, "router"):
                 app.include_router(module.router)
@@ -65,11 +63,11 @@ def home():
     }
 
 if __name__ == "__main__":
-    # Port 7860 adalah standar Hugging Face Spaces
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
-        port=7860, 
+        port=port, 
         proxy_headers=True, 
         forwarded_allow_ips="*"
     )
