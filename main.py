@@ -37,7 +37,7 @@ def check_system():
 
 def load_modules():
     """Import router dari modules"""
-    modules_to_load = ["ytdl", "telegram"]  # <- PASTIKAN telegram ada di sini!
+    modules_to_load = ["ytdl", "telegram"]   # pastikan telegram ada
     
     for mod_name in modules_to_load:
         try:
@@ -57,7 +57,22 @@ def load_modules():
 async def startup():
     check_system()
     load_modules()
+    # Start Telegram client
+    try:
+        from modules.telegram import start_client
+        await start_client()
+        print("✅ Telegram client started")
+    except Exception as e:
+        print(f"⚠️ Telegram client error: {e}")
     print("✅ Server started with modules:", list(status_module["modules"].keys()))
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        from modules.telegram import shutdown_client
+        await shutdown_client()
+    except:
+        pass
 
 @app.get("/")
 def home():
