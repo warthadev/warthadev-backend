@@ -2,10 +2,9 @@
 import os
 from typing import Dict, List, Optional
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from telethon import TelegramClient, errors
-from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, MessageMediaVideo
-from telethon.utils import get_input_location
+from telethon.sessions import StringSession
 import asyncio
 
 # ========== KONFIGURASI ==========
@@ -57,82 +56,63 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
     files = []
     try:
         async for message in telegram_client.iter_messages(chat_id, limit=limit):
-            media = message.media
-            if not media:
-                continue
-
-            # Deteksi tipe media
-            mtype = None
-            name = None
-            size = 0
-            duration = None
-            width = height = None
-            file_id = None
-
-            if hasattr(media, 'video') or isinstance(media, MessageMediaVideo):
+            # Gunakan properti langsung dari message
+            if message.video:
                 mtype = "video"
-                video = media.video if hasattr(media, 'video') else media
-                # Ambil nama file dari atribut
-                for attr in video.attributes:
-                    if hasattr(attr, 'file_name'):
-                        name = attr.file_name
-                        break
-                if not name:
-                    name = f"video_{message.id}.mp4"
+                video = message.video
+                name = video.file_name or f"video_{message.id}.mp4"
                 size = video.size
                 duration = video.duration
-                width = video.w
-                height = video.h
+                width = video.width
+                height = video.height
                 file_id = str(video.id)
-
-            elif hasattr(media, 'audio'):
+                date = message.date.timestamp() if message.date else None
+                
+            elif message.audio:
                 mtype = "audio"
-                audio = media.audio
-                for attr in audio.attributes:
-                    if hasattr(attr, 'file_name'):
-                        name = attr.file_name
-                        break
-                if not name:
-                    name = f"audio_{message.id}.mp3"
+                audio = message.audio
+                name = audio.file_name or f"audio_{message.id}.mp3"
                 size = audio.size
                 duration = audio.duration
+                width = height = None
                 file_id = str(audio.id)
-
-            elif isinstance(media, MessageMediaPhoto):
+                date = message.date.timestamp() if message.date else None
+                
+            elif message.photo:
                 mtype = "image"
+                photo = message.photo
                 name = f"photo_{message.id}.jpg"
-                size = media.photo.size
-                width = media.photo.w
-                height = media.photo.h
-                file_id = str(media.photo.id)
-
-            elif isinstance(media, MessageMediaDocument):
-                doc = media.document
-                # Cek ekstensi
-                for attr in doc.attributes:
-                    if hasattr(attr, 'file_name'):
-                        name = attr.file_name
-                        break
-                if not name:
-                    name = f"file_{message.id}"
-                ext = name.split('.')[-1].lower()
-                if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm']:
+                size = photo.size
+                duration = None
+                width = photo.width
+                height = photo.height
+                file_id = str(photo.id)
+                date = message.date.timestamp() if message.date else None
+                
+            elif message.document:
+                doc = message.document
+                mime = doc.mime_type or ""
+                if mime.startswith('video/'):
                     mtype = "video"
-                elif ext in ['mp3', 'm4a', 'wav', 'ogg', 'flac']:
+                elif mime.startswith('audio/'):
                     mtype = "audio"
-                elif ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                elif mime.startswith('image/'):
                     mtype = "image"
                 else:
                     mtype = "document"
+                name = doc.file_name or f"file_{message.id}"
                 size = doc.size
                 # duration mungkin ada untuk video/audio dalam document
+                duration = None
                 for attr in doc.attributes:
                     if hasattr(attr, 'duration'):
                         duration = attr.duration
+                        break
+                width = height = None
                 file_id = str(doc.id)
-
-            if mtype is None:
-                continue
+                date = message.date.timestamp() if message.date else None
+            else:
+                continue  # Bukan media
 
             files.append({
                 "id": message.id,
@@ -143,7 +123,7 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                 "duration": duration,
                 "width": width,
                 "height": height,
-                "date": message.date.timestamp() if message.date else None,
+                "date": date,
             })
         # Balik urutan agar dari yang paling lama ke terbaru? Terserah.
         # Biasanya diinginkan yang terbaru di atas. Kita reverse.
