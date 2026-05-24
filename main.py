@@ -1,3 +1,4 @@
+# main.py
 import os
 import sys
 import subprocess
@@ -6,14 +7,14 @@ from fastapi import FastAPI
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
-# Setup Path: Memastikan folder 'modules' terbaca sebagai package
+# Setup Path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 app = FastAPI(title="Wartha Sensei API")
 
-# Konfigurasi CORS Paling Agresif
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +27,6 @@ app.add_middleware(
 status_module = {"modules": {}, "system_tools": {}}
 
 def check_system():
-    """Cek ketersediaan binary FFmpeg dan 7z di OS."""
     tools = {"ffmpeg": ["ffmpeg", "-version"], "p7zip": ["7z", "--help"]}
     for name, cmd in tools.items():
         try:
@@ -36,26 +36,31 @@ def check_system():
             status_module["system_tools"][name] = "Not Found"
 
 def load_modules():
-    """Import router dari ytdl.py, igdl.py, dan telegram.py secara dinamis."""
-    for mod_name in ["ytdl", "igdl", "telegram"]:
+    """Import router dari modules"""
+    modules_to_load = ["ytdl", "telegram"]  # <- PASTIKAN telegram ada di sini!
+    
+    for mod_name in modules_to_load:
         try:
             module = importlib.import_module(f"modules.{mod_name}")
             if hasattr(module, "router"):
                 app.include_router(module.router)
                 status_module["modules"][mod_name] = "Success"
+                print(f"✅ Loaded module: {mod_name}")
             else:
-                status_module["modules"][mod_name] = "Error: Missing Router Object"
+                status_module["modules"][mod_name] = "Error: Missing Router"
+                print(f"❌ Module {mod_name} has no router")
         except Exception as e:
             status_module["modules"][mod_name] = f"Error: {str(e)}"
+            print(f"❌ Failed to load {mod_name}: {e}")
 
 @app.on_event("startup")
 async def startup():
     check_system()
     load_modules()
+    print("✅ Server started with modules:", list(status_module["modules"].keys()))
 
 @app.get("/")
 def home():
-    """Root endpoint untuk pengecekan status via browser."""
     return {
         "server": "Online",
         "status": "Ready",
