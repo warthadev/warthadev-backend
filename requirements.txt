@@ -5,5 +5,5 @@ yt-dlp
 requests
 python-multipart
 starlette
-pyrogram
-tgcrypto
+telethon
+cryptg  # opsional, untuk enkripsi lebih cepat
