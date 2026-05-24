@@ -64,6 +64,7 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "size": f.size,
                     "size_formatted": format_file_size(f.size),
                     "media_type": mtype,
+                    "mime_type": f.mime_type,
                     "file_id": str(f.id),
                     "duration": getattr(f, 'duration', None),
                     "width": getattr(f, 'width', None),
@@ -76,6 +77,22 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
     except Exception as e:
         print(f"Error loading files: {e}")
     return files
+
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Range, Content-Type",
+    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, Content-Type",
+}
+
+CHUNK_SIZE = 256 * 1024  # 256 KB chunks
+
+
+@router.options("/stream/{chat_id}/{message_id}")
+async def stream_options(chat_id: int, message_id: int):
+    """Handle CORS preflight for streaming"""
+    return Response(headers=CORS_HEADERS)
 
 
 @router.get("/health")
@@ -125,33 +142,64 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
         msg = await telegram_client.get_messages(chat_id, ids=message_id)
         if not msg or not msg.media:
             raise HTTPException(404, "Media not found")
+
         file_size = msg.file.size
         mime = msg.file.mime_type or "video/mp4"
         fname = msg.file.name or f"file_{message_id}"
         range_header = request.headers.get("range")
+
         if not range_header:
-            return Response(
+            # ✅ FIX: Stream full file instead of returning empty Response
+            async def gen_full():
+                async for chunk in telegram_client.iter_download(msg.media, request_size=CHUNK_SIZE):
+                    yield chunk
+
+            return StreamingResponse(
+                gen_full(),
+                status_code=200,
+                media_type=mime,
                 headers={
                     "Accept-Ranges": "bytes",
                     "Content-Length": str(file_size),
-                    "Content-Type": mime,
                     "Content-Disposition": f'inline; filename="{fname}"',
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+                    **CORS_HEADERS,
                 }
             )
+
+        # Parse Range header
         range_val = range_header.replace("bytes=", "")
         start_str, end_str = range_val.split("-")
         start = int(start_str)
-        end = int(end_str) if end_str else file_size - 1
+        # ✅ FIX: Limit each range chunk to max 2MB to avoid memory issues
+        max_chunk = 2 * 1024 * 1024
+        end = min(int(end_str) if end_str else file_size - 1, file_size - 1)
+        # Also cap to max_chunk from start if the request is huge
+        if end - start + 1 > max_chunk:
+            end = start + max_chunk - 1
         length = end - start + 1
-        if start >= file_size or end >= file_size:
-            return Response(status_code=416)
 
+        if start >= file_size:
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{file_size}", **CORS_HEADERS}
+            )
+
+        # ✅ FIX: Stream all chunks until `length` bytes sent (not just first chunk)
         async def generate():
-            async for chunk in telegram_client.iter_download(msg.media, offset=start, request_size=length):
-                yield chunk[:length]
-                break
+            bytes_sent = 0
+            async for chunk in telegram_client.iter_download(
+                msg.media,
+                offset=start,
+                request_size=CHUNK_SIZE
+            ):
+                remaining = length - bytes_sent
+                if remaining <= 0:
+                    break
+                data = chunk[:remaining]
+                bytes_sent += len(data)
+                yield data
+                if bytes_sent >= length:
+                    break
 
         return StreamingResponse(
             generate(),
@@ -162,8 +210,7 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(length),
                 "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+                **CORS_HEADERS,
             }
         )
     except errors.RPCError as e:
@@ -183,11 +230,14 @@ async def download_file(chat_id: int, message_id: int):
     mime = msg.file.mime_type or "application/octet-stream"
 
     async def gen():
-        async for chunk in telegram_client.iter_download(msg.media):
+        async for chunk in telegram_client.iter_download(msg.media, request_size=CHUNK_SIZE):
             yield chunk
 
     return StreamingResponse(
         gen(),
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            **CORS_HEADERS,
+        }
     )
