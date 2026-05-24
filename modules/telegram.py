@@ -4,9 +4,10 @@ from typing import Dict, Tuple
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pyrogram import Client
-import nest_asyncio
 
-nest_asyncio.apply()
+# HAPUS atau KOMENTAR baris ini:
+# import nest_asyncio
+# nest_asyncio.apply()
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -18,14 +19,22 @@ if not SESSION_STRING:
 _file_cache: Dict[str, Tuple[int, int, int, str]] = {}
 
 async def get_client() -> Client:
-    return Client("telegram_manager", session_string=SESSION_STRING, in_memory=True)
+    """Buat instance Pyrogram client tanpa nest_asyncio"""
+    return Client(
+        "telegram_manager",
+        session_string=SESSION_STRING,
+        in_memory=True,
+        # Tambahkan ini untuk menghindari loop issues
+        no_updates=True,
+        workdir="."
+    )
 
 @router.get("/health")
 async def health():
     return {
         "status": "healthy",
         "configured": bool(SESSION_STRING),
-        "session_length": len(SESSION_STRING)
+        "session_length": len(SESSION_STRING) if SESSION_STRING else 0
     }
 
 @router.get("/dialogs")
@@ -47,6 +56,7 @@ async def get_dialogs():
                     })
             return {"dialogs": dialogs}
     except Exception as e:
+        print(f"Error in get_dialogs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/chat/{chat_id}/files")
@@ -108,6 +118,7 @@ async def get_chat_files(chat_id: int, limit: int = 100):
                     })
             return {"files": files}
     except Exception as e:
+        print(f"Error in get_chat_files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/stream/{file_id}")
@@ -117,7 +128,6 @@ async def stream_file(request: Request, file_id: str):
     
     try:
         cached = _file_cache.get(file_id)
-        file_size = cached[2] if cached else None
         mime_type = cached[3] if cached else "video/mp4"
         
         async def generate():
@@ -127,4 +137,5 @@ async def stream_file(request: Request, file_id: str):
         
         return StreamingResponse(generate(), media_type=mime_type)
     except Exception as e:
+        print(f"Error in stream_file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
