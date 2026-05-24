@@ -48,15 +48,29 @@ async def shutdown_client():
         print("✅ Telegram client disconnected")
 
 # ========== HELPER: AMBIL FILE DARI CHAT ==========
-async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
+async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
     """Ambil daftar media dari suatu chat, dengan cache"""
     if chat_id in files_cache:
         return files_cache[chat_id]
 
     files = []
     try:
+        print(f"🔄 Loading files from chat {chat_id}...")
         async for message in telegram_client.iter_messages(chat_id, limit=limit):
-            # Gunakan properti langsung dari message
+            # Lewati pesan tanpa media
+            if not message.media:
+                continue
+
+            # Inisialisasi variabel
+            mtype = None
+            name = None
+            size = 0
+            duration = None
+            width = height = None
+            file_id = None
+            date = message.date.timestamp() if message.date else None
+
+            # Deteksi tipe media menggunakan properti langsung
             if message.video:
                 mtype = "video"
                 video = message.video
@@ -66,32 +80,25 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                 width = video.width
                 height = video.height
                 file_id = str(video.id)
-                date = message.date.timestamp() if message.date else None
-                
             elif message.audio:
                 mtype = "audio"
                 audio = message.audio
                 name = audio.file_name or f"audio_{message.id}.mp3"
                 size = audio.size
                 duration = audio.duration
-                width = height = None
                 file_id = str(audio.id)
-                date = message.date.timestamp() if message.date else None
-                
             elif message.photo:
                 mtype = "image"
                 photo = message.photo
                 name = f"photo_{message.id}.jpg"
                 size = photo.size
-                duration = None
                 width = photo.width
                 height = photo.height
                 file_id = str(photo.id)
-                date = message.date.timestamp() if message.date else None
-                
             elif message.document:
                 doc = message.document
                 mime = doc.mime_type or ""
+                # Tentukan tipe berdasarkan mime_type atau ekstensi
                 if mime.startswith('video/'):
                     mtype = "video"
                 elif mime.startswith('audio/'):
@@ -99,20 +106,28 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                 elif mime.startswith('image/'):
                     mtype = "image"
                 else:
-                    mtype = "document"
-                name = doc.file_name or f"file_{message.id}"
+                    # Cek ekstensi file
+                    name = doc.file_name or f"file_{message.id}"
+                    ext = name.split('.')[-1].lower() if '.' in name else ''
+                    if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm']:
+                        mtype = "video"
+                    elif ext in ['mp3', 'm4a', 'wav', 'ogg', 'flac']:
+                        mtype = "audio"
+                    elif ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                        mtype = "image"
+                    else:
+                        mtype = "document"
+                if not name:
+                    name = doc.file_name or f"document_{message.id}"
                 size = doc.size
-                # duration mungkin ada untuk video/audio dalam document
-                duration = None
+                # Durasi mungkin ada di atribut video/audio dalam dokumen
                 for attr in doc.attributes:
                     if hasattr(attr, 'duration'):
                         duration = attr.duration
                         break
-                width = height = None
                 file_id = str(doc.id)
-                date = message.date.timestamp() if message.date else None
             else:
-                continue  # Bukan media
+                continue  # Bukan media yang dikenal
 
             files.append({
                 "id": message.id,
@@ -125,16 +140,15 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                 "height": height,
                 "date": date,
             })
-        # Balik urutan agar dari yang paling lama ke terbaru? Terserah.
-        # Biasanya diinginkan yang terbaru di atas. Kita reverse.
-        files.reverse()
+        # Urutkan dari yang terbaru ke terlama (atau sebaliknya, terserah)
+        files.reverse()  # agar yang paling lama di bawah? Sesuaikan kebutuhan
         files_cache[chat_id] = files
         print(f"✅ Loaded {len(files)} files from chat {chat_id}")
 
     except errors.RPCError as e:
-        print(f"❌ Telethon error loading files: {e}")
+        print(f"❌ Telethon RPC error in load_chat_files: {e}")
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print(f"❌ Unexpected error in load_chat_files: {e}")
 
     return files
 
@@ -156,14 +170,24 @@ async def get_dialogs():
     dialogs = []
     async for dialog in telegram_client.iter_dialogs():
         chat = dialog.entity
-        # Hanya tampilkan channel, supergroup, grup biasa
-        if getattr(chat, 'broadcast', False) or getattr(chat, 'megagroup', False) or getattr(chat, 'group', False):
-            dialogs.append({
-                "id": chat.id,
-                "name": chat.title,
-                "type": "channel" if getattr(chat, 'broadcast', False) else "group",
-                "unread_count": dialog.unread_count,
-            })
+        # Tampilkan semua chat kecuali dialog pribadi (user) yang tidak perlu
+        # Kita ingin channel, supergroup, group
+        chat_type = None
+        if hasattr(chat, 'broadcast') and chat.broadcast:
+            chat_type = "channel"
+        elif hasattr(chat, 'megagroup') and chat.megagroup:
+            chat_type = "group"
+        elif hasattr(chat, 'group') and chat.group:
+            chat_type = "group"
+        else:
+            # Lewati private chat, bot, dll.
+            continue
+        dialogs.append({
+            "id": chat.id,
+            "name": chat.title,
+            "type": chat_type,
+            "unread_count": getattr(dialog, 'unread_count', 0),
+        })
     return {"dialogs": dialogs, "total": len(dialogs)}
 
 @router.get("/chat/{chat_id}/files")
@@ -171,15 +195,17 @@ async def get_chat_files(chat_id: int):
     """Ambil daftar file dari chat tertentu"""
     if not telegram_client.is_connected():
         raise HTTPException(503, "Telegram client not ready")
-    files = await load_chat_files(chat_id)
-    return {"files": files, "total": len(files), "chat_id": chat_id}
+
+    try:
+        files = await load_chat_files(chat_id)
+        return {"files": files, "total": len(files), "chat_id": chat_id}
+    except Exception as e:
+        print(f"Error in get_chat_files: {e}")
+        return {"files": [], "total": 0, "chat_id": chat_id, "error": str(e)}
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_file(chat_id: int, message_id: int):
-    """
-    Mengembalikan redirect (302) ke direct download link dari CDN Telegram.
-    Browser akan langsung mengakses CDN, sehingga server tidak terbebani bandwidth.
-    """
+    """Redirect ke direct download link dari CDN Telegram"""
     if not telegram_client.is_connected():
         raise HTTPException(503, "Telegram client not ready")
 
@@ -188,12 +214,10 @@ async def stream_file(chat_id: int, message_id: int):
         if not message or not message.media:
             raise HTTPException(404, "Media not found")
 
-        # Dapatkan direct download link (berlaku ~1 jam)
         direct_url = await telegram_client.get_direct_download_link(message.media)
         if not direct_url:
             raise HTTPException(500, "Could not generate direct download link")
 
-        # Redirect ke CDN Telegram
         return RedirectResponse(url=direct_url, status_code=302)
 
     except errors.RPCError as e:
@@ -203,5 +227,5 @@ async def stream_file(chat_id: int, message_id: int):
 
 @router.get("/download/{chat_id}/{message_id}")
 async def download_file(chat_id: int, message_id: int):
-    """Sama seperti stream, redirect ke direct link (sehingga browser mendownload)"""
+    """Redirect ke direct link (sama seperti stream)"""
     return await stream_file(chat_id, message_id)
