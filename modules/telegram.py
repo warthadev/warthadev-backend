@@ -23,9 +23,9 @@ telegram_client = Client(
 
 # Cache
 file_sizes: Dict[str, int] = {}
-files_cache: Dict[int, List[dict]] = {}  # chat_id -> list of files
+files_cache: Dict[int, List[dict]] = {}
 
-# ========== LIFECYCLE FUNCTIONS (dipanggil dari main.py) ==========
+# ========== LIFECYCLE FUNCTIONS ==========
 async def start_client():
     """Start Telegram client saat aplikasi startup"""
     if SESSION_STRING and not telegram_client.is_connected:
@@ -40,6 +40,10 @@ async def shutdown_client():
     if telegram_client.is_connected:
         await telegram_client.stop()
         print("✅ Telegram client stopped")
+
+def register_telegram_events(app):
+    app.add_event_handler("startup", start_client)
+    app.add_event_handler("shutdown", shutdown_client)
 
 # ========== HELPER ==========
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
@@ -63,7 +67,6 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "width": msg.video.width,
                     "height": msg.video.height,
                     "date": msg.date.timestamp() if msg.date else None,
-                    "caption": msg.caption if hasattr(msg, 'caption') else None,
                 })
                 file_sizes[msg.video.file_id] = msg.video.file_size
             
@@ -77,7 +80,6 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "media_type": "audio",
                     "duration": msg.audio.duration,
                     "date": msg.date.timestamp() if msg.date else None,
-                    "caption": msg.caption if hasattr(msg, 'caption') else None,
                 })
                 file_sizes[msg.audio.file_id] = msg.audio.file_size
             
@@ -93,11 +95,10 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "width": photo.width,
                     "height": photo.height,
                     "date": msg.date.timestamp() if msg.date else None,
-                    "caption": msg.caption if hasattr(msg, 'caption') else None,
                 })
                 file_sizes[photo.file_id] = photo.file_size
             
-            # Document (termasuk video)
+            # Document (termasuk video dalam archive)
             elif msg.document and msg.document.file_name:
                 name = msg.document.file_name
                 ext = name.split('.')[-1].lower()
@@ -117,11 +118,10 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "file_id": msg.document.file_id,
                     "media_type": media_type,
                     "date": msg.date.timestamp() if msg.date else None,
-                    "caption": msg.caption if hasattr(msg, 'caption') else None,
                 })
                 file_sizes[msg.document.file_id] = msg.document.file_size
         
-        files.reverse()  # oldest first
+        files.reverse()
         files_cache[chat_id] = files
         print(f"✅ Loaded {len(files)} files from chat {chat_id}")
     except Exception as e:
@@ -129,6 +129,14 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
         files = []
     
     return files
+
+async def count_chat_files(chat_id: int) -> int:
+    """Hitung jumlah file dalam chat (pakai cache)"""
+    try:
+        files = await load_chat_files(chat_id)
+        return len(files)
+    except:
+        return 0
 
 # ========== ENDPOINTS ==========
 @router.get("/health")
@@ -150,11 +158,13 @@ async def get_dialogs():
         async for dialog in telegram_client.get_dialogs():
             chat = dialog.chat
             if chat.type in [enums.ChatType.CHANNEL, enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+                total_files = await count_chat_files(chat.id)
                 dialogs.append({
                     "id": chat.id,
                     "name": chat.title,
                     "type": str(chat.type).split('.')[-1].lower(),
                     "unread_count": dialog.unread_messages_count or 0,
+                    "total_files": total_files,
                 })
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch dialogs: {str(e)}")
@@ -176,11 +186,11 @@ async def get_chat_files(chat_id: int):
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_file(request: Request, chat_id: int, message_id: int):
-    """Stream file (video/audio/image) dengan dukungan seeking"""
+    """Stream file dengan dukungan seeking - PAKAI MESSAGE ID"""
     if not SESSION_STRING or not telegram_client.is_connected:
         raise HTTPException(500, "Telegram client not ready")
     
-    # Ambil message
+    # Ambil message berdasarkan ID
     msg = await telegram_client.get_messages(chat_id, message_id)
     if not msg:
         raise HTTPException(404, "Message not found")
@@ -201,13 +211,13 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
     elif msg.document:
         file_id = msg.document.file_id
         file_size = msg.document.file_size
-        mime_type = msg.document.mime_type or "application/octet-stream"
+        mime_type = msg.document.mime_type or "video/mp4"
     else:
-        raise HTTPException(404, "No media found in this message")
+        raise HTTPException(404, "No media found")
     
     range_header = request.headers.get("range")
     
-    # ========== SEEKING MODE (sama seperti di Colab) ==========
+    # ========== SEEKING MODE ==========
     if range_header and range_header.startswith("bytes=") and file_size:
         try:
             range_val = range_header.replace("bytes=", "")
@@ -219,7 +229,7 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
                 return Response(status_code=416)
             
             requested_bytes = end_byte - start_byte + 1
-            CHUNK_SIZE = 1024 * 1024
+            CHUNK_SIZE = 1024 * 1024  # 1MB chunks
             start_chunk = start_byte // CHUNK_SIZE
             end_chunk = (end_byte // CHUNK_SIZE) + 1
             chunks_needed = end_chunk - start_chunk
@@ -252,7 +262,6 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
             )
         except Exception as e:
             print(f"Seeking error: {e}")
-            # Fallback ke normal stream
     
     # ========== NORMAL STREAM ==========
     async def generate_chunks():
@@ -271,7 +280,7 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
 
 @router.get("/download/{chat_id}/{message_id}")
 async def download_file(chat_id: int, message_id: int):
-    """Download file asli (attachment)"""
+    """Download file asli"""
     if not SESSION_STRING or not telegram_client.is_connected:
         raise HTTPException(500, "Telegram client not ready")
     
@@ -279,7 +288,6 @@ async def download_file(chat_id: int, message_id: int):
     if not msg:
         raise HTTPException(404, "Message not found")
     
-    # Tentukan file_id dan nama
     if msg.video:
         file_id = msg.video.file_id
         filename = msg.video.file_name or f"video_{message_id}.mp4"
