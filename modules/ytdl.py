@@ -1,3 +1,4 @@
+# modules/ytdl.py
 import os
 import yt_dlp
 import random
@@ -72,7 +73,6 @@ def get_ydl_opts() -> Dict[str, Any]:
     ]
 
     return {
-        # Keep logs visible so you can debug extractor issues
         "quiet": False,
         "no_warnings": False,
         "skip_download": True,
@@ -81,7 +81,6 @@ def get_ydl_opts() -> Dict[str, Any]:
         "socket_timeout": 30,
         "retries": 10,
         "fragment_retries": 10,
-        # Prefer best video+audio; fall back to best muxed
         "format": "bv*+ba/b",
         "extractor_args": {
             "youtube": {
@@ -91,7 +90,6 @@ def get_ydl_opts() -> Dict[str, Any]:
             "instagram": {
                 "check_headers": True,
             },
-            # added to mimic your Colab script behaviour
             "generic": ["impersonate"],
         },
         "http_headers": {
@@ -113,11 +111,9 @@ def _normalize_url(url: str) -> str:
     """
     target_url = url.strip()
 
-    # YouTube Shorts -> standard watch URL
     if "/shorts/" in target_url:
         target_url = target_url.replace("/shorts/", "/watch?v=")
 
-    # Instagram: drop query string and normalize /reel/{id}/
     if "instagram.com" in target_url:
         base = target_url.split("?", 1)[0]
         match = re.search(r"(https://www\.instagram\.com/reel/[^/?#]+)", base)
@@ -145,7 +141,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             "message": "No downloadable video formats were found.",
         }
 
-    # Audio-only formats
     audio_only = [
         f
         for f in raw_formats
@@ -164,14 +159,12 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             best_audio.get("abr") or best_audio.get("tbr"),
         )
 
-    # All video formats that have a height
     video_formats = [
         f
         for f in raw_formats
         if f.get("height") is not None and f.get("vcodec") not in [None, "none"]
     ]
 
-    # 1) Find best muxed MP4 (has audio & mp4 container)
     muxed_candidates = [
         f
         for f in video_formats
@@ -192,7 +185,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             best_muxed.get("height"),
         )
 
-    # 2) Build resolution list
     mp4_formats = []
     seen_res = set()
 
@@ -236,7 +228,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         size = f.get("filesize") or f.get("filesize_approx")
-        # skip obviously broken / zero-size formats
         if size is not None and size <= 0:
             logger.warning(
                 "Format %s has invalid filesize=%s, skipping", res_label, size
@@ -247,7 +238,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "resolution": res_label,
                 "video_url": video_url,
-                # If video already has audio, no separate audio_url is needed
                 "audio_url": None
                 if has_audio
                 else (best_audio.get("url") if best_audio else None),
@@ -262,10 +252,8 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    # Limit resolution list
     mp4_formats = mp4_formats[:12]
 
-    # MP3 formats (audio-only)
     mp3_formats = []
     for idx, f in enumerate(audio_only[:3], 1):
         quality = "HQ" if idx == 1 else f"Quality {idx}"
@@ -283,7 +271,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
         "mp3_formats": mp3_formats,
     }
 
-    # Overall best muxed video for “best quality” download
     if best_muxed is not None and best_muxed.get("url"):
         result["best_muxed"] = {
             "video_url": best_muxed.get("url"),
@@ -292,7 +279,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             "filesize": best_muxed.get("filesize") or best_muxed.get("filesize_approx"),
         }
 
-    # If nothing usable, treat as error
     if not mp4_formats and not mp3_formats:
         return {
             "success": False,
@@ -305,7 +291,6 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
 def extract_video_logic(url: str) -> Dict[str, Any]:
     """
     Extract video info using yt-dlp with special handling for Instagram Reels and Shorts.
-    Public mode only (no cookies) – private/age‑restricted content will fail gracefully.
     """
     target_url = _normalize_url(url)
 
@@ -322,7 +307,6 @@ def extract_video_logic(url: str) -> Dict[str, Any]:
                 "message": "Could not extract video information. Please try again.",
             }
 
-        # Some Instagram URLs return a playlist with 'entries'; pick first entry
         if "entries" in info and isinstance(info["entries"], list):
             if not info["entries"]:
                 return {
@@ -502,7 +486,6 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     try:
         logger.info("Starting mux for resolution: %s", request.resolution)
 
-        # Double-check URLs (already validated by Pydantic)
         if not request.video_url or not request.audio_url:
             raise HTTPException(
                 status_code=400,
@@ -620,7 +603,6 @@ async def handle_ytdl(request: VideoRequest):
     try:
         result = extract_video_logic(request.url)
         if not result.get("success"):
-            # In public mode we return 400 for non-downloadable content
             return JSONResponse(status_code=400, content=result)
         return result
     except Exception as e:
@@ -637,4 +619,13 @@ async def handle_ytdl(request: VideoRequest):
 @router.get("/health")
 async def health_check():
     """
-    Simple health check endpoint fo
+    Simple health check endpoint for monitoring.
+    """
+    return {
+        "status": "healthy",
+        "service": "video-extractor",
+        "ffmpeg": subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True
+        ).returncode
+        == 0,
+    }
