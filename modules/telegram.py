@@ -1,4 +1,3 @@
-# modules/telegram.py
 import os
 import asyncio
 from typing import Dict, List
@@ -55,7 +54,6 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
     files = []
     try:
         print(f"Scanning chat {chat_id} for media files...")
-
         async for message in telegram_client.iter_messages(
             chat_id,
             limit=limit,
@@ -90,15 +88,12 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "date": message.date.timestamp() if message.date else None,
                     "caption": message.text if message.text else None,
                 })
-
         files_cache[chat_id] = files
         print(f"Found {len(files)} media files from chat {chat_id}")
-
     except Exception as e:
         print(f"Error loading files: {e}")
         import traceback
         traceback.print_exc()
-
     return files
 
 
@@ -120,7 +115,6 @@ async def get_dialogs():
     async for dialog in telegram_client.iter_dialogs():
         chat = dialog.entity
         chat_type = None
-
         if hasattr(chat, 'broadcast') and chat.broadcast:
             chat_type = "channel"
         elif hasattr(chat, 'megagroup') and chat.megagroup:
@@ -129,14 +123,12 @@ async def get_dialogs():
             chat_type = "group"
         else:
             continue
-
         dialogs.append({
             "id": chat.id,
             "name": chat.title,
             "type": chat_type,
             "unread_count": getattr(dialog, 'unread_count', 0),
         })
-
     return {"dialogs": dialogs, "total": len(dialogs)}
 
 
@@ -144,7 +136,6 @@ async def get_dialogs():
 async def get_chat_files(chat_id: int, limit: int = 500):
     if not telegram_client.is_connected():
         raise HTTPException(503, "Telegram client not ready")
-
     files = await load_chat_files(chat_id, limit=limit)
     return {"files": files, "total": len(files), "chat_id": chat_id}
 
@@ -153,22 +144,29 @@ async def get_chat_files(chat_id: int, limit: int = 500):
 async def stream_file(chat_id: int, message_id: int):
     if not telegram_client.is_connected():
         raise HTTPException(503, "Telegram client not ready")
-
     try:
-        message = await telegram_client.get_messages(chat_id, ids=message_id)
-        if not message or not message.media:
-            raise HTTPException(404, "Media not found")
-
-        direct_url = await telegram_client.get_direct_download_link(message.media)
+        msg = await telegram_client.get_messages(chat_id, ids=message_id)
+        if not msg:
+            raise HTTPException(404, "Message not found")
+        if not msg.media:
+            raise HTTPException(404, "No media in this message")
+        
+        # Generate direct download link
+        direct_url = await telegram_client.get_direct_download_link(msg.media)
         if not direct_url:
-            raise HTTPException(500, "Could not generate direct download link")
-
+            raise HTTPException(500, "Could not generate direct link")
+        
+        # Log URL untuk debugging (akan muncul di log Render)
+        print(f"Stream redirect: {direct_url}")
+        
+        # Redirect ke CDN Telegram
         return RedirectResponse(url=direct_url, status_code=302)
-
     except errors.RPCError as e:
-        raise HTTPException(500, f"Telegram RPC error: {str(e)}")
+        print(f"RPC error: {e}")
+        raise HTTPException(500, str(e))
     except Exception as e:
-        raise HTTPException(500, f"Unexpected error: {str(e)}")
+        print(f"Unexpected error: {e}")
+        raise HTTPException(500, str(e))
 
 
 @router.get("/download/{chat_id}/{message_id}")
