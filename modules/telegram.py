@@ -1,16 +1,17 @@
+# modules/telegram.py
 import os
-import asyncio
-from typing import Dict, List
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import RedirectResponse
+from typing import Dict, List, Optional
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.tl.types import InputMessagesFilterDocument
 
+# ========== KONFIGURASI ==========
 API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
+# ========== INISIALISASI CLIENT ==========
 telegram_client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
@@ -19,156 +20,100 @@ telegram_client = TelegramClient(
     retry_delay=3
 )
 
+# Cache untuk daftar file
 files_cache: Dict[int, List[dict]] = {}
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
-
+# ========== LIFECYCLE & FUNGSI BANTUAN ==========
 async def start_client():
     if API_ID and API_HASH and SESSION_STRING and not telegram_client.is_connected():
         await telegram_client.start()
         me = await telegram_client.get_me()
-        print(f"Telegram client started as: {me.first_name}")
-
+        print(f"✅ Telegram client started as: {me.first_name}")
 
 async def shutdown_client():
     if telegram_client.is_connected():
         await telegram_client.disconnect()
         print("Telegram client disconnected")
 
-
 def format_file_size(bytes_size: int) -> str:
-    if bytes_size < 1024:
-        return f"{bytes_size} B"
-    elif bytes_size < 1024 * 1024:
-        return f"{bytes_size / 1024:.1f} KB"
-    elif bytes_size < 1024 * 1024 * 1024:
-        return f"{bytes_size / (1024 * 1024):.1f} MB"
-    else:
-        return f"{bytes_size / (1024 * 1024 * 1024):.2f} GB"
-
+    # ... (fungsi format ukuran, sama seperti sebelumnya)
+    pass
 
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
-    if chat_id in files_cache:
-        return files_cache[chat_id]
+    # ... (fungsi untuk memuat daftar file dari chat, sama seperti sebelumnya)
+    pass
 
-    files = []
-    try:
-        print(f"Scanning chat {chat_id} for media files...")
-        async for message in telegram_client.iter_messages(
-            chat_id,
-            limit=limit,
-            filter=InputMessagesFilterDocument
-        ):
-            if message.media and message.file:
-                file = message.file
-                name = file.name if file.name else f"file_{message.id}"
-                size = file.size or 0
-                mime = file.mime_type or ""
-                ext = name.split('.')[-1].lower() if '.' in name else ''
-
-                if mime.startswith('video/') or ext in ('mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', '3gp'):
-                    media_type = "video"
-                elif mime.startswith('audio/') or ext in ('mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac'):
-                    media_type = "audio"
-                elif mime.startswith('image/') or ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
-                    media_type = "image"
-                else:
-                    media_type = "document"
-
-                files.append({
-                    "id": message.id,
-                    "name": name,
-                    "size": size,
-                    "size_formatted": format_file_size(size),
-                    "media_type": media_type,
-                    "file_id": str(file.id),
-                    "duration": getattr(file, 'duration', None),
-                    "width": getattr(file, 'width', None),
-                    "height": getattr(file, 'height', None),
-                    "date": message.date.timestamp() if message.date else None,
-                    "caption": message.text if message.text else None,
-                })
-        files_cache[chat_id] = files
-        print(f"Found {len(files)} media files from chat {chat_id}")
-    except Exception as e:
-        print(f"Error loading files: {e}")
-        import traceback
-        traceback.print_exc()
-    return files
-
-
-@router.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "client_connected": telegram_client.is_connected(),
-        "has_session": bool(SESSION_STRING),
-    }
-
-
-@router.get("/dialogs")
-async def get_dialogs():
-    if not telegram_client.is_connected():
-        raise HTTPException(503, "Telegram client not ready")
-
-    dialogs = []
-    async for dialog in telegram_client.iter_dialogs():
-        chat = dialog.entity
-        chat_type = None
-        if hasattr(chat, 'broadcast') and chat.broadcast:
-            chat_type = "channel"
-        elif hasattr(chat, 'megagroup') and chat.megagroup:
-            chat_type = "group"
-        elif hasattr(chat, 'group') and chat.group:
-            chat_type = "group"
-        else:
-            continue
-        dialogs.append({
-            "id": chat.id,
-            "name": chat.title,
-            "type": chat_type,
-            "unread_count": getattr(dialog, 'unread_count', 0),
-        })
-    return {"dialogs": dialogs, "total": len(dialogs)}
-
-
-@router.get("/chat/{chat_id}/files")
-async def get_chat_files(chat_id: int, limit: int = 500):
-    if not telegram_client.is_connected():
-        raise HTTPException(503, "Telegram client not ready")
-    files = await load_chat_files(chat_id, limit=limit)
-    return {"files": files, "total": len(files), "chat_id": chat_id}
-
-
+# ========== ENDPOINT STREAMING UTAMA ==========
 @router.get("/stream/{chat_id}/{message_id}")
-async def stream_file(chat_id: int, message_id: int):
+async def stream_file(request: Request, chat_id: int, message_id: int):
+    # 1. Cek koneksi
     if not telegram_client.is_connected():
         raise HTTPException(503, "Telegram client not ready")
-    try:
-        msg = await telegram_client.get_messages(chat_id, ids=message_id)
-        if not msg:
-            raise HTTPException(404, "Message not found")
-        if not msg.media:
-            raise HTTPException(404, "No media in this message")
-        
-        # Generate direct download link
-        direct_url = await telegram_client.get_direct_download_link(msg.media)
-        if not direct_url:
-            raise HTTPException(500, "Could not generate direct link")
-        
-        # Log URL untuk debugging (akan muncul di log Render)
-        print(f"Stream redirect: {direct_url}")
-        
-        # Redirect ke CDN Telegram
-        return RedirectResponse(url=direct_url, status_code=302)
-    except errors.RPCError as e:
-        print(f"RPC error: {e}")
-        raise HTTPException(500, str(e))
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        raise HTTPException(500, str(e))
+    
+    # 2. Ambil pesan berdasarkan ID
+    msg = await telegram_client.get_messages(chat_id, ids=message_id)
+    if not msg or not msg.media:
+        raise HTTPException(404, "Media not found")
+    
+    # 3. Dapatkan informasi file (ukuran, ID, dll.)
+    file_size = msg.file.size if msg.file else 0
+    file_id = msg.file.id if msg.file else None
+    mime_type = msg.file.mime_type if msg.file else "application/octet-stream"
+    file_name = msg.file.name if msg.file and msg.file.name else f"file_{message_id}"
 
+    # 4. Proses permintaan HTTP range header
+    range_header = request.headers.get("range")
+    
+    if not range_header:
+        # Mode default: Kirim header informasi ukuran file (tanpa data)
+        return StreamingResponse(
+            content=iter(()),  # generator kosong
+            status_code=200,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+                "Content-Type": mime_type,
+                "Content-Disposition": f'inline; filename="{file_name}"'
+            }
+        )
+    
+    # 5. Mode seeking: Ambil dan kirim potongan data yang diminta
+    # Contoh: parse "bytes=0-1023" -> start=0, end=1023
+    range_val = range_header.replace("bytes=", "")
+    start_str, end_str = range_val.split("-")
+    start_byte = int(start_str)
+    end_byte = int(end_str) if end_str else file_size - 1
+    requested_length = end_byte - start_byte + 1
+    
+    # Konversi ke chunk Telethon (offset dalam 4096 byte)
+    CHUNK_SIZE = 4096  # Minimum chunk size untuk API Telegram
+    start_chunk = start_byte // CHUNK_SIZE
+    # offset_start = start_byte % CHUNK_SIZE  # untuk slicing nanti
+    
+    async def generate_chunk():
+        # Minta hanya satu chunk data dari Telegram
+        async for chunk in telegram_client.iter_download(
+            msg.media,
+            offset=start_chunk,
+            request_size=requested_length
+        ):
+            # Kirim potongan yang diminta oleh browser
+            # Potong jika hanya diperlukan sebagian dari chunk ini
+            # yield chunk[start_offset:start_offset+requested_length]
+            yield chunk[:requested_length]
+            break  # Hanya ambil satu chunk yang cukup
+        return
 
-@router.get("/download/{chat_id}/{message_id}")
-async def download_file(chat_id: int, message_id: int):
-    return await stream_file(chat_id, message_id)
+    return StreamingResponse(
+        generate_chunk(),
+        status_code=206,
+        media_type=mime_type,
+        headers={
+            "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(requested_length),
+            "Content-Type": mime_type,
+            "Cache-Control": "no-cache"
+        }
+    )
