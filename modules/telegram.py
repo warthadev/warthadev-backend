@@ -1,11 +1,11 @@
 # modules/telegram.py
 import os
-from typing import Dict, List, Optional
+import asyncio
+from typing import Dict, List
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-import asyncio
 
 # ========== KONFIGURASI ==========
 API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
@@ -47,17 +47,23 @@ async def shutdown_client():
         await telegram_client.disconnect()
         print("✅ Telegram client disconnected")
 
-# ========== HELPER: AMBIL FILE DARI CHAT ==========
-async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
-    """Ambil daftar media dari suatu chat, dengan cache"""
+# ========== HELPER: AMBIL FILE DENGAN DUA LANGKAH ==========
+async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
+    """Ambil daftar media dari chat dengan pendekatan dua langkah untuk menghindari expired reference."""
     if chat_id in files_cache:
         return files_cache[chat_id]
 
     files = []
+    # Langkah 1: Ambil semua pesan sebagai list terlebih dahulu
+    all_messages = []
     try:
-        print(f"🔄 Loading files from chat {chat_id}...")
-        async for message in telegram_client.iter_messages(chat_id, limit=limit):
-            # Lewati pesan tanpa media
+        print(f"🔄 Mengambil {limit} pesan dari chat {chat_id}...")
+        async for message in telegram_client.iter_messages(chat_id, limit=limit, wait_time=0.5):
+            all_messages.append(message)
+        print(f"✅ Berhasil mengambil {len(all_messages)} pesan. Memproses file...")
+
+        # Langkah 2: Proses setiap pesan yang mengandung media
+        for idx, message in enumerate(all_messages):
             if not message.media:
                 continue
 
@@ -70,7 +76,6 @@ async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
             file_id = None
             date = message.date.timestamp() if message.date else None
 
-            # Deteksi tipe media menggunakan properti langsung
             if message.video:
                 mtype = "video"
                 video = message.video
@@ -98,7 +103,7 @@ async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
             elif message.document:
                 doc = message.document
                 mime = doc.mime_type or ""
-                # Tentukan tipe berdasarkan mime_type atau ekstensi
+                # Tentukan tipe berdasarkan mime atau ekstensi
                 if mime.startswith('video/'):
                     mtype = "video"
                 elif mime.startswith('audio/'):
@@ -107,8 +112,8 @@ async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
                     mtype = "image"
                 else:
                     # Cek ekstensi file
-                    name = doc.file_name or f"file_{message.id}"
-                    ext = name.split('.')[-1].lower() if '.' in name else ''
+                    fname = doc.file_name or f"file_{message.id}"
+                    ext = fname.split('.')[-1].lower() if '.' in fname else ''
                     if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm']:
                         mtype = "video"
                     elif ext in ['mp3', 'm4a', 'wav', 'ogg', 'flac']:
@@ -117,17 +122,18 @@ async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
                         mtype = "image"
                     else:
                         mtype = "document"
+                    name = fname
                 if not name:
                     name = doc.file_name or f"document_{message.id}"
                 size = doc.size
-                # Durasi mungkin ada di atribut video/audio dalam dokumen
+                # Durasi mungkin ada di atribut
                 for attr in doc.attributes:
                     if hasattr(attr, 'duration'):
                         duration = attr.duration
                         break
                 file_id = str(doc.id)
             else:
-                continue  # Bukan media yang dikenal
+                continue
 
             files.append({
                 "id": message.id,
@@ -140,15 +146,24 @@ async def load_chat_files(chat_id: int, limit: int = 200) -> List[dict]:
                 "height": height,
                 "date": date,
             })
-        # Urutkan dari yang terbaru ke terlama (atau sebaliknya, terserah)
-        files.reverse()  # agar yang paling lama di bawah? Sesuaikan kebutuhan
+
+            # Jeda kecil setiap 50 pesan agar tidak kena rate limit
+            if idx % 50 == 0 and idx > 0:
+                await asyncio.sleep(1)
+
+        # Urutkan dari yang terbaru ke terlama (atau sebaliknya, sesuaikan kebutuhan)
+        files.reverse()
         files_cache[chat_id] = files
         print(f"✅ Loaded {len(files)} files from chat {chat_id}")
 
     except errors.RPCError as e:
         print(f"❌ Telethon RPC error in load_chat_files: {e}")
+        files = []
     except Exception as e:
         print(f"❌ Unexpected error in load_chat_files: {e}")
+        import traceback
+        traceback.print_exc()
+        files = []
 
     return files
 
@@ -170,8 +185,6 @@ async def get_dialogs():
     dialogs = []
     async for dialog in telegram_client.iter_dialogs():
         chat = dialog.entity
-        # Tampilkan semua chat kecuali dialog pribadi (user) yang tidak perlu
-        # Kita ingin channel, supergroup, group
         chat_type = None
         if hasattr(chat, 'broadcast') and chat.broadcast:
             chat_type = "channel"
