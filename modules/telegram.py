@@ -22,7 +22,7 @@ async def start_client():
     if API_ID and API_HASH and SESSION_STRING and not telegram_client.is_connected():
         await telegram_client.start()
         me = await telegram_client.get_me()
-        print(f"✅ Telegram client started as: {me.first_name}")
+        print(f"Telegram client started as: {me.first_name}")
 
 
 async def shutdown_client():
@@ -33,11 +33,11 @@ async def shutdown_client():
 def format_file_size(s: int) -> str:
     if s < 1024:
         return f"{s} B"
-    if s < 1024**2:
-        return f"{s/1024:.1f} KB"
-    if s < 1024**3:
-        return f"{s/1024**2:.1f} MB"
-    return f"{s/1024**3:.2f} GB"
+    if s < 1024 ** 2:
+        return f"{s / 1024:.1f} KB"
+    if s < 1024 ** 3:
+        return f"{s / 1024 ** 2:.1f} MB"
+    return f"{s / 1024 ** 3:.2f} GB"
 
 
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
@@ -135,7 +135,9 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
                     "Accept-Ranges": "bytes",
                     "Content-Length": str(file_size),
                     "Content-Type": mime,
-                    "Content-Disposition": f'inline; filename="{fname}"'
+                    "Content-Disposition": f'inline; filename="{fname}"',
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
                 }
             )
         range_val = range_header.replace("bytes=", "")
@@ -145,10 +147,12 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
         length = end - start + 1
         if start >= file_size or end >= file_size:
             return Response(status_code=416)
+
         async def generate():
             async for chunk in telegram_client.iter_download(msg.media, offset=start, request_size=length):
                 yield chunk[:length]
                 break
+
         return StreamingResponse(
             generate(),
             status_code=206,
@@ -158,6 +162,8 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(length),
                 "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
             }
         )
     except errors.RPCError as e:
@@ -175,9 +181,11 @@ async def download_file(chat_id: int, message_id: int):
         raise HTTPException(404, "Media not found")
     fname = msg.file.name or f"file_{message_id}"
     mime = msg.file.mime_type or "application/octet-stream"
+
     async def gen():
         async for chunk in telegram_client.iter_download(msg.media):
             yield chunk
+
     return StreamingResponse(
         gen(),
         media_type=mime,
