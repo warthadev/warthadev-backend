@@ -1,173 +1,214 @@
-import logging
-from typing import List, Dict, Optional
-from fastapi import APIRouter, HTTPException, Query
+# modules/telegram.py
+import os
+import asyncio
+from typing import Dict, Tuple
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
-from pyrogram import Client, errors
-import io
+from pyrogram import Client
+import nest_asyncio
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+nest_asyncio.apply()
 
-router = APIRouter(prefix="/telegram")
+router = APIRouter(prefix="/telegram", tags=["telegram"])
 
-# ========== KONFIGURASI ==========
-API_ID = 25590547
-API_HASH = 'cea88887e3f1eca7b048bb85fe97f5be'
-SESSION_STRING = 'BQGGexMATYDTitbHfX-xdLrAob2StdELEBSI281hi7tzYqM2F9IANhltWG9pU2eFNch-dwLAWBsJGTacHUlzWl3EHw2Gt2hzH7M1Uya74QyquOm7lGa3Zfz2iIfl4CmZkQ4taZkM1Tr2pBfSWNtIEoRLArgGfrl0-jDdsPx_kKPOpEftdgFidrPmVUv9rS1OHLKXCrGF3KhV9AZIqNw5cS5TqiHTtiubkD-ECSYL9RtcG-wbY3flfXyRjel5X1SULwzBQBC2PyhTdHwZCENa-FzodMv9Wcym6NQV9tsqyQ19o_lEstkQ2mWiFR6zJR4S9bwDtVJaJ4aYOeW4VzG_OvjfGoAyrwAAAAGQadPXAA'
+# === Konfigurasi dari environment variables ===
+API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
-# 🔥 GANTI DENGAN USERNAME ATAU ID CHANNEL KAMU
-# Cara 1: Pakai username channel (contoh: "warthavideo" tanpa @)
-# Cara 2: Pakai ID numerik dari Colab (contoh: -1002466984537)
-RECIPIENT = "-1002466984537"  # <-- GANTI SESUAI
+if not API_ID or not API_HASH or not SESSION_STRING:
+    raise RuntimeError(
+        "Missing Telegram credentials. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING"
+    )
+
+# Cache untuk menyimpan info file (file_id -> (chat_id, message_id, size))
+_file_cache: Dict[str, Tuple[int, int, int]] = {}
 
 
-async def get_client():
-    """Membuat koneksi Pyrogram (in-memory)"""
+def _cache_file_info(file_id: str, chat_id: int, message_id: int, size: int) -> None:
+    _file_cache[file_id] = (chat_id, message_id, size)
+
+
+async def get_client() -> Client:
+    """Buat instance Pyrogram client (in‑memory)."""
     return Client(
-        "telegram_stream",
+        "telegram_manager",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
-        in_memory=True
+        in_memory=True,
     )
 
 
-@router.get("/files")
-async def get_files(limit: int = Query(100, ge=1, le=500)):
-    """Mengambil daftar file video dari channel Telegram"""
-    try:
-        async with await get_client() as client:
-            logger.info(f"Mencoba mengakses channel: {RECIPIENT}")
-            
-            # Coba resolve channel
-            try:
-                # Jika RECIPIENT numeric string, konversi ke int
-                if RECIPIENT.startswith('-'):
-                    chat_id = int(RECIPIENT)
-                else:
-                    chat_id = RECIPIENT
-                    
-                chat = await client.get_chat(chat_id)
-                logger.info(f"✅ Channel ditemukan: {chat.title} (ID: {chat.id})")
-            except errors.PeerIdInvalid:
-                # Coba cari dari daftar dialog
-                logger.info("Mencari dari daftar dialog...")
-                found = False
-                async for dialog in client.get_dialogs():
-                    if str(dialog.chat.id) == RECIPIENT or dialog.chat.username == RECIPIENT:
-                        chat = dialog.chat
-                        found = True
-                        logger.info(f"✅ Ditemukan dari dialog: {chat.title}")
-                        break
-                
-                if not found:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Channel {RECIPIENT} tidak ditemukan. Pastikan akun sudah join channel."
-                    )
-            except Exception as e:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Channel tidak dapat diakses: {str(e)}"
+@router.get("/dialogs")
+async def get_dialogs():
+    """Daftar semua grup/channel yang bisa diakses."""
+    async with await get_client() as client:
+        dialogs = []
+        async for dialog in client.get_dialogs():
+            chat = dialog.chat
+            if chat.type in ["group", "supergroup", "channel"]:
+                dialogs.append(
+                    {
+                        "id": chat.id,
+                        "title": chat.title,
+                        "type": str(chat.type),
+                        "unread_count": dialog.unread_count or 0,
+                    }
                 )
-            
-            # Ambil pesan dari channel
-            messages = []
-            async for message in client.get_chat_history(chat.id, limit=limit):
-                if message.document and message.document.mime_type:
-                    mime = message.document.mime_type.lower()
-                    if mime.startswith('video/'):
-                        messages.append({
-                            "id": message.id,
-                            "name": message.document.file_name or f"video_{message.id}.mp4",
-                            "size": message.document.file_size,
-                            "mime_type": mime,
-                            "file_id": message.document.file_id,
-                            "date": message.date.timestamp() if message.date else None,
-                            "caption": message.caption or ""
-                        })
-            
-            logger.info(f"✅ Ditemukan {len(messages)} video")
-            return messages
-            
-    except HTTPException:
-        raise
-    except errors.Unauthorized:
-        raise HTTPException(status_code=401, detail="Session string tidak valid. Generate ulang di Colab.")
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"dialogs": dialogs}
+
+
+@router.get("/chat/{chat_id}/files")
+async def get_chat_files(chat_id: int, limit: int = 100):
+    """
+    Ambil daftar file dari sebuah chat (dokumen, video, audio, foto).
+    Sekaligus mengisi cache untuk keperluan streaming.
+    """
+    async with await get_client() as client:
+        files = []
+        async for message in client.get_chat_history(chat_id, limit=limit):
+            # Dokumen
+            if message.document:
+                doc = message.document
+                _cache_file_info(doc.file_id, chat_id, message.id, doc.file_size)
+                files.append(
+                    {
+                        "id": str(message.id),
+                        "name": doc.file_name or f"file_{message.id}",
+                        "size": doc.file_size,
+                        "file_id": doc.file_id,
+                        "mime_type": doc.mime_type or "application/octet-stream",
+                        "date": message.date.timestamp(),
+                        "chat_id": chat_id,
+                    }
+                )
+            # Video
+            elif message.video:
+                vid = message.video
+                _cache_file_info(vid.file_id, chat_id, message.id, vid.file_size)
+                files.append(
+                    {
+                        "id": str(message.id),
+                        "name": vid.file_name or f"video_{message.id}.mp4",
+                        "size": vid.file_size,
+                        "file_id": vid.file_id,
+                        "mime_type": "video/mp4",
+                        "date": message.date.timestamp(),
+                        "chat_id": chat_id,
+                    }
+                )
+            # Audio
+            elif message.audio:
+                aud = message.audio
+                _cache_file_info(aud.file_id, chat_id, message.id, aud.file_size)
+                files.append(
+                    {
+                        "id": str(message.id),
+                        "name": aud.file_name or f"audio_{message.id}.mp3",
+                        "size": aud.file_size,
+                        "file_id": aud.file_id,
+                        "mime_type": "audio/mpeg",
+                        "date": message.date.timestamp(),
+                        "chat_id": chat_id,
+                    }
+                )
+            # Foto
+            elif message.photo:
+                photo = message.photo[-1]  # ambil resolusi terbesar
+                _cache_file_info(photo.file_id, chat_id, message.id, photo.file_size)
+                files.append(
+                    {
+                        "id": str(message.id),
+                        "name": f"photo_{message.id}.jpg",
+                        "size": photo.file_size,
+                        "file_id": photo.file_id,
+                        "mime_type": "image/jpeg",
+                        "date": message.date.timestamp(),
+                        "chat_id": chat_id,
+                    }
+                )
+        return {"files": files}
 
 
 @router.get("/stream/{file_id}")
-async def stream_video(file_id: str, range: Optional[str] = None):
-    """Streaming video dengan dukungan HTTP Range"""
-    try:
-        async with await get_client() as client:
-            logger.info(f"📥 Streaming file: {file_id}")
-            
-            # Download file ke memory
-            file_stream = io.BytesIO()
-            await client.download_media(file_id, file=file_stream)
-            file_stream.seek(0)
-            file_size = file_stream.getbuffer().nbytes
-            
-            logger.info(f"File size: {file_size} bytes")
-            
-            # Handle range request (untuk seeking video)
-            if range and range.startswith("bytes="):
-                range_value = range.replace("bytes=", "")
+async def stream_telegram_file(request: Request, file_id: str):
+    """
+    Stream file dengan dukungan seeking (jika ukuran file diketahui dari cache).
+    Jika tidak ada di cache, tetap stream tanpa seeking.
+    """
+    async with await get_client() as client:
+        # Coba ambil ukuran file dari cache
+        cached = _file_cache.get(file_id)
+        file_size = cached[2] if cached else None
+
+        range_header = request.headers.get("range")
+
+        # === SEEKING MODE (jika cache ada) ===
+        if range_header and range_header.startswith("bytes=") and file_size:
+            try:
+                range_value = range_header.replace("bytes=", "")
                 parts = range_value.split("-")
-                start = int(parts[0])
-                end = int(parts[1]) if parts[1] and parts[1].strip() else file_size - 1
-                
-                if start >= file_size or end >= file_size:
-                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-                
-                chunk_size = end - start + 1
-                file_stream.seek(start)
-                data = file_stream.read(chunk_size)
-                
-                headers = {
-                    "Content-Range": f"bytes {start}-{end}/{file_size}",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(chunk_size),
-                    "Content-Type": "video/mp4",
-                }
-                return Response(content=data, status_code=206, headers=headers)
-            else:
-                # Kirim seluruh file
+                start_byte = int(parts[0])
+                end_byte = int(parts[1]) if parts[1] else file_size - 1
+
+                if start_byte >= file_size or end_byte >= file_size:
+                    return Response(status_code=416)
+
+                requested_bytes = end_byte - start_byte + 1
+                CHUNK_SIZE = 1024 * 1024
+                start_chunk = start_byte // CHUNK_SIZE
+                end_chunk = (end_byte // CHUNK_SIZE) + 1
+                chunks_needed = end_chunk - start_chunk
+
+                async def seek_generator():
+                    async with await get_client() as stream_client:
+                        streamed = 0
+                        async for chunk in stream_client.stream_media(
+                            file_id, offset=start_chunk, limit=chunks_needed
+                        ):
+                            if streamed >= requested_bytes:
+                                break
+                            chunk_start = start_byte - (start_chunk * CHUNK_SIZE)
+                            if streamed == 0 and chunk_start > 0:
+                                chunk = chunk[chunk_start:]
+                            if streamed + len(chunk) > requested_bytes:
+                                chunk = chunk[: requested_bytes - streamed]
+                            yield chunk
+                            streamed += len(chunk)
+
                 return StreamingResponse(
-                    file_stream,
+                    seek_generator(),
+                    status_code=206,
                     media_type="video/mp4",
                     headers={
+                        "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
                         "Accept-Ranges": "bytes",
-                        "Content-Length": str(file_size)
-                    }
+                        "Content-Length": str(requested_bytes),
+                        "Cache-Control": "no-cache",
+                    },
                 )
-                
-    except errors.exceptions.not_acceptable_406.MediaEmpty:
-        logger.error(f"❌ File tidak ditemukan: {file_id}")
-        raise HTTPException(status_code=404, detail="File tidak ditemukan")
-    except Exception as e:
-        logger.error(f"❌ Streaming error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            except Exception as e:
+                print(f"Seeking error: {e}")
+                # fallback ke mode normal
 
+        # === NORMAL STREAM (tanpa seeking atau tanpa ukuran file) ===
+        async def generate_chunks():
+            async with await get_client() as stream_client:
+                async for chunk in stream_client.stream_media(file_id, limit=0):
+                    yield chunk
 
-@router.get("/health")
-async def health_check():
-    """Cek koneksi ke Telegram"""
-    try:
-        async with await get_client() as client:
-            me = await client.get_me()
-            return {
-                "status": "connected",
-                "user": me.first_name,
-                "username": me.username,
-                "user_id": me.id
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
+        headers = {
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
         }
+        if file_size:
+            headers["Content-Length"] = str(file_size)
+
+        return StreamingResponse(
+            generate_chunks(),
+            status_code=200,
+            media_type="video/mp4",
+            headers=headers,
+        )
