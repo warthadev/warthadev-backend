@@ -7,4 +7,3 @@ python-multipart
 starlette
 pyrogram
 tgcrypto
-nest-asyncio
