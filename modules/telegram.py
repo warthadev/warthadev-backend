@@ -1,228 +1,212 @@
 # modules/telegram.py
 import os
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
-from pyrogram import Client
+from pyrogram import Client, enums
+from pyrogram.errors import PeerIdInvalid, ChannelInvalid
+import asyncio
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
+# ========== KONFIGURASI ==========
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
-
 if not SESSION_STRING:
     print("WARNING: TELEGRAM_SESSION_STRING not set!")
 
-# Cache file_id -> file_size
+# Client GLOBAL (dibuat sekali, dipakai berkali-kali)
+telegram_client = Client(
+    "telegram_manager",
+    session_string=SESSION_STRING,
+    in_memory=True,
+    no_updates=True,
+)
+
+# Cache
 file_sizes: Dict[str, int] = {}
-files_cache: Dict[int, list] = {}  # chat_id -> list of files
-cache_loaded: Dict[int, bool] = {}
+videos_cache: Dict[int, List[dict]] = {}  # chat_id -> list video
 
-async def get_client() -> Client:
-    return Client(
-        "telegram_manager",
-        session_string=SESSION_STRING,
-        in_memory=True,
-        no_updates=True,
-    )
+# ========== LIFECYCLE ==========
+async def start_client():
+    """Start client saat aplikasi mulai"""
+    if SESSION_STRING:
+        await telegram_client.start()
+        me = await telegram_client.get_me()
+        print(f"✅ Telegram client started as: {me.first_name}")
+    else:
+        print("❌ Telegram client not started: missing SESSION_STRING")
 
-async def get_file_size(client: Client, chat_id: int, file_id: str) -> Optional[int]:
-    """Dapatkan ukuran file (cached) seperti di Colab"""
-    if file_id in file_sizes:
-        return file_sizes[file_id]
+async def shutdown_client():
+    """Stop client saat aplikasi berhenti"""
+    if telegram_client.is_connected:
+        await telegram_client.stop()
+        print("✅ Telegram client stopped")
+
+# Fungsi ini akan dipanggil dari main.py (FastAPI startup/shutdown)
+def register_telegram_events(app):
+    app.add_event_handler("startup", start_client)
+    app.add_event_handler("shutdown", shutdown_client)
+
+# ========== HELPER ==========
+async def get_chat_videos(chat_id: int, limit: int = 500) -> List[dict]:
+    """Ambil daftar video dari chat (cache 5 menit)"""
+    cache_key = chat_id
+    if cache_key in videos_cache:
+        return videos_cache[cache_key]
     
+    videos = []
     try:
-        messages = await client.get_messages(chat_id, file_ids=file_id)
-        if messages:
-            if messages.video:
-                file_sizes[file_id] = messages.video.file_size
-                return messages.video.file_size
-            elif messages.document:
-                file_sizes[file_id] = messages.document.file_size
-                return messages.document.file_size
-    except Exception as e:
-        print(f"Error getting file size: {e}")
-    return None
-
-async def load_chat_files(chat_id: int):
-    """Load semua file dari chat (mirip dengan Colab)"""
-    global files_cache, cache_loaded
-    
-    if cache_loaded.get(chat_id, False):
-        return files_cache.get(chat_id, [])
-    
-    async with await get_client() as client:
-        files_found = []
-        async for message in client.get_chat_history(chat_id):
-            # Video
-            if message.video:
-                file_name = message.video.file_name or f"video_{message.id}.mp4"
-                files_found.append({
-                    "id": message.id,
-                    "name": file_name,
-                    "size": message.video.file_size,
-                    "file_id": message.video.file_id,
-                    "media_type": "video",
+        async for msg in telegram_client.get_chat_history(chat_id, limit=limit):
+            # Video message
+            if msg.video:
+                name = msg.video.file_name or f"video_{msg.id}.mp4"
+                videos.append({
+                    "id": msg.id,
+                    "name": name,
+                    "size": msg.video.file_size,
+                    "file_id": msg.video.file_id,
+                    "type": "video"
                 })
-                file_sizes[message.video.file_id] = message.video.file_size
-            
-            # Audio
-            elif message.audio:
-                files_found.append({
-                    "id": message.id,
-                    "name": message.audio.file_name or f"audio_{message.id}.mp3",
-                    "size": message.audio.file_size,
-                    "file_id": message.audio.file_id,
-                    "media_type": "audio",
-                })
-                file_sizes[message.audio.file_id] = message.audio.file_size
-            
-            # Photo
-            elif message.photo:
-                photo = message.photo[-1]
-                files_found.append({
-                    "id": message.id,
-                    "name": f"photo_{message.id}.jpg",
-                    "size": photo.file_size,
-                    "file_id": photo.file_id,
-                    "media_type": "image",
-                })
-                file_sizes[photo.file_id] = photo.file_size
-            
-            # Document (termasuk video dalam archive)
-            elif message.document:
-                file_name = message.document.file_name
-                if file_name:
-                    ext = file_name.split('.')[-1].lower()
-                    media_type = "video" if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm'] else "document"
-                    files_found.append({
-                        "id": message.id,
-                        "name": file_name,
-                        "size": message.document.file_size,
-                        "file_id": message.document.file_id,
-                        "media_type": media_type,
+                file_sizes[msg.video.file_id] = msg.video.file_size
+            # Document (video file)
+            elif msg.document and msg.document.file_name:
+                ext = msg.document.file_name.split('.')[-1].lower()
+                if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm']:
+                    videos.append({
+                        "id": msg.id,
+                        "name": msg.document.file_name,
+                        "size": msg.document.file_size,
+                        "file_id": msg.document.file_id,
+                        "type": "video"
                     })
-                    file_sizes[message.document.file_id] = message.document.file_size
-        
-        files_found.reverse()
-        print(f"✅ Chat {chat_id}: {len(files_found)} files ready")
-        files_cache[chat_id] = files_found
-        cache_loaded[chat_id] = True
-        return files_found
+                    file_sizes[msg.document.file_id] = msg.document.file_size
+    except Exception as e:
+        print(f"Error loading videos from chat {chat_id}: {e}")
+    
+    videos.reverse()  # oldest first
+    videos_cache[cache_key] = videos
+    return videos
 
-# ============ ENDPOINTS ============
-
+# ========== ENDPOINTS ==========
 @router.get("/health")
 async def health():
     return {
         "status": "healthy",
         "configured": bool(SESSION_STRING),
-        "session_length": len(SESSION_STRING) if SESSION_STRING else 0
+        "client_connected": telegram_client.is_connected if SESSION_STRING else False
     }
 
-@router.get("/dialogs")
-async def get_dialogs():
-    """Ambil daftar chat (tanpa validasi akses file)"""
-    if not SESSION_STRING:
-        raise HTTPException(500, "TELEGRAM_SESSION_STRING not configured")
+@router.get("/chats")
+async def get_chats():
+    """Daftar semua channel/grup yang bisa diakses"""
+    if not SESSION_STRING or not telegram_client.is_connected:
+        raise HTTPException(500, "Telegram client not ready")
+    
+    dialogs = []
+    async for dialog in telegram_client.get_dialogs():
+        chat = dialog.chat
+        if chat.type in [enums.ChatType.CHANNEL, enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+            dialogs.append({
+                "id": chat.id,
+                "name": chat.title,
+                "type": str(chat.type).split('.')[-1].lower(),
+            })
+    return {"chats": dialogs, "total": len(dialogs)}
+
+@router.get("/chat/{chat_id}/videos")
+async def get_videos(chat_id: int):
+    """Daftar video dalam chat tertentu"""
+    if not SESSION_STRING or not telegram_client.is_connected:
+        raise HTTPException(500, "Telegram client not ready")
     
     try:
-        async with await get_client() as client:
-            dialogs = []
-            async for dialog in client.get_dialogs():
-                chat = dialog.chat
-                if chat.type in ["group", "supergroup", "channel"]:
-                    dialogs.append({
-                        "id": chat.id,
-                        "name": chat.title,
-                        "type": str(chat.type).split('.')[-1].lower(),
-                        "unread_count": dialog.unread_messages_count or 0,
-                    })
-            return {"dialogs": dialogs, "total": len(dialogs)}
+        videos = await get_chat_videos(chat_id)
+        return {"videos": videos, "total": len(videos), "chat_id": chat_id}
     except Exception as e:
-        print(f"Error in get_dialogs: {e}")
-        raise HTTPException(500, detail=str(e))
+        print(f"Error: {e}")
+        return {"videos": [], "total": 0, "chat_id": chat_id, "error": str(e)}
 
-@router.get("/chat/{chat_id}/files")
-async def get_chat_files(chat_id: int):
-    """Ambil file dari chat - LANGSUNG akses tanpa validasi"""
-    if not SESSION_STRING:
-        raise HTTPException(500, "TELEGRAM_SESSION_STRING not configured")
+@router.get("/stream/{chat_id}/{message_id}")
+async def stream_video(request: Request, chat_id: int, message_id: int):
+    """Stream video dengan dukungan seeking (sama seperti di Colab)"""
+    if not SESSION_STRING or not telegram_client.is_connected:
+        raise HTTPException(500, "Telegram client not ready")
     
-    try:
-        files = await load_chat_files(chat_id)
-        return {"files": files, "total": len(files), "chat_id": chat_id}
-    except Exception as e:
-        print(f"Error loading files for chat {chat_id}: {e}")
-        # Tetap return array kosong, jangan error
-        return {"files": [], "total": 0, "chat_id": chat_id, "error": str(e)}
-
-@router.get("/stream/{chat_id}/{file_id}")
-async def stream_file(request: Request, chat_id: int, file_id: str):
-    """Stream file - seperti di Colab"""
-    if not SESSION_STRING:
-        raise HTTPException(500, "TELEGRAM_SESSION_STRING not configured")
+    # Ambil message
+    msg = await telegram_client.get_messages(chat_id, message_id)
+    if not msg or (not msg.video and not msg.document):
+        raise HTTPException(404, "Video not found")
     
-    async with await get_client() as client:
-        file_size = await get_file_size(client, chat_id, file_id)
-        range_header = request.headers.get("range")
-        
-        # Seeking mode (sama persis seperti Colab)
-        if range_header and range_header.startswith("bytes=") and file_size:
-            try:
-                range_value = range_header.replace("bytes=", "")
-                parts = range_value.split("-")
-                start_byte = int(parts[0])
-                end_byte = int(parts[1]) if parts[1] else file_size - 1
-                
-                if start_byte >= file_size or end_byte >= file_size:
-                    return Response(status_code=416)
-                
-                requested_bytes = end_byte - start_byte + 1
-                CHUNK_SIZE = 1024 * 1024
-                start_chunk = start_byte // CHUNK_SIZE
-                end_chunk = (end_byte // CHUNK_SIZE) + 1
-                chunks_needed = end_chunk - start_chunk
-                
-                async def seek_generator():
-                    async with await get_client() as stream_client:
-                        streamed = 0
-                        async for chunk in stream_client.stream_media(file_id, offset=start_chunk, limit=chunks_needed):
-                            if streamed >= requested_bytes:
-                                break
-                            chunk_start = start_byte - (start_chunk * CHUNK_SIZE)
-                            if streamed == 0 and chunk_start > 0:
-                                chunk = chunk[chunk_start:]
-                            if streamed + len(chunk) > requested_bytes:
-                                chunk = chunk[:requested_bytes - streamed]
-                            yield chunk
-                            streamed += len(chunk)
-                
-                return StreamingResponse(
-                    seek_generator(),
-                    status_code=206,
-                    media_type="video/mp4",
-                    headers={
-                        "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
-                        "Accept-Ranges": "bytes",
-                        "Content-Length": str(requested_bytes),
-                        "Cache-Control": "no-cache",
-                    }
-                )
-            except Exception as e:
-                print(f"Seeking error: {e}")
-        
-        # Normal stream
-        async def generate_chunks():
-            async with await get_client() as stream_client:
-                async for chunk in stream_client.stream_media(file_id, limit=0):
+    # Ambil file_id dan ukuran
+    if msg.video:
+        file_id = msg.video.file_id
+        file_size = msg.video.file_size
+        mime_type = "video/mp4"
+    else:
+        file_id = msg.document.file_id
+        file_size = msg.document.file_size
+        mime_type = msg.document.mime_type or "video/mp4"
+    
+    range_header = request.headers.get("range")
+    
+    # ========== SEEKING MODE ==========
+    if range_header and range_header.startswith("bytes=") and file_size:
+        try:
+            range_val = range_header.replace("bytes=", "")
+            parts = range_val.split("-")
+            start_byte = int(parts[0])
+            end_byte = int(parts[1]) if parts[1] else file_size - 1
+            
+            if start_byte >= file_size or end_byte >= file_size:
+                return Response(status_code=416)
+            
+            requested_bytes = end_byte - start_byte + 1
+            CHUNK_SIZE = 1024 * 1024
+            start_chunk = start_byte // CHUNK_SIZE
+            end_chunk = (end_byte // CHUNK_SIZE) + 1
+            chunks_needed = end_chunk - start_chunk
+            
+            print(f"🎯 Seeking: {start_byte}-{end_byte} (chunks {start_chunk}-{end_chunk})")
+            
+            async def seek_generator():
+                streamed = 0
+                async for chunk in telegram_client.stream_media(file_id, offset=start_chunk, limit=chunks_needed):
+                    if streamed >= requested_bytes:
+                        break
+                    chunk_start = start_byte - (start_chunk * CHUNK_SIZE)
+                    if streamed == 0 and chunk_start > 0 and chunk_start < len(chunk):
+                        chunk = chunk[chunk_start:]
+                    if streamed + len(chunk) > requested_bytes:
+                        chunk = chunk[:requested_bytes - streamed]
                     yield chunk
-        
-        headers = {
-            "Content-Type": "video/mp4",
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache",
-        }
-        if file_size:
-            headers["Content-Length"] = str(file_size)
-        
-        return StreamingResponse(generate_chunks(), status_code=200, media_type="video/mp4", headers=headers)
+                    streamed += len(chunk)
+            
+            return StreamingResponse(
+                seek_generator(),
+                status_code=206,
+                media_type=mime_type,
+                headers={
+                    "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(requested_bytes),
+                    "Cache-Control": "no-cache",
+                }
+            )
+        except Exception as e:
+            print(f"Seeking error: {e}")
+            # Fallback ke normal stream
+    
+    # ========== NORMAL STREAM ==========
+    async def generate_chunks():
+        async for chunk in telegram_client.stream_media(file_id, limit=0):
+            yield chunk
+    
+    headers = {
+        "Content-Type": mime_type,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+    }
+    if file_size:
+        headers["Content-Length"] = str(file_size)
+    
+    return StreamingResponse(generate_chunks(), status_code=200, media_type=mime_type, headers=headers)
