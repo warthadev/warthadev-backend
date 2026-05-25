@@ -2,7 +2,7 @@
 import os
 from typing import Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, RedirectResponse
 from pyrogram import Client, enums
 from pyrogram.errors import PeerIdInvalid, ChannelInvalid
 
@@ -31,15 +31,15 @@ async def start_client():
     if SESSION_STRING and not telegram_client.is_connected:
         await telegram_client.start()
         me = await telegram_client.get_me()
-        print(f"✅ Telegram client started as: {me.first_name}")
+        print(f"Telegram client started as: {me.first_name}")
     elif not SESSION_STRING:
-        print("❌ Telegram client not started: missing SESSION_STRING")
+        print("Telegram client not started: missing SESSION_STRING")
 
 async def shutdown_client():
     """Stop Telegram client saat aplikasi shutdown"""
     if telegram_client.is_connected:
         await telegram_client.stop()
-        print("✅ Telegram client stopped")
+        print("Telegram client stopped")
 
 def register_telegram_events(app):
     app.add_event_handler("startup", start_client)
@@ -123,7 +123,7 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
         
         files.reverse()
         files_cache[chat_id] = files
-        print(f"✅ Loaded {len(files)} files from chat {chat_id}")
+        print(f"Loaded {len(files)} files from chat {chat_id}")
     except Exception as e:
         print(f"Error loading files from chat {chat_id}: {e}")
         files = []
@@ -138,13 +138,61 @@ async def count_chat_files(chat_id: int) -> int:
     except:
         return 0
 
+# ========== R2 INTEGRATION HELPER ==========
+def is_r2_configured() -> bool:
+    """Cek apakah environment R2 sudah diisi"""
+    return all([
+        os.environ.get("R2_ACCESS_KEY_ID"),
+        os.environ.get("R2_SECRET_ACCESS_KEY"),
+        os.environ.get("R2_ACCOUNT_ID"),
+        os.environ.get("R2_BUCKET_NAME")
+    ])
+
+async def check_r2_and_redirect(chat_id: int, message_id: int):
+    """
+    Cek keberadaan file di R2. Jika ada, kembalikan RedirectResponse ke R2.
+    Jika tidak ada, upload file ke R2 lalu redirect.
+    Return None jika R2 tidak dikonfigurasi atau terjadi error (fallback ke streaming langsung).
+    """
+    try:
+        from modules.r2 import get_r2_client, generate_presigned_url, upload_telegram_to_r2, R2_BUCKET_NAME
+    except ImportError:
+        print("R2 module not available, skipping R2 integration")
+        return None
+    
+    if not is_r2_configured():
+        print("R2 not configured, skipping R2 integration")
+        return None
+    
+    try:
+        r2 = get_r2_client()
+        prefix = f"telegram/{chat_id}/{message_id}/"
+        resp = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        objects = resp.get("Contents", [])
+        
+        if objects:
+            # File sudah ada di R2
+            key = objects[0]["Key"]
+            url = generate_presigned_url(r2, key, expires=3600)
+            return RedirectResponse(url=url, status_code=302)
+        else:
+            # Belum ada, upload ke R2
+            print(f"Uploading {chat_id}/{message_id} to R2...")
+            result = await upload_telegram_to_r2(telegram_client, chat_id, message_id)
+            # Redirect ke endpoint R2 yang akan generate URL fresh
+            return RedirectResponse(url=f"/r2/stream/{chat_id}/{message_id}", status_code=302)
+    except Exception as e:
+        print(f"R2 operation failed: {e}, falling back to direct stream")
+        return None
+
 # ========== ENDPOINTS ==========
 @router.get("/health")
 async def health():
     return {
         "status": "healthy",
         "configured": bool(SESSION_STRING),
-        "client_connected": telegram_client.is_connected if SESSION_STRING else False
+        "client_connected": telegram_client.is_connected if SESSION_STRING else False,
+        "r2_enabled": is_r2_configured()
     }
 
 @router.get("/dialogs")
@@ -186,10 +234,21 @@ async def get_chat_files(chat_id: int):
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_file(request: Request, chat_id: int, message_id: int):
-    """Stream file dengan dukungan seeking - PAKAI MESSAGE ID"""
+    """
+    Stream file dengan prioritas R2:
+    - Jika R2 aktif dan file ada, redirect ke R2
+    - Jika file belum ada di R2, upload lalu redirect
+    - Fallback ke streaming langsung dari Telegram jika R2 gagal atau tidak dikonfigurasi
+    """
     if not SESSION_STRING or not telegram_client.is_connected:
         raise HTTPException(500, "Telegram client not ready")
     
+    # Coba gunakan R2 terlebih dahulu
+    r2_redirect = await check_r2_and_redirect(chat_id, message_id)
+    if r2_redirect:
+        return r2_redirect
+    
+    # ========== FALLBACK: STREAMING LANGSUNG DARI TELEGRAM ==========
     # Ambil message berdasarkan ID
     msg = await telegram_client.get_messages(chat_id, message_id)
     if not msg:
@@ -234,7 +293,7 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
             end_chunk = (end_byte // CHUNK_SIZE) + 1
             chunks_needed = end_chunk - start_chunk
             
-            print(f"🎯 Seeking: {start_byte}-{end_byte} (chunks {start_chunk}-{end_chunk})")
+            print(f"Seeking: {start_byte}-{end_byte} (chunks {start_chunk}-{end_chunk})")
             
             async def seek_generator():
                 streamed = 0
