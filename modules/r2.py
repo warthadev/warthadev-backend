@@ -4,7 +4,7 @@ import boto3
 import asyncio
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import RedirectResponse, JSONResponse
 from typing import Optional
 
@@ -32,9 +32,7 @@ def get_r2_client():
 def is_configured() -> bool:
     return all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET_NAME])
 
-
 # ========== HELPER ==========
-
 def get_r2_key(chat_id: int, message_id: int, filename: str) -> str:
     """Generate key/path di R2"""
     return f"telegram/{chat_id}/{message_id}/{filename}"
@@ -54,9 +52,8 @@ def check_exists(r2, key: str) -> Optional[int]:
 
 def generate_presigned_url(r2, key: str, expires: int = 3600) -> str:
     """
-    Generate presigned URL untuk stream langsung dari R2.
-    Browser bisa akses langsung tanpa lewat Render.
-    expires = detik (default 1 jam)
+    Generate presigned URL untuk stream/download langsung dari R2.
+    Browser bisa akses langsung tanpa lewat server.
     """
     return r2.generate_presigned_url(
         "get_object",
@@ -64,9 +61,7 @@ def generate_presigned_url(r2, key: str, expires: int = 3600) -> str:
         ExpiresIn=expires,
     )
 
-
 # ========== UPLOAD: Telegram → R2 ==========
-
 async def upload_telegram_to_r2(
     telegram_client,
     chat_id: int,
@@ -81,6 +76,7 @@ async def upload_telegram_to_r2(
         raise Exception("R2 not configured. Check environment variables.")
 
     from pyrogram import Client
+    
     msg = await telegram_client.get_messages(chat_id, message_id)
     if not msg:
         raise Exception("Message not found")
@@ -125,9 +121,10 @@ async def upload_telegram_to_r2(
     parts     = []
     part_num  = 1
     buffer    = bytearray()
-    MIN_PART  = 5 * 1024 * 1024  # 5MB minimum per part (syarat S3)
+    MIN_PART  = 5 * 1024 * 1024  # 5MB minimum per part (syarat S3/R2)
 
     try:
+        # Stream dari Telegram
         async for chunk in telegram_client.stream_media(media.file_id, limit=0):
             buffer.extend(chunk)
 
@@ -172,16 +169,18 @@ async def upload_telegram_to_r2(
 
     except Exception as e:
         # Batalkan multipart upload jika error
-        r2.abort_multipart_upload(
-            Bucket=R2_BUCKET_NAME,
-            Key=key,
-            UploadId=upload_id,
-        )
+        try:
+            r2.abort_multipart_upload(
+                Bucket=R2_BUCKET_NAME,
+                Key=key,
+                UploadId=upload_id,
+            )
+        except:
+            pass
         raise Exception(f"Upload failed: {e}")
 
     url = generate_presigned_url(r2, key)
     return {"key": key, "size": file_size, "url": url, "cached": False}
-
 
 # ========== ENDPOINTS ==========
 
@@ -204,35 +203,33 @@ async def r2_health():
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-
 @router.post("/upload/{chat_id}/{message_id}")
-async def upload_to_r2(chat_id: int, message_id: int):
+async def upload_to_r2(chat_id: int, message_id: int, background_tasks: BackgroundTasks):
     """
-    Upload file dari Telegram ke R2.
-    Panggil sekali, lalu gunakan /stream untuk streaming langsung.
+    Upload file dari Telegram ke R2 (bisa dipanggil manual).
+    Gunakan background task agar tidak memblokir response.
     """
     if not is_configured():
         raise HTTPException(500, "R2 not configured")
 
-    try:
-        from modules.telegram import telegram_client
-        result = await upload_telegram_to_r2(telegram_client, chat_id, message_id)
-        return {
-            "success": True,
-            "key": result["key"],
-            "size": result["size"],
-            "cached": result["cached"],
-            "stream_url": f"/r2/stream/{chat_id}/{message_id}",
-        }
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
+    from modules.telegram import telegram_client, trigger_upload_to_r2
+    
+    # Trigger upload background
+    background_tasks.add_task(trigger_upload_to_r2, chat_id, message_id)
+    
+    return {
+        "success": True,
+        "message": "Upload started in background",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "check_url": f"/r2/stream/{chat_id}/{message_id}"
+    }
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_from_r2(chat_id: int, message_id: int):
     """
     Generate presigned URL dan redirect browser langsung ke R2.
-    Browser akan stream + seek langsung dari R2 — Render tidak ikut.
+    Browser akan stream + seek langsung dari R2 — server tidak ikut transfer data.
     URL berlaku 1 jam.
     """
     if not is_configured():
@@ -243,27 +240,26 @@ async def stream_from_r2(chat_id: int, message_id: int):
 
         # Cari key yang sesuai (cek semua ekstensi umum)
         prefix = f"telegram/{chat_id}/{message_id}/"
-        resp   = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        resp   = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=1)
 
         objects = resp.get("Contents", [])
         if not objects:
             raise HTTPException(
                 404,
-                f"File not found in R2. Upload dulu via POST /r2/upload/{chat_id}/{message_id}"
+                f"File not found in R2. Upload dulu via POST /r2/upload/{chat_id}/{message_id} atau via /telegram/stream"
             )
 
         # Ambil file pertama yang ditemukan
         key = objects[0]["Key"]
         url = generate_presigned_url(r2, key, expires=3600)
 
-        # Redirect browser langsung ke R2 — Render tidak streaming sama sekali
+        # Redirect browser langsung ke R2 — server tidak streaming sama sekali
         return RedirectResponse(url=url, status_code=302)
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
-
 
 @router.get("/url/{chat_id}/{message_id}")
 async def get_r2_url(chat_id: int, message_id: int):
@@ -276,7 +272,7 @@ async def get_r2_url(chat_id: int, message_id: int):
     try:
         r2      = get_r2_client()
         prefix  = f"telegram/{chat_id}/{message_id}/"
-        resp    = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        resp    = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=1)
         objects = resp.get("Contents", [])
 
         if not objects:
@@ -291,7 +287,6 @@ async def get_r2_url(chat_id: int, message_id: int):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
-
 
 @router.delete("/delete/{chat_id}/{message_id}")
 async def delete_from_r2(chat_id: int, message_id: int):
