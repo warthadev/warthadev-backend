@@ -24,6 +24,7 @@ telegram_client = Client(
 # Cache
 file_sizes: Dict[str, int] = {}
 files_cache: Dict[int, List[dict]] = {}
+chat_total_size_cache: Dict[int, int] = {}
 
 # ========== LIFECYCLE FUNCTIONS ==========
 async def start_client():
@@ -64,21 +65,37 @@ async def ensure_client_ready():
         )
 
 # ========== HELPER ==========
+def format_size(bytes_size: int) -> str:
+    """Konversi bytes ke format human readable (MB/GB)"""
+    if bytes_size is None:
+        return "0 B"
+    if bytes_size < 1024:
+        return f"{bytes_size} B"
+    elif bytes_size < 1024 * 1024:
+        return f"{bytes_size / 1024:.1f} KB"
+    elif bytes_size < 1024 * 1024 * 1024:
+        return f"{bytes_size / (1024 * 1024):.1f} MB"
+    else:
+        return f"{bytes_size / (1024 * 1024 * 1024):.2f} GB"
+
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
     """Ambil file dari chat (dengan cache)"""
     if chat_id in files_cache:
         return files_cache[chat_id]
     
     files = []
+    total_size = 0
+    
     try:
         async for msg in telegram_client.get_chat_history(chat_id, limit=limit):
             # Video message
             if msg.video:
+                size = msg.video.file_size or 0
                 name = msg.video.file_name or f"video_{msg.id}.mp4"
                 files.append({
                     "id": msg.id,
                     "name": name,
-                    "size": msg.video.file_size,
+                    "size": size,
                     "file_id": msg.video.file_id,
                     "media_type": "video",
                     "duration": msg.video.duration,
@@ -86,35 +103,40 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "height": msg.video.height,
                     "date": msg.date.timestamp() if msg.date else None,
                 })
-                file_sizes[msg.video.file_id] = msg.video.file_size
+                file_sizes[msg.video.file_id] = size
+                total_size += size
             
             # Audio message
             elif msg.audio:
+                size = msg.audio.file_size or 0
                 files.append({
                     "id": msg.id,
                     "name": msg.audio.file_name or f"audio_{msg.id}.mp3",
-                    "size": msg.audio.file_size,
+                    "size": size,
                     "file_id": msg.audio.file_id,
                     "media_type": "audio",
                     "duration": msg.audio.duration,
                     "date": msg.date.timestamp() if msg.date else None,
                 })
-                file_sizes[msg.audio.file_id] = msg.audio.file_size
+                file_sizes[msg.audio.file_id] = size
+                total_size += size
             
             # Photo
             elif msg.photo:
                 photo = msg.photo[-1]
+                size = photo.file_size or 0
                 files.append({
                     "id": msg.id,
                     "name": f"photo_{msg.id}.jpg",
-                    "size": photo.file_size,
+                    "size": size,
                     "file_id": photo.file_id,
                     "media_type": "image",
                     "width": photo.width,
                     "height": photo.height,
                     "date": msg.date.timestamp() if msg.date else None,
                 })
-                file_sizes[photo.file_id] = photo.file_size
+                file_sizes[photo.file_id] = size
+                total_size += size
             
             # Document (termasuk video dalam archive)
             elif msg.document and msg.document.file_name:
@@ -129,32 +151,37 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                 else:
                     media_type = "document"
                 
+                size = msg.document.file_size or 0
                 files.append({
                     "id": msg.id,
                     "name": name,
-                    "size": msg.document.file_size,
+                    "size": size,
                     "file_id": msg.document.file_id,
                     "media_type": media_type,
                     "date": msg.date.timestamp() if msg.date else None,
                 })
-                file_sizes[msg.document.file_id] = msg.document.file_size
+                file_sizes[msg.document.file_id] = size
+                total_size += size
         
         files.reverse()
         files_cache[chat_id] = files
-        print(f"Loaded {len(files)} files from chat {chat_id}")
+        chat_total_size_cache[chat_id] = total_size
+        print(f"Loaded {len(files)} files from chat {chat_id}, total size: {format_size(total_size)}")
     except Exception as e:
         print(f"Error loading files from chat {chat_id}: {e}")
         files = []
+        total_size = 0
     
     return files
 
-async def count_chat_files(chat_id: int) -> int:
-    """Hitung jumlah file dalam chat (pakai cache)"""
-    try:
-        files = await load_chat_files(chat_id)
-        return len(files)
-    except:
-        return 0
+async def get_chat_total_size(chat_id: int) -> int:
+    """Dapatkan total ukuran file dalam chat (dalam bytes)"""
+    if chat_id in chat_total_size_cache:
+        return chat_total_size_cache[chat_id]
+    
+    # Load files untuk mendapatkan total size
+    await load_chat_files(chat_id)
+    return chat_total_size_cache.get(chat_id, 0)
 
 # ========== R2 INTEGRATION HELPER ==========
 def is_r2_configured() -> bool:
@@ -222,13 +249,14 @@ async def get_dialogs():
         async for dialog in telegram_client.get_dialogs():
             chat = dialog.chat
             if chat.type in [enums.ChatType.CHANNEL, enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-                total_files = await count_chat_files(chat.id)
+                total_size_bytes = await get_chat_total_size(chat.id)
                 dialogs.append({
                     "id": chat.id,
                     "name": chat.title,
                     "type": str(chat.type).split('.')[-1].lower(),
                     "unread_count": dialog.unread_messages_count or 0,
-                    "total_files": total_files,
+                    "total_size_bytes": total_size_bytes,
+                    "total_size_human": format_size(total_size_bytes)
                 })
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch dialogs: {str(e)}")
@@ -241,10 +269,24 @@ async def get_chat_files(chat_id: int):
     
     try:
         files = await load_chat_files(chat_id)
-        return {"files": files, "total": len(files), "chat_id": chat_id}
+        total_size = chat_total_size_cache.get(chat_id, 0)
+        return {
+            "files": files, 
+            "total": len(files), 
+            "chat_id": chat_id,
+            "total_size_bytes": total_size,
+            "total_size_human": format_size(total_size)
+        }
     except Exception as e:
         print(f"Error in get_chat_files: {e}")
-        return {"files": [], "total": 0, "chat_id": chat_id, "error": str(e)}
+        return {
+            "files": [], 
+            "total": 0, 
+            "chat_id": chat_id, 
+            "error": str(e),
+            "total_size_bytes": 0,
+            "total_size_human": "0 B"
+        }
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_file(request: Request, chat_id: int, message_id: int):
