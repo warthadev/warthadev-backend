@@ -1,7 +1,7 @@
 # modules/telegram.py
 import os
 from typing import Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, Response, RedirectResponse
 from pyrogram import Client, enums
 from pyrogram.errors import PeerIdInvalid, ChannelInvalid
@@ -44,6 +44,24 @@ async def shutdown_client():
 def register_telegram_events(app):
     app.add_event_handler("startup", start_client)
     app.add_event_handler("shutdown", shutdown_client)
+
+# ========== CLIENT READINESS HELPER ==========
+async def ensure_client_ready():
+    """
+    Pastikan Telegram client sudah siap.
+    Jika belum, raise HTTP 503 dengan header Retry-After.
+    """
+    if not SESSION_STRING:
+        raise HTTPException(
+            status_code=500,
+            detail="Telegram not configured (missing TELEGRAM_SESSION_STRING)"
+        )
+    if not telegram_client.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram client is connecting, please retry",
+            headers={"Retry-After": "2"}
+        )
 
 # ========== HELPER ==========
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
@@ -197,9 +215,7 @@ async def health():
 
 @router.get("/dialogs")
 async def get_dialogs():
-    """Daftar semua channel/grup yang bisa diakses"""
-    if not SESSION_STRING or not telegram_client.is_connected:
-        raise HTTPException(500, "Telegram client not ready")
+    await ensure_client_ready()
     
     dialogs = []
     try:
@@ -221,9 +237,7 @@ async def get_dialogs():
 
 @router.get("/chat/{chat_id}/files")
 async def get_chat_files(chat_id: int):
-    """Ambil daftar file dari chat tertentu"""
-    if not SESSION_STRING or not telegram_client.is_connected:
-        raise HTTPException(500, "Telegram client not ready")
+    await ensure_client_ready()
     
     try:
         files = await load_chat_files(chat_id)
@@ -234,14 +248,7 @@ async def get_chat_files(chat_id: int):
 
 @router.get("/stream/{chat_id}/{message_id}")
 async def stream_file(request: Request, chat_id: int, message_id: int):
-    """
-    Stream file dengan prioritas R2:
-    - Jika R2 aktif dan file ada, redirect ke R2
-    - Jika file belum ada di R2, upload lalu redirect
-    - Fallback ke streaming langsung dari Telegram jika R2 gagal atau tidak dikonfigurasi
-    """
-    if not SESSION_STRING or not telegram_client.is_connected:
-        raise HTTPException(500, "Telegram client not ready")
+    await ensure_client_ready()
     
     # Coba gunakan R2 terlebih dahulu
     r2_redirect = await check_r2_and_redirect(chat_id, message_id)
@@ -339,9 +346,7 @@ async def stream_file(request: Request, chat_id: int, message_id: int):
 
 @router.get("/download/{chat_id}/{message_id}")
 async def download_file(chat_id: int, message_id: int):
-    """Download file asli"""
-    if not SESSION_STRING or not telegram_client.is_connected:
-        raise HTTPException(500, "Telegram client not ready")
+    await ensure_client_ready()
     
     msg = await telegram_client.get_messages(chat_id, message_id)
     if not msg:
