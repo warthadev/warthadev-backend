@@ -37,7 +37,7 @@ def check_system():
 
 def load_modules():
     """Import router dari modules"""
-    modules_to_load = ["ytdl", "telegram"]   # pastikan telegram ada
+    modules_to_load = ["ytdl", "telegram", "r2"]   # pastikan telegram ada
     
     for mod_name in modules_to_load:
         try:
