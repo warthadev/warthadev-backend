@@ -1,8 +1,8 @@
 # modules/telegram.py
 import os
 from typing import Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import StreamingResponse, Response, RedirectResponse
 from pyrogram import Client, enums
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
@@ -20,12 +20,9 @@ telegram_client = Client(
     no_updates=True,
 )
 
-# Cache untuk files dan ukuran total per chat (tetap dipertahankan untuk listing)
+# Cache untuk file dan ukuran total per chat
 files_cache: Dict[int, List[dict]] = {}
 chat_total_size_cache: Dict[int, int] = {}
-
-# Set untuk mencegah upload ganda untuk file yang sama
-_uploading_lock = set()
 
 # ========== LIFECYCLE ==========
 async def start_client():
@@ -51,7 +48,7 @@ async def ensure_client_ready():
         raise HTTPException(500, detail="Telegram not configured (missing TELEGRAM_SESSION_STRING)")
     if not telegram_client.is_connected:
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Telegram client is connecting, please retry",
             headers={"Retry-After": "2"}
         )
@@ -72,7 +69,7 @@ def format_size(bytes_size: int) -> str:
 async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
     if chat_id in files_cache:
         return files_cache[chat_id]
-    
+
     files = []
     total_size = 0
     try:
@@ -85,12 +82,15 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "size": size,
                     "file_id": msg.video.file_id,
                     "media_type": "video",
+                    "mime_type": "video/mp4",
                     "duration": msg.video.duration,
                     "width": msg.video.width,
                     "height": msg.video.height,
-                    "date": msg.date.timestamp() if msg.date else None,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
                 })
                 total_size += size
+
             elif msg.audio:
                 size = msg.audio.file_size or 0
                 files.append({
@@ -99,12 +99,31 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "size": size,
                     "file_id": msg.audio.file_id,
                     "media_type": "audio",
+                    "mime_type": "audio/mpeg",
                     "duration": msg.audio.duration,
-                    "date": msg.date.timestamp() if msg.date else None,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
                 })
                 total_size += size
+
+            elif msg.voice:
+                size = msg.voice.file_size or 0
+                files.append({
+                    "id": msg.id,
+                    "name": f"voice_{msg.id}.ogg",
+                    "size": size,
+                    "file_id": msg.voice.file_id,
+                    "media_type": "voice",
+                    "mime_type": "audio/ogg",
+                    "duration": msg.voice.duration,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
+                })
+                total_size += size
+
             elif msg.photo:
-                photo = msg.photo[-1]
+                # ✅ FIX: msg.photo adalah objek Photo tunggal, BUKAN list
+                photo = msg.photo
                 size = photo.file_size or 0
                 files.append({
                     "id": msg.id,
@@ -112,22 +131,33 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "size": size,
                     "file_id": photo.file_id,
                     "media_type": "image",
+                    "mime_type": "image/jpeg",
                     "width": photo.width,
                     "height": photo.height,
-                    "date": msg.date.timestamp() if msg.date else None,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
                 })
                 total_size += size
+
             elif msg.document and msg.document.file_name:
                 name = msg.document.file_name
-                ext = name.split('.')[-1].lower()
+                ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
                 if ext in ['mp4', 'mkv', 'avi', 'mov', 'webm']:
                     media_type = "video"
+                    mime_type = msg.document.mime_type or "video/mp4"
                 elif ext in ['mp3', 'm4a', 'wav', 'ogg', 'flac']:
                     media_type = "audio"
+                    mime_type = msg.document.mime_type or "audio/mpeg"
                 elif ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
                     media_type = "image"
+                    mime_type = msg.document.mime_type or "image/jpeg"
+                elif ext in ['zip', 'rar', '7z', 'tar', 'gz']:
+                    media_type = "archive"
+                    mime_type = msg.document.mime_type or "application/octet-stream"
                 else:
                     media_type = "document"
+                    mime_type = msg.document.mime_type or "application/octet-stream"
+
                 size = msg.document.file_size or 0
                 files.append({
                     "id": msg.id,
@@ -135,9 +165,28 @@ async def load_chat_files(chat_id: int, limit: int = 500) -> List[dict]:
                     "size": size,
                     "file_id": msg.document.file_id,
                     "media_type": media_type,
-                    "date": msg.date.timestamp() if msg.date else None,
+                    "mime_type": mime_type,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
                 })
                 total_size += size
+
+            elif msg.animation:
+                size = msg.animation.file_size or 0
+                files.append({
+                    "id": msg.id,
+                    "name": msg.animation.file_name or f"gif_{msg.id}.mp4",
+                    "size": size,
+                    "file_id": msg.animation.file_id,
+                    "media_type": "gif",
+                    "mime_type": "video/mp4",
+                    "width": msg.animation.width,
+                    "height": msg.animation.height,
+                    "caption": msg.caption or None,
+                    "date": int(msg.date.timestamp()) if msg.date else None,
+                })
+                total_size += size
+
         files.reverse()
         files_cache[chat_id] = files
         chat_total_size_cache[chat_id] = total_size
@@ -154,7 +203,7 @@ async def get_chat_total_size(chat_id: int) -> int:
     await load_chat_files(chat_id)
     return chat_total_size_cache.get(chat_id, 0)
 
-# ========== R2 INTEGRATION (TANPA FALLBACK) ==========
+# ========== R2 INTEGRATION ==========
 def is_r2_configured() -> bool:
     return all([
         os.environ.get("R2_ACCESS_KEY_ID"),
@@ -163,45 +212,56 @@ def is_r2_configured() -> bool:
         os.environ.get("R2_BUCKET_NAME")
     ])
 
-async def get_r2_stream_url(chat_id: int, message_id: int) -> Optional[str]:
-    """
-    Cek apakah file sudah ada di R2.
-    Return presigned URL jika ada, None jika tidak atau R2 tidak dikonfigurasi.
-    """
-    if not is_r2_configured():
-        return None
+async def check_r2_and_redirect(chat_id: int, message_id: int):
     try:
-        from modules.r2 import get_r2_client, generate_presigned_url, R2_BUCKET_NAME
-        r2 = get_r2_client()
-        prefix = f"telegram/{chat_id}/{message_id}/"
-        resp = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, MaxKeys=1)
-        objects = resp.get("Contents", [])
-        if objects:
-            key = objects[0]["Key"]
-            return generate_presigned_url(r2, key, expires=3600)
-        return None
-    except Exception as e:
-        print(f"R2 check error: {e}")
+        from modules.r2 import get_r2_client, generate_presigned_url, upload_telegram_to_r2, R2_BUCKET_NAME
+    except ImportError:
+        print("R2 module not available, skipping R2 integration")
         return None
 
-async def trigger_upload_to_r2(chat_id: int, message_id: int):
-    """
-    Background task: upload file dari Telegram ke R2.
-    Menggunakan lock agar tidak ada upload ganda untuk file yang sama.
-    """
-    key = f"{chat_id}/{message_id}"
-    if key in _uploading_lock:
-        print(f"Upload already in progress for {key}")
-        return
-    _uploading_lock.add(key)
+    if not is_r2_configured():
+        print("R2 not configured, skipping R2 integration")
+        return None
+
     try:
-        from modules.r2 import upload_telegram_to_r2
-        await upload_telegram_to_r2(telegram_client, chat_id, message_id)
-        print(f"Background upload completed for {key}")
+        r2 = get_r2_client()
+        prefix = f"telegram/{chat_id}/{message_id}/"
+        resp = r2.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        objects = resp.get("Contents", [])
+
+        if objects:
+            key = objects[0]["Key"]
+            url = generate_presigned_url(r2, key, expires=3600)
+            return RedirectResponse(url=url, status_code=302)
+        else:
+            print(f"Uploading {chat_id}/{message_id} to R2...")
+            await upload_telegram_to_r2(telegram_client, chat_id, message_id)
+            return RedirectResponse(url=f"/r2/stream/{chat_id}/{message_id}", status_code=302)
     except Exception as e:
-        print(f"Background upload failed for {key}: {e}")
-    finally:
-        _uploading_lock.discard(key)
+        print(f"R2 operation failed: {e}, falling back to direct stream")
+        return None
+
+# ========== RESOLVE MEDIA INFO ==========
+def resolve_media(msg):
+    """
+    Ambil (file_id, file_size, mime_type) dari pesan Pyrogram.
+    Return None jika pesan tidak punya media yang didukung.
+    """
+    if msg.video:
+        return msg.video.file_id, msg.video.file_size, "video/mp4"
+    if msg.audio:
+        return msg.audio.file_id, msg.audio.file_size, msg.audio.mime_type or "audio/mpeg"
+    if msg.voice:
+        return msg.voice.file_id, msg.voice.file_size, "audio/ogg"
+    if msg.animation:
+        return msg.animation.file_id, msg.animation.file_size, "video/mp4"
+    if msg.photo:
+        # ✅ FIX: msg.photo adalah objek Photo tunggal, BUKAN list
+        photo = msg.photo
+        return photo.file_id, photo.file_size, "image/jpeg"
+    if msg.document:
+        return msg.document.file_id, msg.document.file_size, msg.document.mime_type or "application/octet-stream"
+    return None
 
 # ========== ENDPOINTS ==========
 @router.get("/health")
@@ -249,53 +309,171 @@ async def get_chat_files(chat_id: int):
         }
     except Exception as e:
         print(f"Error in get_chat_files: {e}")
-        return {"files": [], "total": 0, "chat_id": chat_id, "error": str(e), "total_size_bytes": 0, "total_size_human": "0 B"}
+        return {
+            "files": [], "total": 0, "chat_id": chat_id,
+            "error": str(e), "total_size_bytes": 0, "total_size_human": "0 B"
+        }
+
+@router.get("/chat/{chat_id}/refresh")
+async def refresh_chat_files(chat_id: int):
+    """Hapus cache dan muat ulang file dari chat."""
+    await ensure_client_ready()
+    files_cache.pop(chat_id, None)
+    chat_total_size_cache.pop(chat_id, None)
+    files = await load_chat_files(chat_id)
+    total_size = chat_total_size_cache.get(chat_id, 0)
+    return {
+        "files": files,
+        "total": len(files),
+        "chat_id": chat_id,
+        "total_size_bytes": total_size,
+        "total_size_human": format_size(total_size)
+    }
 
 @router.get("/stream/{chat_id}/{message_id}")
-async def stream_file(chat_id: int, message_id: int, background_tasks: BackgroundTasks):
-    """
-    Redirect ke R2 jika file sudah ada.
-    Jika belum, trigger upload asinkron dan return 202 Accepted.
-    Tidak ada fallback streaming dari server.
-    """
+async def stream_file(request: Request, chat_id: int, message_id: int):
     await ensure_client_ready()
-    
-    r2_url = await get_r2_stream_url(chat_id, message_id)
-    if r2_url:
-        return RedirectResponse(url=r2_url, status_code=302)
-    
-    # File belum ada di R2: mulai upload background
-    background_tasks.add_task(trigger_upload_to_r2, chat_id, message_id)
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "uploading",
-            "message": "File is being uploaded to R2. Please retry in a few seconds.",
-            "retry_after": 5
-        },
-        headers={"Retry-After": "5"}
+
+    # Coba R2 dulu
+    r2_redirect = await check_r2_and_redirect(chat_id, message_id)
+    if r2_redirect:
+        return r2_redirect
+
+    # Ambil pesan
+    msg = await telegram_client.get_messages(chat_id, message_id)
+    if not msg:
+        raise HTTPException(404, "Message not found")
+
+    media = resolve_media(msg)
+    if not media:
+        raise HTTPException(404, "No streamable media found in this message")
+
+    file_id, file_size, mime_type = media
+    range_header = request.headers.get("range")
+
+    # ── Partial Content (Range Request) ──────────────────────────────────────
+    if range_header and range_header.startswith("bytes=") and file_size:
+        try:
+            range_val = range_header.replace("bytes=", "")
+            parts = range_val.split("-")
+            start_byte = int(parts[0])
+            end_byte = int(parts[1]) if parts[1] else file_size - 1
+
+            # Validasi range
+            if start_byte >= file_size or end_byte >= file_size or start_byte > end_byte:
+                return Response(
+                    status_code=416,
+                    headers={"Content-Range": f"bytes */{file_size}"}
+                )
+
+            requested_bytes = end_byte - start_byte + 1
+            CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk Telegram
+            start_chunk = start_byte // CHUNK_SIZE
+            end_chunk = (end_byte // CHUNK_SIZE) + 1
+            chunks_needed = end_chunk - start_chunk
+
+            # ✅ FIX: gunakan flag first_chunk agar trim offset hanya di chunk pertama
+            async def seek_generator():
+                streamed = 0
+                first_chunk = True
+                async for chunk in telegram_client.stream_media(
+                    file_id, offset=start_chunk, limit=chunks_needed
+                ):
+                    if streamed >= requested_bytes:
+                        break
+
+                    if first_chunk:
+                        # Buang byte di awal chunk yang ada sebelum start_byte
+                        inner_offset = start_byte - (start_chunk * CHUNK_SIZE)
+                        if inner_offset > 0:
+                            chunk = chunk[inner_offset:]
+                        first_chunk = False
+
+                    # Potong jika chunk melebihi yang dibutuhkan
+                    remaining = requested_bytes - streamed
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+
+                    yield chunk
+                    streamed += len(chunk)
+
+            return StreamingResponse(
+                seek_generator(),
+                status_code=206,
+                media_type=mime_type,
+                headers={
+                    "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(requested_bytes),
+                    "Cache-Control": "no-cache",
+                }
+            )
+        except Exception as e:
+            print(f"Seeking error: {e}")
+            # Jangan raise, fall-through ke full stream sebagai fallback
+
+    # ── Full Stream ───────────────────────────────────────────────────────────
+    async def generate_chunks():
+        async for chunk in telegram_client.stream_media(file_id, limit=0):
+            yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+    }
+    if file_size:
+        headers["Content-Length"] = str(file_size)
+
+    return StreamingResponse(
+        generate_chunks(),
+        status_code=200,
+        media_type=mime_type,
+        headers=headers
     )
 
 @router.get("/download/{chat_id}/{message_id}")
-async def download_file(chat_id: int, message_id: int, background_tasks: BackgroundTasks):
-    """
-    Redirect ke R2 (presigned URL) untuk download langsung.
-    Jika belum ada, trigger upload asinkron dan return 202.
-    """
+async def download_file(chat_id: int, message_id: int):
     await ensure_client_ready()
-    
-    r2_url = await get_r2_stream_url(chat_id, message_id)
-    if r2_url:
-        # Redirect ke R2, browser akan langsung mendownload file
-        return RedirectResponse(url=r2_url, status_code=302)
-    
-    background_tasks.add_task(trigger_upload_to_r2, chat_id, message_id)
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "uploading",
-            "message": "File is being prepared. Please try again later.",
-            "retry_after": 5
-        },
-        headers={"Retry-After": "5"}
+
+    msg = await telegram_client.get_messages(chat_id, message_id)
+    if not msg:
+        raise HTTPException(404, "Message not found")
+
+    # Tentukan nama file dan mime_type
+    if msg.video:
+        file_id = msg.video.file_id
+        filename = msg.video.file_name or f"video_{message_id}.mp4"
+        mime_type = "video/mp4"
+    elif msg.audio:
+        file_id = msg.audio.file_id
+        filename = msg.audio.file_name or f"audio_{message_id}.mp3"
+        mime_type = msg.audio.mime_type or "audio/mpeg"
+    elif msg.voice:
+        file_id = msg.voice.file_id
+        filename = f"voice_{message_id}.ogg"
+        mime_type = "audio/ogg"
+    elif msg.animation:
+        file_id = msg.animation.file_id
+        filename = msg.animation.file_name or f"animation_{message_id}.mp4"
+        mime_type = "video/mp4"
+    elif msg.photo:
+        # ✅ FIX: msg.photo adalah objek tunggal
+        file_id = msg.photo.file_id
+        filename = f"photo_{message_id}.jpg"
+        mime_type = "image/jpeg"
+    elif msg.document:
+        file_id = msg.document.file_id
+        filename = msg.document.file_name or f"file_{message_id}"
+        mime_type = msg.document.mime_type or "application/octet-stream"
+    else:
+        raise HTTPException(404, "No downloadable media found")
+
+    async def generate():
+        async for chunk in telegram_client.stream_media(file_id, limit=0):
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type=mime_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
