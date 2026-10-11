@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic
+yt-dlp
+requests
+python-multipart
+starlette
+telethon
+cachetools
+firebase-admin
+aiohttp
+httpx
+huggingface_hub
+cryptography
