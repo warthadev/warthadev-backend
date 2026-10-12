@@ -7,6 +7,7 @@ import shutil
 import asyncio
 import logging
 import tempfile
+import urllib.parse
 import subprocess
 import threading
 from typing import Dict, Any, Optional, List
@@ -28,6 +29,7 @@ COLAB_NOTEBOOK_URL = os.environ.get(
     "COLAB_NOTEBOOK_URL",
     "https://colab.research.google.com/drive/1HPCV9DbL2QCaahkxALemIyN2fQwcEGHd",
 )
+BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "").strip().rstrip("/")
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
@@ -419,6 +421,15 @@ def _watch_process(sid: str) -> None:
                 shutil.rmtree(s.get("dir", ""), ignore_errors=True)
 
 
+def _get_backend_url(request: Request) -> str:
+    if BACKEND_PUBLIC_URL:
+        return BACKEND_PUBLIC_URL
+    try:
+        return str(request.base_url).rstrip("/")
+    except Exception:
+        return ""
+
+
 async def _get_payload(
     request: Request,
     magnet_query: Optional[str],
@@ -668,12 +679,21 @@ async def torrent_colab_start(request: Request):
             "phase": "waiting",
         }
 
-    colab_url = f"{COLAB_NOTEBOOK_URL}?session_id={sid}"
+    backend_url = _get_backend_url(request)
+    if backend_url:
+        colab_url = (
+            f"{COLAB_NOTEBOOK_URL}"
+            f"?session_id={sid}"
+            f"&backend={urllib.parse.quote(backend_url, safe='')}"
+        )
+    else:
+        colab_url = f"{COLAB_NOTEBOOK_URL}?session_id={sid}"
 
     return {
         "ok": True,
         "session_id": sid,
         "colab_url": colab_url,
+        "backend_url": backend_url,
     }
 
 
@@ -726,7 +746,7 @@ async def torrent_colab_update(request: Request, session_id: str = Query(...)):
             raise HTTPException(404, "session not found")
 
         status_val = body.get("status")
-        if status_val in ("downloading", "uploading", "saved", "done", "error"):
+        if status_val in ("downloading", "uploading", "saved", "done", "error", "waiting_colab"):
             s["status"] = status_val
 
         if "percent" in body:
