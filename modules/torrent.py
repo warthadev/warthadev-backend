@@ -11,7 +11,7 @@ import subprocess
 import threading
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, Request, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from . import diskcache as dc
 
@@ -24,6 +24,11 @@ METADATA_TIMEOUT = int(os.environ.get("TORRENT_METADATA_TIMEOUT", "90"))
 SESSION_TTL_SECONDS = int(os.environ.get("TORRENT_SESSION_TTL", str(6 * 60 * 60)))
 MIN_FREE_DISK_MB = dc.MIN_FREE_DISK_MB
 
+COLAB_NOTEBOOK_URL = os.environ.get(
+    "COLAB_NOTEBOOK_URL",
+    "https://colab.research.google.com/drive/1HPCV9DbL2QCaahkxALemIyN2fQwcEGHd",
+)
+
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
@@ -34,7 +39,7 @@ MAX_CONNECTION_PER_SERVER = os.environ.get("TORRENT_MAX_CONN_PER_SERVER", "16")
 SPLIT_COUNT = os.environ.get("TORRENT_SPLIT", "16")
 DHT_LISTEN_PORT = os.environ.get("TORRENT_DHT_PORT", "6881")
 
-HF_REPO_TYPES = {"dataset"}
+HF_REPO_TYPES = {"dataset", "model", "space"}
 HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _SIZE_UNITS = {
@@ -554,6 +559,7 @@ async def torrent_download(
     with _sessions_lock:
         _sessions[sid] = {
             "session_id": sid,
+            "mode": "server",
             "magnet": magnet_value,
             "file_index": file_index_value,
             "file_name": file_name_value,
@@ -594,6 +600,177 @@ async def torrent_download(
     }
 
 
+@router.post("/colab-start")
+async def torrent_colab_start(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+
+    magnet_value = str(body.get("magnet") or "").strip()
+    token_value = str(body.get("token") or "").strip()
+    repo_id_value = str(body.get("repo_id") or "").strip()
+    repo_type_value = str(body.get("repo_type") or "dataset").strip().lower()
+    folder_value = str(body.get("folder") or "").strip().strip("/")
+    file_index_value = body.get("file_index")
+    file_name_value = str(body.get("file_name") or "")
+
+    if not magnet_value:
+        raise HTTPException(400, "magnet is required")
+    if not MAGNET_RE.match(magnet_value):
+        raise HTTPException(400, "magnet link not valid")
+    if not token_value:
+        raise HTTPException(400, "token is required")
+    if not HF_REPO_ID_RE.match(repo_id_value):
+        raise HTTPException(400, "repo_id not valid")
+    if repo_type_value not in HF_REPO_TYPES:
+        raise HTTPException(400, "repo_type not valid")
+    if file_index_value is None:
+        raise HTTPException(400, "file_index is required")
+
+    try:
+        file_index_int = int(file_index_value)
+    except Exception:
+        raise HTTPException(400, "file_index must be integer")
+
+    _cleanup_stale_sessions()
+
+    sid = uuid.uuid4().hex[:16]
+
+    with _sessions_lock:
+        _sessions[sid] = {
+            "session_id": sid,
+            "mode": "colab",
+            "magnet": magnet_value,
+            "token": token_value,
+            "repo_id": repo_id_value,
+            "repo_type": repo_type_value,
+            "folder": folder_value,
+            "file_index": file_index_int,
+            "file_name": file_name_value,
+            "dir": "",
+            "status": "waiting_colab",
+            "percent": 0,
+            "current_human": "0 B",
+            "total_human": "0 B",
+            "speed_human": "0 B/s",
+            "eta_seconds": None,
+            "finished": False,
+            "error": None,
+            "save_status": None,
+            "save_error": None,
+            "save_url": None,
+            "created_at": time.time(),
+            "started_at": time.time(),
+            "phase": "waiting",
+        }
+
+    colab_url = f"{COLAB_NOTEBOOK_URL}?session_id={sid}"
+
+    return {
+        "ok": True,
+        "session_id": sid,
+        "colab_url": colab_url,
+    }
+
+
+@router.get("/colab-config")
+async def torrent_colab_config(session_id: str = Query(...)):
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+
+    if not sess:
+        raise HTTPException(404, "session not found")
+
+    if sess.get("mode") != "colab":
+        raise HTTPException(400, "session is not a colab session")
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "magnet": sess.get("magnet"),
+        "token": sess.get("token"),
+        "repo_id": sess.get("repo_id"),
+        "repo_type": sess.get("repo_type"),
+        "folder": sess.get("folder"),
+        "file_index": sess.get("file_index"),
+        "file_name": sess.get("file_name"),
+    }
+
+
+@router.post("/colab-update")
+async def torrent_colab_update(request: Request, session_id: str = Query(...)):
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+
+    if not sess:
+        raise HTTPException(404, "session not found")
+
+    if sess.get("mode") != "colab":
+        raise HTTPException(400, "session is not a colab session")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+
+    with _sessions_lock:
+        s = _sessions.get(session_id)
+        if not s:
+            raise HTTPException(404, "session not found")
+
+        status_val = body.get("status")
+        if status_val in ("downloading", "uploading", "saved", "done", "error"):
+            s["status"] = status_val
+
+        if "percent" in body:
+            try:
+                s["percent"] = int(body["percent"])
+            except Exception:
+                pass
+
+        if "current_human" in body:
+            s["current_human"] = str(body["current_human"])
+        if "total_human" in body:
+            s["total_human"] = str(body["total_human"])
+        if "speed_human" in body:
+            s["speed_human"] = str(body["speed_human"])
+        if "eta_seconds" in body:
+            try:
+                s["eta_seconds"] = int(body["eta_seconds"]) if body["eta_seconds"] is not None else None
+            except Exception:
+                pass
+
+        if "file_name" in body and body["file_name"]:
+            s["file_name"] = str(body["file_name"])
+
+        if "phase" in body:
+            s["phase"] = str(body["phase"])
+
+        if "save_status" in body:
+            s["save_status"] = body["save_status"]
+        if "save_error" in body:
+            s["save_error"] = body["save_error"]
+        if "save_url" in body:
+            s["save_url"] = body["save_url"]
+
+        if body.get("finished") is True:
+            s["finished"] = True
+
+        if "error" in body and body["error"]:
+            s["error"] = str(body["error"])
+
+        s["updated_at"] = time.time()
+
+    return {"ok": True, "session_id": session_id}
+
+
 @router.get("/progress/{sid}")
 async def torrent_progress(sid: str):
     with _sessions_lock:
@@ -613,7 +790,9 @@ async def torrent_progress(sid: str):
     return {
         "ok": True,
         "session_id": sid,
+        "mode": sess.get("mode", "server"),
         "status": sess.get("status", "downloading"),
+        "phase": sess.get("phase"),
         "percent": sess.get("percent", 0),
         "current_human": sess.get("current_human", "0 B"),
         "total_human": sess.get("total_human", "0 B"),
