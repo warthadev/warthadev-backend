@@ -27,8 +27,10 @@ _sessions_lock = threading.Lock()
 
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:btih:[A-Za-z0-9]+", re.IGNORECASE)
 
-MAX_UPLOAD_LIMIT = os.environ.get("TORRENT_MAX_UPLOAD_LIMIT", "20K")
-MAX_PEERS = os.environ.get("TORRENT_MAX_PEERS", "30")
+MAX_PEERS = os.environ.get("TORRENT_MAX_PEERS", "200")
+MAX_CONNECTION_PER_SERVER = os.environ.get("TORRENT_MAX_CONN_PER_SERVER", "16")
+SPLIT_COUNT = os.environ.get("TORRENT_SPLIT", "16")
+DHT_LISTEN_PORT = os.environ.get("TORRENT_DHT_PORT", "6881")
 
 HF_REPO_TYPES = {"dataset"}
 HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -156,6 +158,10 @@ def _run_aria2_metadata(magnet: str, timeout: int) -> Dict[str, Any]:
             "--bt-save-metadata=true",
             "--seed-time=0",
             "--enable-dht=true",
+            "--dht-listen-port=" + DHT_LISTEN_PORT,
+            "--enable-dht6=false",
+            "--bt-enable-lpd=true",
+            "--bt-max-peers=" + MAX_PEERS,
             "--console-log-level=notice",
             "--summary-interval=0",
             "--file-allocation=none",
@@ -251,6 +257,14 @@ def _start_download_process(magnet: str, file_index: int, sid: str) -> subproces
     cmd = [
         "aria2c",
         "--enable-dht=true",
+        "--dht-listen-port=" + DHT_LISTEN_PORT,
+        "--enable-dht6=false",
+        "--bt-enable-lpd=true",
+        "--bt-detach-seed-only=true",
+        "--bt-max-peers=" + MAX_PEERS,
+        "--max-connection-per-server=" + MAX_CONNECTION_PER_SERVER,
+        "--split=" + SPLIT_COUNT,
+        "--min-split-size=1M",
         "--seed-time=0",
         "--file-allocation=none",
         "--summary-interval=1",
@@ -258,8 +272,6 @@ def _start_download_process(magnet: str, file_index: int, sid: str) -> subproces
         "--show-console-readout=true",
         "--download-result=full",
         "--select-file=" + str(file_index),
-        "--max-upload-limit=" + MAX_UPLOAD_LIMIT,
-        "--bt-max-peers=" + MAX_PEERS,
         "--input-file=" + input_file,
         "--dir", work_dir,
     ]
