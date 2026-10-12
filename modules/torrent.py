@@ -11,7 +11,7 @@ import tempfile
 import subprocess
 import threading
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import FileResponse
 
 logger = logging.getLogger(__name__)
@@ -27,10 +27,9 @@ _sessions_lock = threading.Lock()
 
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:btih:[A-Za-z0-9]+", re.IGNORECASE)
 
-# Limits to protect the free-tier bandwidth / disk.
 MAX_FILE_MB = int(os.environ.get("TORRENT_MAX_FILE_MB", "500"))
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-SIZE_TOLERANCE_BYTES = 16 * 1024 * 1024  # piece-boundary overhead
+SIZE_TOLERANCE_BYTES = 16 * 1024 * 1024
 MAX_UPLOAD_LIMIT = os.environ.get("TORRENT_MAX_UPLOAD_LIMIT", "20K")
 MAX_PEERS = os.environ.get("TORRENT_MAX_PEERS", "30")
 
@@ -90,7 +89,6 @@ def _find_torrent_file(dir_path: str) -> Optional[str]:
 
 
 def _bdecode(data: bytes, i: int = 0):
-    """Minimal bencode decoder. Returns (value, next_index)."""
     c = data[i:i + 1]
     if c == b"i":
         j = data.index(b"e", i)
@@ -116,11 +114,6 @@ def _bdecode(data: bytes, i: int = 0):
 
 
 def _parse_torrent_file(torrent_path: str):
-    """Read a .torrent file. Returns (torrent_name, files).
-
-    `index` is 1-based in torrent order, which is the same numbering
-    aria2 uses for --select-file.
-    """
     with open(torrent_path, "rb") as fh:
         meta, _ = _bdecode(fh.read())
 
@@ -394,17 +387,78 @@ def _watch_process(sid: str) -> None:
                 shutil.rmtree(s.get("dir", ""), ignore_errors=True)
 
 
+def _get_magnet_from_request(
+    request: Request,
+    magnet_query: Optional[str],
+) -> str:
+    if magnet_query and magnet_query.strip():
+        return magnet_query.strip()
+
+    try:
+        raw = request.query_params.get("magnet")
+        if raw and raw.strip():
+            return raw.strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+async def _get_payload(
+    request: Request,
+    magnet_query: Optional[str],
+    file_index_query: Optional[int],
+    file_name_query: Optional[str],
+    file_size_query: Optional[int],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+
+    if magnet_query and magnet_query.strip():
+        payload["magnet"] = magnet_query.strip()
+    if file_index_query is not None:
+        payload["file_index"] = file_index_query
+    if file_name_query is not None:
+        payload["file_name"] = file_name_query
+    if file_size_query is not None:
+        payload["file_size"] = file_size_query
+
+    if "magnet" in payload and "file_index" in payload:
+        return payload
+
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            for key in ("magnet", "file_index", "file_name", "file_size"):
+                if key in body and key not in payload:
+                    payload[key] = body[key]
+    except Exception:
+        pass
+
+    return payload
+
+
 @router.post("/start")
-async def torrent_start(payload: Dict[str, Any]):
-    magnet = (payload or {}).get("magnet", "").strip()
-    if not magnet:
+async def torrent_start(
+    request: Request,
+    magnet: Optional[str] = Query(default=None),
+):
+    payload = await _get_payload(
+        request,
+        magnet_query=magnet,
+        file_index_query=None,
+        file_name_query=None,
+        file_size_query=None,
+    )
+
+    magnet_value = str(payload.get("magnet", "")).strip()
+    if not magnet_value:
         raise HTTPException(400, "magnet is required")
-    if not MAGNET_RE.match(magnet):
+    if not MAGNET_RE.match(magnet_value):
         raise HTTPException(400, "magnet link not valid")
 
     _cleanup_stale_sessions()
 
-    result = await asyncio.to_thread(_run_aria2_metadata, magnet, METADATA_TIMEOUT)
+    result = await asyncio.to_thread(_run_aria2_metadata, magnet_value, METADATA_TIMEOUT)
     if not result.get("ok"):
         return {
             "ok": False,
@@ -423,18 +477,32 @@ async def torrent_start(payload: Dict[str, Any]):
 
 
 @router.post("/download")
-async def torrent_download(payload: Dict[str, Any]):
-    magnet = (payload or {}).get("magnet", "").strip()
-    file_index = (payload or {}).get("file_index")
-    file_name = (payload or {}).get("file_name") or ""
+async def torrent_download(
+    request: Request,
+    magnet: Optional[str] = Query(default=None),
+    file_index: Optional[int] = Query(default=None),
+    file_name: Optional[str] = Query(default=None),
+    file_size: Optional[int] = Query(default=None),
+):
+    payload = await _get_payload(
+        request,
+        magnet_query=magnet,
+        file_index_query=file_index,
+        file_name_query=file_name,
+        file_size_query=file_size,
+    )
 
-    if not magnet:
+    magnet_value = str(payload.get("magnet", "")).strip()
+    file_index_value = payload.get("file_index")
+    file_name_value = str(payload.get("file_name") or "")
+
+    if not magnet_value:
         raise HTTPException(400, "magnet is required")
-    if file_index is None:
+    if file_index_value is None:
         raise HTTPException(400, "file_index is required")
 
     try:
-        declared_size = int((payload or {}).get("file_size") or 0)
+        declared_size = int(payload.get("file_size") or 0)
     except Exception:
         declared_size = 0
     if declared_size > MAX_FILE_BYTES:
@@ -445,7 +513,7 @@ async def torrent_download(payload: Dict[str, Any]):
         )
 
     try:
-        file_index = int(file_index)
+        file_index_value = int(file_index_value)
     except Exception:
         raise HTTPException(400, "file_index must be integer")
 
@@ -456,9 +524,9 @@ async def torrent_download(payload: Dict[str, Any]):
     with _sessions_lock:
         _sessions[sid] = {
             "session_id": sid,
-            "magnet": magnet,
-            "file_index": file_index,
-            "file_name": file_name,
+            "magnet": magnet_value,
+            "file_index": file_index_value,
+            "file_name": file_name_value,
             "dir": _session_dir(sid),
             "status": "starting",
             "percent": 0,
@@ -473,7 +541,7 @@ async def torrent_download(payload: Dict[str, Any]):
         }
 
     try:
-        proc = _start_download_process(magnet, file_index, sid)
+        proc = _start_download_process(magnet_value, file_index_value, sid)
     except Exception as e:
         with _sessions_lock:
             sess = _sessions.pop(sid, None)
@@ -491,7 +559,7 @@ async def torrent_download(payload: Dict[str, Any]):
     return {
         "ok": True,
         "session_id": sid,
-        "file_name": file_name,
+        "file_name": file_name_value,
         "file_size": 0,
     }
 
@@ -635,7 +703,6 @@ def _upload_to_hf_worker(
             return
         work_dir = s.get("dir", "")
 
-    # Free the disk first, then mark as done.
     shutil.rmtree(work_dir, ignore_errors=True)
 
     with _sessions_lock:
@@ -646,9 +713,26 @@ def _upload_to_hf_worker(
         s["save_url"] = _hf_blob_url(repo_type, repo_id, path_in_repo)
 
 
+async def _get_save_hf_payload(request: Request) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            payload.update(body)
+    except Exception:
+        pass
+
+    for key in ("session_id", "token", "repo_id", "repo_type", "folder"):
+        qv = request.query_params.get(key)
+        if qv is not None and key not in payload:
+            payload[key] = qv
+
+    return payload
+
+
 @router.post("/save-hf")
-async def torrent_save_hf(payload: Dict[str, Any]):
-    p = payload or {}
+async def torrent_save_hf(request: Request):
+    p = await _get_save_hf_payload(request)
     sid = str(p.get("session_id") or "").strip()
     token = str(p.get("token") or "").strip()
     repo_id = str(p.get("repo_id") or "").strip()
