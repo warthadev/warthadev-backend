@@ -14,6 +14,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, validator
 import yt_dlp
 
+from . import diskcache as dc
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -644,6 +646,7 @@ async def handle_ytdl(request: VideoRequest):
             content={"success": False, "message": "URL must not be empty"}
         )
     try:
+        dc.log_disk_stats("[extract] ")
         result = await extract_video_logic(request.url)
         if not result.get("success"):
             return JSONResponse(status_code=400, content=result)
@@ -668,6 +671,9 @@ async def health_check():
 async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
     if shutil.which("ffmpeg") is None:
         raise HTTPException(500, "ffmpeg is not installed on the server")
+
+    dc.cleanup_disk(force=False)
+    dc.log_disk_stats("[mux] before ")
 
     tmp_dir = tempfile.mkdtemp(prefix="videomux_")
     video_path = os.path.join(tmp_dir, "video.mp4")
@@ -730,7 +736,7 @@ async def mux_video(request: MuxRequest, background_tasks: BackgroundTasks):
         logger.error(f"Mux error: {e}")
         raise HTTPException(500, str(e)[:200])
 
-# ---- TEMPORARY: hapus setelah tes jaringan selesai ----
+
 @router.get("/netcheck")
 async def netcheck():
     import urllib.request
