@@ -27,9 +27,6 @@ _sessions_lock = threading.Lock()
 
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:btih:[A-Za-z0-9]+", re.IGNORECASE)
 
-MAX_FILE_MB = int(os.environ.get("TORRENT_MAX_FILE_MB", "500"))
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-SIZE_TOLERANCE_BYTES = 16 * 1024 * 1024
 MAX_UPLOAD_LIMIT = os.environ.get("TORRENT_MAX_UPLOAD_LIMIT", "20K")
 MAX_PEERS = os.environ.get("TORRENT_MAX_PEERS", "30")
 
@@ -348,16 +345,6 @@ def _watch_process(sid: str) -> None:
                             s["speed_human"] = parsed["speed_human"]
                         if "eta_raw" in parsed:
                             s["eta_seconds"] = _eta_raw_to_seconds(parsed["eta_raw"])
-                        total_b = _human_to_bytes(parsed.get("total_human", ""))
-                        if total_b and total_b > MAX_FILE_BYTES + SIZE_TOLERANCE_BYTES:
-                            s["aborted"] = True
-                            s["status"] = "error"
-                            s["error"] = f"File is larger than the {MAX_FILE_MB} MB limit."
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-                            break
     except Exception as e:
         logger.error(f"torrent watcher error: {e}")
     finally:
@@ -385,23 +372,6 @@ def _watch_process(sid: str) -> None:
                 s["status"] = "error"
                 s["error"] = f"aria2 exited with code {code}. Last: {last_line[:200]}"
                 shutil.rmtree(s.get("dir", ""), ignore_errors=True)
-
-
-def _get_magnet_from_request(
-    request: Request,
-    magnet_query: Optional[str],
-) -> str:
-    if magnet_query and magnet_query.strip():
-        return magnet_query.strip()
-
-    try:
-        raw = request.query_params.get("magnet")
-        if raw and raw.strip():
-            return raw.strip()
-    except Exception:
-        pass
-
-    return ""
 
 
 async def _get_payload(
@@ -500,17 +470,6 @@ async def torrent_download(
         raise HTTPException(400, "magnet is required")
     if file_index_value is None:
         raise HTTPException(400, "file_index is required")
-
-    try:
-        declared_size = int(payload.get("file_size") or 0)
-    except Exception:
-        declared_size = 0
-    if declared_size > MAX_FILE_BYTES:
-        raise HTTPException(
-            413,
-            f"File is larger than the {MAX_FILE_MB} MB limit "
-            f"({_human_size(declared_size)}).",
-        )
 
     try:
         file_index_value = int(file_index_value)
