@@ -4,7 +4,6 @@ import re
 import time
 import uuid
 import shutil
-import socket
 import asyncio
 import logging
 import tempfile
@@ -14,14 +13,16 @@ from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import FileResponse
 
+from . import diskcache as dc
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/torrent", tags=["torrent"])
 
-DOWNLOAD_ROOT = os.environ.get("TORRENT_DOWNLOAD_DIR", "/tmp/wartha-torrents")
+DOWNLOAD_ROOT = dc.DOWNLOAD_ROOT
 METADATA_TIMEOUT = int(os.environ.get("TORRENT_METADATA_TIMEOUT", "90"))
 SESSION_TTL_SECONDS = int(os.environ.get("TORRENT_SESSION_TTL", str(6 * 60 * 60)))
-MIN_FREE_DISK_MB = int(os.environ.get("TORRENT_MIN_FREE_DISK_MB", "100"))
+MIN_FREE_DISK_MB = dc.MIN_FREE_DISK_MB
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
@@ -42,19 +43,35 @@ _SIZE_UNITS = {
     "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4,
 }
 
-_SAFE_CLEAN_PATHS = [
-    "/tmp/wartha-torrents",
-    "/tmp/tmeta_",
-    "/root/.cache/aria2",
-    "/root/.cache/pip",
-    "/tmp/pip-",
-    "/tmp/tmp",
-    "/root/.cache/huggingface",
-    "/root/.cache/yt-dlp",
-    "/tmp/ytdl_",
-    "/tmp/videomux_",
-    "/tmp/ffmpeg_",
-]
+
+def _human_size(num: int) -> str:
+    return dc.human_size(num)
+
+
+def _disk_stats() -> Dict[str, int]:
+    return dc.disk_stats()
+
+
+def _log_disk_stats(prefix: str = "") -> None:
+    dc.log_disk_stats(prefix)
+
+
+def _active_session_dirs() -> List[str]:
+    with _sessions_lock:
+        dirs = []
+        for sess in _sessions.values():
+            d = sess.get("dir", "")
+            if d:
+                dirs.append(d)
+        return dirs
+
+
+def _cleanup_disk(force: bool = False) -> int:
+    return dc.cleanup_disk(force=force, active_dirs=_active_session_dirs())
+
+
+def _aggressive_cleanup_if_low(reserve_bytes: int) -> int:
+    return dc.aggressive_cleanup_if_low(reserve_bytes, active_dirs=_active_session_dirs())
 
 
 def _human_to_bytes(text: str) -> Optional[int]:
@@ -68,238 +85,7 @@ def _human_to_bytes(text: str) -> Optional[int]:
 
 
 def _ensure_download_root() -> None:
-    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
-
-
-def _human_size(num: int) -> str:
-    try:
-        n = float(num)
-    except Exception:
-        return "0 B"
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if abs(n) < 1024.0:
-            if unit == "B":
-                return f"{int(n)} B"
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PB"
-
-
-def _dir_size(path: str) -> int:
-    if not path or not os.path.exists(path):
-        return 0
-    if os.path.isfile(path):
-        try:
-            return os.path.getsize(path)
-        except Exception:
-            return 0
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except Exception:
-                pass
-    return total
-
-
-def _disk_stats() -> Dict[str, int]:
-    try:
-        usage = shutil.disk_usage(DOWNLOAD_ROOT)
-        return {
-            "total_bytes": usage.total,
-            "used_bytes": usage.used,
-            "free_bytes": usage.free,
-        }
-    except Exception:
-        try:
-            usage = shutil.disk_usage("/")
-            return {
-                "total_bytes": usage.total,
-                "used_bytes": usage.used,
-                "free_bytes": usage.free,
-            }
-        except Exception:
-            return {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0}
-
-
-def _log_disk_stats(prefix: str = "") -> None:
-    stats = _disk_stats()
-    total = stats["total_bytes"]
-    used = stats["used_bytes"]
-    free = stats["free_bytes"]
-    if total > 0:
-        logger.info(
-            f"{prefix}disk: {_human_size(used)} used / {_human_size(total)} total "
-            f"({_human_size(free)} free)"
-        )
-    else:
-        logger.warning(f"{prefix}disk: unable to read disk stats")
-
-
-def _is_safe_path(path: str) -> bool:
-    if not path:
-        return False
-    abs_path = os.path.abspath(path)
-    for safe in _SAFE_CLEAN_PATHS:
-        if abs_path == os.path.abspath(safe):
-            return True
-        if abs_path.startswith(os.path.abspath(safe) + os.sep):
-            return True
-    return False
-
-
-def _remove_path(path: str) -> int:
-    if not path or not os.path.exists(path):
-        return 0
-    if not _is_safe_path(path):
-        logger.warning(f"torrent cleanup: refused to remove unsafe path {path}")
-        return 0
-    size = _dir_size(path)
-    try:
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-        else:
-            os.remove(path)
-        if size > 0:
-            logger.info(f"torrent cleanup: removed {path} ({_human_size(size)})")
-        else:
-            logger.info(f"torrent cleanup: removed {path}")
-        return size
-    except Exception as e:
-        logger.warning(f"torrent cleanup: failed to remove {path}: {e}")
-        return 0
-
-
-def _cleanup_disk(force: bool = False) -> int:
-    _ensure_download_root()
-
-    now = time.time()
-    freed_bytes = 0
-
-    with _sessions_lock:
-        active_dirs = set()
-        for sess in _sessions.values():
-            d = sess.get("dir", "")
-            if d:
-                active_dirs.add(os.path.abspath(d))
-
-    try:
-        entries = os.listdir(DOWNLOAD_ROOT)
-    except Exception:
-        entries = []
-
-    for name in entries:
-        path = os.path.join(DOWNLOAD_ROOT, name)
-        if not os.path.isdir(path):
-            continue
-
-        abs_path = os.path.abspath(path)
-
-        if name.startswith("tmeta_"):
-            try:
-                if force or os.path.getmtime(path) < now - 60:
-                    freed_bytes += _remove_path(path)
-            except Exception:
-                pass
-            continue
-
-        if name.startswith("session_"):
-            if abs_path in active_dirs and not force:
-                continue
-            try:
-                if force or os.path.getmtime(path) < now - 300:
-                    freed_bytes += _remove_path(path)
-            except Exception:
-                pass
-
-    for root, _dirs, files in os.walk(DOWNLOAD_ROOT):
-        for f in files:
-            p = os.path.join(root, f)
-            try:
-                if f.endswith(".aria2"):
-                    if force or os.path.getmtime(p) < now - 300:
-                        freed_bytes += _remove_path(p)
-            except Exception:
-                pass
-
-    stale_temp_prefixes = ["/tmp/tmeta_", "/tmp/ytdl_", "/tmp/videomux_", "/tmp/ffmpeg_"]
-    try:
-        tmp_entries = os.listdir("/tmp")
-    except Exception:
-        tmp_entries = []
-
-    for name in tmp_entries:
-        full = os.path.join("/tmp", name)
-        for prefix in stale_temp_prefixes:
-            if full.startswith(prefix):
-                try:
-                    if force or os.path.getmtime(full) < now - 300:
-                        freed_bytes += _remove_path(full)
-                except Exception:
-                    pass
-                break
-
-    for name in tmp_entries:
-        full = os.path.join("/tmp", name)
-        try:
-            if name.startswith("pip-"):
-                if force or os.path.getmtime(full) < now - 600:
-                    freed_bytes += _remove_path(full)
-            elif name.startswith("tmp"):
-                if force or os.path.getmtime(full) < now - 1800:
-                    freed_bytes += _remove_path(full)
-        except Exception:
-            pass
-
-    aria_cache = "/root/.cache/aria2"
-    if os.path.isdir(aria_cache):
-        try:
-            for name in os.listdir(aria_cache):
-                if name.endswith(".aria2") or name == "dht.dat":
-                    p = os.path.join(aria_cache, name)
-                    if force:
-                        freed_bytes += _remove_path(p)
-        except Exception:
-            pass
-
-    if force:
-        for cache_dir in [
-            "/root/.cache/pip",
-            "/root/.cache/huggingface",
-            "/root/.cache/yt-dlp",
-        ]:
-            if os.path.isdir(cache_dir):
-                freed_bytes += _remove_path(cache_dir)
-
-    if freed_bytes > 0:
-        logger.info(f"torrent cleanup: freed {_human_size(freed_bytes)}")
-
-    return freed_bytes
-
-
-def _aggressive_cleanup_if_low(reserve_bytes: int) -> int:
-    stats = _disk_stats()
-    if stats["free_bytes"] >= reserve_bytes:
-        return 0
-
-    logger.info("torrent cleanup: disk low, running aggressive cleanup")
-    freed = _cleanup_disk(force=True)
-
-    try:
-        for root, _dirs, files in os.walk("/tmp"):
-            for f in files:
-                if f.endswith(".log") or f.endswith(".tmp"):
-                    p = os.path.join(root, f)
-                    try:
-                        if os.path.getmtime(p) < time.time() - 600:
-                            freed += _remove_path(p)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    return freed
+    dc.ensure_download_root()
 
 
 def _write_magnet_input_file(magnet: str, dir_path: str) -> str:
