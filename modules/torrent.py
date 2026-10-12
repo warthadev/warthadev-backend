@@ -21,6 +21,7 @@ router = APIRouter(prefix="/torrent", tags=["torrent"])
 DOWNLOAD_ROOT = os.environ.get("TORRENT_DOWNLOAD_DIR", "/tmp/wartha-torrents")
 METADATA_TIMEOUT = int(os.environ.get("TORRENT_METADATA_TIMEOUT", "90"))
 SESSION_TTL_SECONDS = int(os.environ.get("TORRENT_SESSION_TTL", str(6 * 60 * 60)))
+MIN_FREE_DISK_MB = int(os.environ.get("TORRENT_MIN_FREE_DISK_MB", "500"))
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
@@ -68,6 +69,97 @@ def _human_size(num: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PB"
+
+
+def _disk_stats() -> Dict[str, int]:
+    try:
+        usage = shutil.disk_usage(DOWNLOAD_ROOT)
+        return {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+        }
+    except Exception:
+        try:
+            usage = shutil.disk_usage("/")
+            return {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+            }
+        except Exception:
+            return {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0}
+
+
+def _log_disk_stats(prefix: str = "") -> None:
+    stats = _disk_stats()
+    total = stats["total_bytes"]
+    used = stats["used_bytes"]
+    free = stats["free_bytes"]
+    if total > 0:
+        logger.info(
+            f"{prefix}disk: {_human_size(used)} used / {_human_size(total)} total "
+            f"({_human_size(free)} free)"
+        )
+    else:
+        logger.warning(f"{prefix}disk: unable to read disk stats")
+
+
+def _cleanup_disk(force: bool = False) -> None:
+    _ensure_download_root()
+
+    now = time.time()
+
+    with _sessions_lock:
+        active_dirs = set()
+        for sess in _sessions.values():
+            d = sess.get("dir", "")
+            if d:
+                active_dirs.add(os.path.abspath(d))
+
+    try:
+        entries = os.listdir(DOWNLOAD_ROOT)
+    except Exception:
+        return
+
+    for name in entries:
+        path = os.path.join(DOWNLOAD_ROOT, name)
+        if not os.path.isdir(path):
+            continue
+
+        abs_path = os.path.abspath(path)
+
+        if name.startswith("tmeta_"):
+            try:
+                if os.path.getmtime(path) < now - 60 or force:
+                    shutil.rmtree(path, ignore_errors=True)
+                    logger.info(f"torrent cleanup: removed stale metadata dir {name}")
+            except Exception:
+                pass
+            continue
+
+        if name.startswith("session_"):
+            if abs_path in active_dirs and not force:
+                continue
+            try:
+                if force or os.path.getmtime(path) < now - 300:
+                    shutil.rmtree(path, ignore_errors=True)
+                    logger.info(f"torrent cleanup: removed orphan session dir {name}")
+            except Exception:
+                pass
+
+    for root, dirs, files in os.walk(DOWNLOAD_ROOT):
+        for f in files:
+            if f.endswith(".aria2"):
+                p = os.path.join(root, f)
+                try:
+                    if os.path.getmtime(p) < now - 300 or force:
+                        os.remove(p)
+                        logger.info(f"torrent cleanup: removed stale .aria2 {f}")
+                except Exception:
+                    pass
+            if f == "input.txt":
+                continue
 
 
 def _write_magnet_input_file(magnet: str, dir_path: str) -> str:
@@ -147,6 +239,7 @@ def _parse_torrent_file(torrent_path: str):
 
 def _run_aria2_metadata(magnet: str, timeout: int) -> Dict[str, Any]:
     _ensure_download_root()
+    _cleanup_disk()
     tmp = tempfile.mkdtemp(prefix="tmeta_", dir=DOWNLOAD_ROOT)
     torrent_path: Optional[str] = None
     try:
@@ -381,8 +474,17 @@ def _watch_process(sid: str) -> None:
                 s["finished"] = True
                 s["percent"] = 100
             else:
+                err_msg = f"aria2 exited with code {code}."
+                if code == 9:
+                    err_msg += " Disk space not enough to finish download."
+                elif code == 7:
+                    err_msg += " Download was aborted."
+                elif code == 3:
+                    err_msg += " Resource not found."
+                elif code == 1:
+                    err_msg += " Unknown error."
                 s["status"] = "error"
-                s["error"] = f"aria2 exited with code {code}. Last: {last_line[:200]}"
+                s["error"] = f"{err_msg} Last: {last_line[:200]}"
                 shutil.rmtree(s.get("dir", ""), ignore_errors=True)
 
 
@@ -439,6 +541,7 @@ async def torrent_start(
         raise HTTPException(400, "magnet link not valid")
 
     _cleanup_stale_sessions()
+    _log_disk_stats("[start] ")
 
     result = await asyncio.to_thread(_run_aria2_metadata, magnet_value, METADATA_TIMEOUT)
     if not result.get("ok"):
@@ -489,6 +592,30 @@ async def torrent_download(
         raise HTTPException(400, "file_index must be integer")
 
     _cleanup_stale_sessions()
+    _cleanup_disk(force=False)
+    _log_disk_stats("[download] ")
+
+    try:
+        declared_size = int(payload.get("file_size") or 0)
+    except Exception:
+        declared_size = 0
+
+    stats = _disk_stats()
+    free_bytes = stats["free_bytes"]
+    needed_bytes = declared_size if declared_size > 0 else 0
+    reserve_bytes = MIN_FREE_DISK_MB * 1024 * 1024
+
+    if needed_bytes > 0 and free_bytes - needed_bytes < reserve_bytes:
+        _cleanup_disk(force=True)
+        stats = _disk_stats()
+        free_bytes = stats["free_bytes"]
+
+    if needed_bytes > 0 and free_bytes - needed_bytes < reserve_bytes:
+        raise HTTPException(
+            507,
+            f"Insufficient disk space. Need {_human_size(needed_bytes)}, "
+            f"available {_human_size(free_bytes)} (reserve {MIN_FREE_DISK_MB} MB).",
+        )
 
     sid = uuid.uuid4().hex[:16]
 
