@@ -77,6 +77,73 @@ app = FastAPI(
 )
 
 
+def _parse_allowed_origins() -> list:
+    raw = os.environ.get("ALLOWED_ORIGINS", "*")
+    if not raw:
+        parts = ["*"]
+    else:
+        parts = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        if not parts:
+            parts = ["*"]
+
+    defaults = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "https://warthasensei.web.app",
+        "https://warthasensei.firebaseapp.com",
+    ]
+
+    if parts == ["*"]:
+        for origin in defaults:
+            if origin not in parts:
+                parts.append(origin)
+
+    return parts
+
+
+ALLOWED_ORIGINS = _parse_allowed_origins()
+logger.info(f"Allowed CORS origins: {ALLOWED_ORIGINS}")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Type",
+        "Content-Disposition",
+        "X-Subtitle-Format",
+        "X-Subtitle-Track",
+        "X-Subtitle-Language",
+        "X-Subtitle-Codec-Source"
+    ],
+)
+
+
+@app.middleware("http")
+async def ensure_cors_headers(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
+
+    origin = request.headers.get("origin")
+    if origin and "access-control-allow-origin" not in {k.lower() for k in response.headers.keys()}:
+        if "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin if "*" not in ALLOWED_ORIGINS else "*"
+            response.headers["Access-Control-Allow-Methods"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+
+    return response
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
@@ -94,36 +161,6 @@ async def head_root():
 @app.head("/health")
 async def head_health():
     return Response(status_code=200)
-
-
-def _parse_allowed_origins() -> list:
-    raw = os.environ.get("ALLOWED_ORIGINS", "*")
-    if not raw:
-        return ["*"]
-    parts = [origin.strip() for origin in raw.split(",") if origin.strip()]
-    if not parts:
-        return ["*"]
-    return parts
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_parse_allowed_origins(),
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=[
-        "Content-Range",
-        "Accept-Ranges",
-        "Content-Length",
-        "Content-Type",
-        "Content-Disposition",
-        "X-Subtitle-Format",
-        "X-Subtitle-Track",
-        "X-Subtitle-Language",
-        "X-Subtitle-Codec-Source"
-    ],
-)
 
 
 @app.get("/")
