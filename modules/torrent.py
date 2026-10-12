@@ -21,7 +21,7 @@ router = APIRouter(prefix="/torrent", tags=["torrent"])
 DOWNLOAD_ROOT = os.environ.get("TORRENT_DOWNLOAD_DIR", "/tmp/wartha-torrents")
 METADATA_TIMEOUT = int(os.environ.get("TORRENT_METADATA_TIMEOUT", "90"))
 SESSION_TTL_SECONDS = int(os.environ.get("TORRENT_SESSION_TTL", str(6 * 60 * 60)))
-MIN_FREE_DISK_MB = int(os.environ.get("TORRENT_MIN_FREE_DISK_MB", "500"))
+MIN_FREE_DISK_MB = int(os.environ.get("TORRENT_MIN_FREE_DISK_MB", "100"))
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
@@ -41,6 +41,20 @@ _SIZE_UNITS = {
     "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3, "TIB": 1024 ** 4,
     "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4,
 }
+
+_SAFE_CLEAN_PATHS = [
+    "/tmp/wartha-torrents",
+    "/tmp/tmeta_",
+    "/root/.cache/aria2",
+    "/root/.cache/pip",
+    "/tmp/pip-",
+    "/tmp/tmp",
+    "/root/.cache/huggingface",
+    "/root/.cache/yt-dlp",
+    "/tmp/ytdl_",
+    "/tmp/videomux_",
+    "/tmp/ffmpeg_",
+]
 
 
 def _human_to_bytes(text: str) -> Optional[int]:
@@ -69,6 +83,24 @@ def _human_size(num: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PB"
+
+
+def _dir_size(path: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except Exception:
+                pass
+    return total
 
 
 def _disk_stats() -> Dict[str, int]:
@@ -105,10 +137,45 @@ def _log_disk_stats(prefix: str = "") -> None:
         logger.warning(f"{prefix}disk: unable to read disk stats")
 
 
-def _cleanup_disk(force: bool = False) -> None:
+def _is_safe_path(path: str) -> bool:
+    if not path:
+        return False
+    abs_path = os.path.abspath(path)
+    for safe in _SAFE_CLEAN_PATHS:
+        if abs_path == os.path.abspath(safe):
+            return True
+        if abs_path.startswith(os.path.abspath(safe) + os.sep):
+            return True
+    return False
+
+
+def _remove_path(path: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    if not _is_safe_path(path):
+        logger.warning(f"torrent cleanup: refused to remove unsafe path {path}")
+        return 0
+    size = _dir_size(path)
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+        if size > 0:
+            logger.info(f"torrent cleanup: removed {path} ({_human_size(size)})")
+        else:
+            logger.info(f"torrent cleanup: removed {path}")
+        return size
+    except Exception as e:
+        logger.warning(f"torrent cleanup: failed to remove {path}: {e}")
+        return 0
+
+
+def _cleanup_disk(force: bool = False) -> int:
     _ensure_download_root()
 
     now = time.time()
+    freed_bytes = 0
 
     with _sessions_lock:
         active_dirs = set()
@@ -120,7 +187,7 @@ def _cleanup_disk(force: bool = False) -> None:
     try:
         entries = os.listdir(DOWNLOAD_ROOT)
     except Exception:
-        return
+        entries = []
 
     for name in entries:
         path = os.path.join(DOWNLOAD_ROOT, name)
@@ -131,9 +198,8 @@ def _cleanup_disk(force: bool = False) -> None:
 
         if name.startswith("tmeta_"):
             try:
-                if os.path.getmtime(path) < now - 60 or force:
-                    shutil.rmtree(path, ignore_errors=True)
-                    logger.info(f"torrent cleanup: removed stale metadata dir {name}")
+                if force or os.path.getmtime(path) < now - 60:
+                    freed_bytes += _remove_path(path)
             except Exception:
                 pass
             continue
@@ -143,23 +209,97 @@ def _cleanup_disk(force: bool = False) -> None:
                 continue
             try:
                 if force or os.path.getmtime(path) < now - 300:
-                    shutil.rmtree(path, ignore_errors=True)
-                    logger.info(f"torrent cleanup: removed orphan session dir {name}")
+                    freed_bytes += _remove_path(path)
             except Exception:
                 pass
 
-    for root, dirs, files in os.walk(DOWNLOAD_ROOT):
+    for root, _dirs, files in os.walk(DOWNLOAD_ROOT):
         for f in files:
-            if f.endswith(".aria2"):
-                p = os.path.join(root, f)
+            p = os.path.join(root, f)
+            try:
+                if f.endswith(".aria2"):
+                    if force or os.path.getmtime(p) < now - 300:
+                        freed_bytes += _remove_path(p)
+            except Exception:
+                pass
+
+    stale_temp_prefixes = ["/tmp/tmeta_", "/tmp/ytdl_", "/tmp/videomux_", "/tmp/ffmpeg_"]
+    try:
+        tmp_entries = os.listdir("/tmp")
+    except Exception:
+        tmp_entries = []
+
+    for name in tmp_entries:
+        full = os.path.join("/tmp", name)
+        for prefix in stale_temp_prefixes:
+            if full.startswith(prefix):
                 try:
-                    if os.path.getmtime(p) < now - 300 or force:
-                        os.remove(p)
-                        logger.info(f"torrent cleanup: removed stale .aria2 {f}")
+                    if force or os.path.getmtime(full) < now - 300:
+                        freed_bytes += _remove_path(full)
                 except Exception:
                     pass
-            if f == "input.txt":
-                continue
+                break
+
+    for name in tmp_entries:
+        full = os.path.join("/tmp", name)
+        try:
+            if name.startswith("pip-"):
+                if force or os.path.getmtime(full) < now - 600:
+                    freed_bytes += _remove_path(full)
+            elif name.startswith("tmp"):
+                if force or os.path.getmtime(full) < now - 1800:
+                    freed_bytes += _remove_path(full)
+        except Exception:
+            pass
+
+    aria_cache = "/root/.cache/aria2"
+    if os.path.isdir(aria_cache):
+        try:
+            for name in os.listdir(aria_cache):
+                if name.endswith(".aria2") or name == "dht.dat":
+                    p = os.path.join(aria_cache, name)
+                    if force:
+                        freed_bytes += _remove_path(p)
+        except Exception:
+            pass
+
+    if force:
+        for cache_dir in [
+            "/root/.cache/pip",
+            "/root/.cache/huggingface",
+            "/root/.cache/yt-dlp",
+        ]:
+            if os.path.isdir(cache_dir):
+                freed_bytes += _remove_path(cache_dir)
+
+    if freed_bytes > 0:
+        logger.info(f"torrent cleanup: freed {_human_size(freed_bytes)}")
+
+    return freed_bytes
+
+
+def _aggressive_cleanup_if_low(reserve_bytes: int) -> int:
+    stats = _disk_stats()
+    if stats["free_bytes"] >= reserve_bytes:
+        return 0
+
+    logger.info("torrent cleanup: disk low, running aggressive cleanup")
+    freed = _cleanup_disk(force=True)
+
+    try:
+        for root, _dirs, files in os.walk("/tmp"):
+            for f in files:
+                if f.endswith(".log") or f.endswith(".tmp"):
+                    p = os.path.join(root, f)
+                    try:
+                        if os.path.getmtime(p) < time.time() - 600:
+                            freed += _remove_path(p)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return freed
 
 
 def _write_magnet_input_file(magnet: str, dir_path: str) -> str:
@@ -541,7 +681,11 @@ async def torrent_start(
         raise HTTPException(400, "magnet link not valid")
 
     _cleanup_stale_sessions()
-    _log_disk_stats("[start] ")
+    _log_disk_stats("[start] before cleanup ")
+
+    if _disk_stats()["free_bytes"] < MIN_FREE_DISK_MB * 1024 * 1024:
+        _aggressive_cleanup_if_low(MIN_FREE_DISK_MB * 1024 * 1024)
+        _log_disk_stats("[start] after cleanup ")
 
     result = await asyncio.to_thread(_run_aria2_metadata, magnet_value, METADATA_TIMEOUT)
     if not result.get("ok"):
@@ -593,29 +737,31 @@ async def torrent_download(
 
     _cleanup_stale_sessions()
     _cleanup_disk(force=False)
-    _log_disk_stats("[download] ")
+    _log_disk_stats("[download] before ")
 
     try:
         declared_size = int(payload.get("file_size") or 0)
     except Exception:
         declared_size = 0
 
-    stats = _disk_stats()
-    free_bytes = stats["free_bytes"]
-    needed_bytes = declared_size if declared_size > 0 else 0
     reserve_bytes = MIN_FREE_DISK_MB * 1024 * 1024
 
-    if needed_bytes > 0 and free_bytes - needed_bytes < reserve_bytes:
-        _cleanup_disk(force=True)
-        stats = _disk_stats()
-        free_bytes = stats["free_bytes"]
+    if declared_size > 0:
+        free_bytes = _disk_stats()["free_bytes"]
+        if free_bytes - declared_size < reserve_bytes:
+            _aggressive_cleanup_if_low(declared_size + reserve_bytes)
 
-    if needed_bytes > 0 and free_bytes - needed_bytes < reserve_bytes:
+    free_bytes = _disk_stats()["free_bytes"]
+
+    if declared_size > 0 and free_bytes - declared_size < reserve_bytes:
         raise HTTPException(
             507,
-            f"Insufficient disk space. Need {_human_size(needed_bytes)}, "
-            f"available {_human_size(free_bytes)} (reserve {MIN_FREE_DISK_MB} MB).",
+            f"Insufficient disk space. Need {_human_size(declared_size)}, "
+            f"available {_human_size(free_bytes)} (reserve {MIN_FREE_DISK_MB} MB). "
+            f"Try a smaller file or upgrade your plan.",
         )
+
+    _log_disk_stats("[download] after ")
 
     sid = uuid.uuid4().hex[:16]
 
@@ -902,3 +1048,36 @@ async def torrent_session_delete(sid: str):
 
     shutil.rmtree(sess.get("dir", ""), ignore_errors=True)
     return {"ok": True, "session_id": sid}
+
+
+@router.post("/cleanup")
+async def torrent_cleanup(force: bool = Query(default=True)):
+    freed = _cleanup_disk(force=force)
+    if force:
+        freed += _aggressive_cleanup_if_low(0)
+    stats = _disk_stats()
+    return {
+        "ok": True,
+        "freed_bytes": freed,
+        "freed_human": _human_size(freed),
+        "disk": {
+            "total": _human_size(stats["total_bytes"]),
+            "used": _human_size(stats["used_bytes"]),
+            "free": _human_size(stats["free_bytes"]),
+            "free_bytes": stats["free_bytes"],
+        },
+    }
+
+
+@router.get("/disk")
+async def torrent_disk():
+    stats = _disk_stats()
+    return {
+        "ok": True,
+        "total_bytes": stats["total_bytes"],
+        "used_bytes": stats["used_bytes"],
+        "free_bytes": stats["free_bytes"],
+        "total_human": _human_size(stats["total_bytes"]),
+        "used_human": _human_size(stats["used_bytes"]),
+        "free_human": _human_size(stats["free_bytes"]),
+    }
