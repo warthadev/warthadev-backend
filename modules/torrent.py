@@ -680,14 +680,10 @@ async def torrent_colab_start(request: Request):
         }
 
     backend_url = _get_backend_url(request)
+    hash_params = f"session_id={sid}"
     if backend_url:
-        colab_url = (
-            f"{COLAB_NOTEBOOK_URL}"
-            f"?session_id={sid}"
-            f"&backend={urllib.parse.quote(backend_url, safe='')}"
-        )
-    else:
-        colab_url = f"{COLAB_NOTEBOOK_URL}?session_id={sid}"
+        hash_params += f"&backend={urllib.parse.quote(backend_url, safe='')}"
+    colab_url = f"{COLAB_NOTEBOOK_URL}#{hash_params}"
 
     return {
         "ok": True,
