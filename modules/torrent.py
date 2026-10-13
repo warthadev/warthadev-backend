@@ -1072,6 +1072,12 @@ async def torrent_colab_session(session_id: str = Query(...)):
             raise HTTPException(410, "session not found or expired")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         seconds_left = max(0, int(expires_at - now))
+        colab_files = list(sess.get("colab_files") or [])
+        file_indexes = sorted({
+            int(f.get("index", 0))
+            for f in colab_files
+            if int(f.get("index", 0)) > 0
+        })
         return {
             "ok": True,
             "session_id": session_id,
@@ -1079,6 +1085,8 @@ async def torrent_colab_session(session_id: str = Query(...)):
             "seconds_left": seconds_left,
             "ttl_seconds": SESSION_TTL_SECONDS,
             "status": sess.get("status"),
+            "file_indexes": file_indexes,
+            "files_count": len(colab_files),
         }
 
 
