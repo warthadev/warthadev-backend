@@ -1095,15 +1095,11 @@ async def torrent_colab_update(request: Request, session_id: str = Query(...)):
         sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
 
         if body.get("save_status") == "done":
-            done_index = body.get("current_file_index")
-            try:
-                done_index_int = int(done_index) if done_index is not None else None
-            except Exception:
-                done_index_int = None
-            if done_index_int is not None:
+            done_name = str(body.get("file_name") or "").strip()
+            if done_name:
                 remaining = [
                     f for f in (sess.get("colab_files") or [])
-                    if int(f.get("index", 0)) != done_index_int
+                    if str(f.get("name", "")) != done_name
                 ]
                 sess["colab_files"] = remaining
 
