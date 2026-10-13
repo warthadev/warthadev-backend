@@ -626,8 +626,7 @@ async def torrent_colab_start(request: Request):
     repo_id_value = str(body.get("repo_id") or "").strip()
     repo_type_value = str(body.get("repo_type") or "dataset").strip().lower()
     folder_value = str(body.get("folder") or "").strip().strip("/")
-    file_index_value = body.get("file_index")
-    file_name_value = str(body.get("file_name") or "")
+    files_value = body.get("files")
 
     if not magnet_value:
         raise HTTPException(400, "magnet is required")
@@ -639,13 +638,24 @@ async def torrent_colab_start(request: Request):
         raise HTTPException(400, "repo_id not valid")
     if repo_type_value not in HF_REPO_TYPES:
         raise HTTPException(400, "repo_type not valid")
-    if file_index_value is None:
-        raise HTTPException(400, "file_index is required")
+    if not isinstance(files_value, list) or not files_value:
+        raise HTTPException(400, "files must be a non-empty list")
 
-    try:
-        file_index_int = int(file_index_value)
-    except Exception:
-        raise HTTPException(400, "file_index must be integer")
+    normalized_files: List[Dict[str, Any]] = []
+    for item in files_value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index"))
+        except Exception:
+            continue
+        name = str(item.get("name") or "").strip()
+        if idx <= 0 or not name:
+            continue
+        normalized_files.append({"index": idx, "name": name})
+
+    if not normalized_files:
+        raise HTTPException(400, "no valid files provided")
 
     _cleanup_stale_sessions()
 
@@ -660,8 +670,9 @@ async def torrent_colab_start(request: Request):
             "repo_id": repo_id_value,
             "repo_type": repo_type_value,
             "folder": folder_value,
-            "file_index": file_index_int,
-            "file_name": file_name_value,
+            "files": normalized_files,
+            "current_file_index": 0,
+            "current_file_name": normalized_files[0]["name"] if normalized_files else "",
             "dir": "",
             "status": "waiting_colab",
             "percent": 0,
@@ -690,6 +701,7 @@ async def torrent_colab_start(request: Request):
         "session_id": sid,
         "colab_url": colab_url,
         "backend_url": backend_url,
+        "files_count": len(normalized_files),
     }
 
 
@@ -712,8 +724,7 @@ async def torrent_colab_config(session_id: str = Query(...)):
         "repo_id": sess.get("repo_id"),
         "repo_type": sess.get("repo_type"),
         "folder": sess.get("folder"),
-        "file_index": sess.get("file_index"),
-        "file_name": sess.get("file_name"),
+        "files": sess.get("files", []),
     }
 
 
@@ -764,7 +775,31 @@ async def torrent_colab_update(request: Request, session_id: str = Query(...)):
                 pass
 
         if "file_name" in body and body["file_name"]:
-            s["file_name"] = str(body["file_name"])
+            s["current_file_name"] = str(body["file_name"])
+
+        if "current_file_index" in body:
+            try:
+                s["current_file_index"] = int(body["current_file_index"])
+            except Exception:
+                pass
+
+        if "total_files" in body:
+            try:
+                s["total_files"] = int(body["total_files"])
+            except Exception:
+                pass
+
+        if "completed_files" in body:
+            try:
+                s["completed_files"] = int(body["completed_files"])
+            except Exception:
+                pass
+
+        if "failed_files" in body:
+            try:
+                s["failed_files"] = int(body["failed_files"])
+            except Exception:
+                pass
 
         if "phase" in body:
             s["phase"] = str(body["phase"])
@@ -815,7 +850,11 @@ async def torrent_progress(sid: str):
         "speed_human": sess.get("speed_human", "0 B/s"),
         "elapsed": elapsed,
         "eta_seconds": sess.get("eta_seconds"),
-        "file_name": sess.get("file_name", ""),
+        "file_name": sess.get("current_file_name", sess.get("file_name", "")),
+        "current_file_index": sess.get("current_file_index", 0),
+        "total_files": sess.get("total_files", len(sess.get("files", []))),
+        "completed_files": sess.get("completed_files", 0),
+        "failed_files": sess.get("failed_files", 0),
         "finished": bool(sess.get("finished")),
         "error": sess.get("error"),
         "save_status": sess.get("save_status"),
