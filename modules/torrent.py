@@ -3,16 +3,16 @@ import os
 import re
 import time
 import uuid
+import json
 import shutil
 import asyncio
 import logging
 import tempfile
-import urllib.parse
 import subprocess
 import threading
 from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, Request, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 
 from . import diskcache as dc
 
@@ -24,12 +24,7 @@ DOWNLOAD_ROOT = dc.DOWNLOAD_ROOT
 METADATA_TIMEOUT = int(os.environ.get("TORRENT_METADATA_TIMEOUT", "90"))
 SESSION_TTL_SECONDS = int(os.environ.get("TORRENT_SESSION_TTL", str(6 * 60 * 60)))
 MIN_FREE_DISK_MB = dc.MIN_FREE_DISK_MB
-
-COLAB_NOTEBOOK_URL = os.environ.get(
-    "COLAB_NOTEBOOK_URL",
-    "https://colab.research.google.com/drive/1HPCV9DbL2QCaahkxALemIyN2fQwcEGHd",
-)
-BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "").strip().rstrip("/")
+SESSIONS_FILE = os.path.join(DOWNLOAD_ROOT, "sessions.json")
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
@@ -41,7 +36,7 @@ MAX_CONNECTION_PER_SERVER = os.environ.get("TORRENT_MAX_CONN_PER_SERVER", "16")
 SPLIT_COUNT = os.environ.get("TORRENT_SPLIT", "16")
 DHT_LISTEN_PORT = os.environ.get("TORRENT_DHT_PORT", "6881")
 
-HF_REPO_TYPES = {"dataset", "model", "space"}
+HF_REPO_TYPES = {"dataset"}
 HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _SIZE_UNITS = {
@@ -93,6 +88,75 @@ def _human_to_bytes(text: str) -> Optional[int]:
 
 def _ensure_download_root() -> None:
     dc.ensure_download_root()
+
+
+def _persist_sessions() -> None:
+    try:
+        _ensure_download_root()
+        with _sessions_lock:
+            snapshot = {}
+            for sid, sess in _sessions.items():
+                snapshot[sid] = {
+                    "session_id": sid,
+                    "magnet": sess.get("magnet"),
+                    "file_index": sess.get("file_index"),
+                    "file_name": sess.get("file_name"),
+                    "dir": sess.get("dir"),
+                    "status": sess.get("status"),
+                    "percent": sess.get("percent", 0),
+                    "current_human": sess.get("current_human", "0 B"),
+                    "total_human": sess.get("total_human", "0 B"),
+                    "speed_human": sess.get("speed_human", "0 B/s"),
+                    "eta_seconds": sess.get("eta_seconds"),
+                    "finished": sess.get("finished", False),
+                    "error": sess.get("error"),
+                    "created_at": sess.get("created_at"),
+                    "started_at": sess.get("started_at"),
+                    "expires_at": sess.get("expires_at"),
+                    "colab_files": sess.get("colab_files", []),
+                    "colab_token": sess.get("colab_token"),
+                    "colab_repo_id": sess.get("colab_repo_id"),
+                    "colab_repo_type": sess.get("colab_repo_type"),
+                    "colab_folder": sess.get("colab_folder"),
+                    "save_status": sess.get("save_status"),
+                    "save_error": sess.get("save_error"),
+                    "save_url": sess.get("save_url"),
+                }
+        tmp = SESSIONS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, SESSIONS_FILE)
+    except Exception as e:
+        logger.warning(f"persist_sessions failed: {e}")
+
+
+def _load_sessions() -> None:
+    if not os.path.exists(SESSIONS_FILE):
+        return
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        now = time.time()
+        with _sessions_lock:
+            for sid, data in snapshot.items():
+                exp = data.get("expires_at") or 0
+                if exp and exp < now:
+                    continue
+                data["proc"] = None
+                data["aborted"] = False
+                _sessions[sid] = data
+        logger.info(f"Loaded {len(_sessions)} session(s) from disk")
+    except Exception as e:
+        logger.warning(f"load_sessions failed: {e}")
+
+
+def _extend_session(sid: str, seconds: Optional[int] = None) -> None:
+    ttl = seconds if seconds is not None else SESSION_TTL_SECONDS
+    with _sessions_lock:
+        sess = _sessions.get(sid)
+        if not sess:
+            return
+        sess["expires_at"] = time.time() + ttl
 
 
 def _write_magnet_input_file(magnet: str, dir_path: str) -> str:
@@ -252,7 +316,8 @@ def _cleanup_stale_sessions() -> None:
     with _sessions_lock:
         stale = []
         for sid, sess in _sessions.items():
-            if now - sess["created_at"] > SESSION_TTL_SECONDS:
+            exp = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
+            if now - exp > 0:
                 stale.append(sid)
         for sid in stale:
             sess = _sessions.pop(sid, None)
@@ -268,6 +333,8 @@ def _cleanup_stale_sessions() -> None:
                 shutil.rmtree(sess.get("dir", ""), ignore_errors=True)
             except Exception:
                 pass
+    if stale:
+        _persist_sessions()
 
 
 def _session_dir(sid: str) -> str:
@@ -419,15 +486,7 @@ def _watch_process(sid: str) -> None:
                 s["status"] = "error"
                 s["error"] = f"{err_msg} Last: {last_line[:200]}"
                 shutil.rmtree(s.get("dir", ""), ignore_errors=True)
-
-
-def _get_backend_url(request: Request) -> str:
-    if BACKEND_PUBLIC_URL:
-        return BACKEND_PUBLIC_URL
-    try:
-        return str(request.base_url).rstrip("/")
-    except Exception:
-        return ""
+        _persist_sessions()
 
 
 async def _get_payload(
@@ -570,7 +629,6 @@ async def torrent_download(
     with _sessions_lock:
         _sessions[sid] = {
             "session_id": sid,
-            "mode": "server",
             "magnet": magnet_value,
             "file_index": file_index_value,
             "file_name": file_name_value,
@@ -585,7 +643,10 @@ async def torrent_download(
             "error": None,
             "created_at": time.time(),
             "started_at": time.time(),
+            "expires_at": time.time() + SESSION_TTL_SECONDS,
         }
+
+    _persist_sessions()
 
     try:
         proc = _start_download_process(magnet_value, file_index_value, sid)
@@ -594,6 +655,7 @@ async def torrent_download(
             sess = _sessions.pop(sid, None)
             if sess:
                 shutil.rmtree(sess.get("dir", ""), ignore_errors=True)
+        _persist_sessions()
         raise HTTPException(500, f"Failed to start aria2c: {e}")
 
     with _sessions_lock:
@@ -611,217 +673,6 @@ async def torrent_download(
     }
 
 
-@router.post("/colab-start")
-async def torrent_colab_start(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "JSON body required")
-
-    if not isinstance(body, dict):
-        raise HTTPException(400, "JSON object required")
-
-    magnet_value = str(body.get("magnet") or "").strip()
-    token_value = str(body.get("token") or "").strip()
-    repo_id_value = str(body.get("repo_id") or "").strip()
-    repo_type_value = str(body.get("repo_type") or "dataset").strip().lower()
-    folder_value = str(body.get("folder") or "").strip().strip("/")
-    files_value = body.get("files")
-
-    if not magnet_value:
-        raise HTTPException(400, "magnet is required")
-    if not MAGNET_RE.match(magnet_value):
-        raise HTTPException(400, "magnet link not valid")
-    if not token_value:
-        raise HTTPException(400, "token is required")
-    if not HF_REPO_ID_RE.match(repo_id_value):
-        raise HTTPException(400, "repo_id not valid")
-    if repo_type_value not in HF_REPO_TYPES:
-        raise HTTPException(400, "repo_type not valid")
-    if not isinstance(files_value, list) or not files_value:
-        raise HTTPException(400, "files must be a non-empty list")
-
-    normalized_files: List[Dict[str, Any]] = []
-    for item in files_value:
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item.get("index"))
-        except Exception:
-            continue
-        name = str(item.get("name") or "").strip()
-        if idx <= 0 or not name:
-            continue
-        normalized_files.append({"index": idx, "name": name})
-
-    if not normalized_files:
-        raise HTTPException(400, "no valid files provided")
-
-    _cleanup_stale_sessions()
-
-    sid = uuid.uuid4().hex[:16]
-
-    with _sessions_lock:
-        _sessions[sid] = {
-            "session_id": sid,
-            "mode": "colab",
-            "magnet": magnet_value,
-            "token": token_value,
-            "repo_id": repo_id_value,
-            "repo_type": repo_type_value,
-            "folder": folder_value,
-            "files": normalized_files,
-            "current_file_index": 0,
-            "current_file_name": normalized_files[0]["name"] if normalized_files else "",
-            "dir": "",
-            "status": "waiting_colab",
-            "percent": 0,
-            "current_human": "0 B",
-            "total_human": "0 B",
-            "speed_human": "0 B/s",
-            "eta_seconds": None,
-            "finished": False,
-            "error": None,
-            "save_status": None,
-            "save_error": None,
-            "save_url": None,
-            "created_at": time.time(),
-            "started_at": time.time(),
-            "phase": "waiting",
-        }
-
-    backend_url = _get_backend_url(request)
-    hash_params = f"session_id={sid}"
-    if backend_url:
-        hash_params += f"&backend={urllib.parse.quote(backend_url, safe='')}"
-    colab_url = f"{COLAB_NOTEBOOK_URL}#{hash_params}"
-
-    return {
-        "ok": True,
-        "session_id": sid,
-        "colab_url": colab_url,
-        "backend_url": backend_url,
-        "files_count": len(normalized_files),
-    }
-
-
-@router.get("/colab-config")
-async def torrent_colab_config(session_id: str = Query(...)):
-    with _sessions_lock:
-        sess = _sessions.get(session_id)
-
-    if not sess:
-        raise HTTPException(404, "session not found")
-
-    if sess.get("mode") != "colab":
-        raise HTTPException(400, "session is not a colab session")
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "magnet": sess.get("magnet"),
-        "token": sess.get("token"),
-        "repo_id": sess.get("repo_id"),
-        "repo_type": sess.get("repo_type"),
-        "folder": sess.get("folder"),
-        "files": sess.get("files", []),
-    }
-
-
-@router.post("/colab-update")
-async def torrent_colab_update(request: Request, session_id: str = Query(...)):
-    with _sessions_lock:
-        sess = _sessions.get(session_id)
-
-    if not sess:
-        raise HTTPException(404, "session not found")
-
-    if sess.get("mode") != "colab":
-        raise HTTPException(400, "session is not a colab session")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "JSON body required")
-
-    if not isinstance(body, dict):
-        raise HTTPException(400, "JSON object required")
-
-    with _sessions_lock:
-        s = _sessions.get(session_id)
-        if not s:
-            raise HTTPException(404, "session not found")
-
-        status_val = body.get("status")
-        if status_val in ("downloading", "uploading", "saved", "done", "error", "waiting_colab"):
-            s["status"] = status_val
-
-        if "percent" in body:
-            try:
-                s["percent"] = int(body["percent"])
-            except Exception:
-                pass
-
-        if "current_human" in body:
-            s["current_human"] = str(body["current_human"])
-        if "total_human" in body:
-            s["total_human"] = str(body["total_human"])
-        if "speed_human" in body:
-            s["speed_human"] = str(body["speed_human"])
-        if "eta_seconds" in body:
-            try:
-                s["eta_seconds"] = int(body["eta_seconds"]) if body["eta_seconds"] is not None else None
-            except Exception:
-                pass
-
-        if "file_name" in body and body["file_name"]:
-            s["current_file_name"] = str(body["file_name"])
-
-        if "current_file_index" in body:
-            try:
-                s["current_file_index"] = int(body["current_file_index"])
-            except Exception:
-                pass
-
-        if "total_files" in body:
-            try:
-                s["total_files"] = int(body["total_files"])
-            except Exception:
-                pass
-
-        if "completed_files" in body:
-            try:
-                s["completed_files"] = int(body["completed_files"])
-            except Exception:
-                pass
-
-        if "failed_files" in body:
-            try:
-                s["failed_files"] = int(body["failed_files"])
-            except Exception:
-                pass
-
-        if "phase" in body:
-            s["phase"] = str(body["phase"])
-
-        if "save_status" in body:
-            s["save_status"] = body["save_status"]
-        if "save_error" in body:
-            s["save_error"] = body["save_error"]
-        if "save_url" in body:
-            s["save_url"] = body["save_url"]
-
-        if body.get("finished") is True:
-            s["finished"] = True
-
-        if "error" in body and body["error"]:
-            s["error"] = str(body["error"])
-
-        s["updated_at"] = time.time()
-
-    return {"ok": True, "session_id": session_id}
-
-
 @router.get("/progress/{sid}")
 async def torrent_progress(sid: str):
     with _sessions_lock:
@@ -837,29 +688,30 @@ async def torrent_progress(sid: str):
 
     now = time.time()
     elapsed = int(now - sess.get("started_at", now))
+    expires_at = sess.get("expires_at")
+    if expires_at is None:
+        expires_at = sess.get("created_at", now) + SESSION_TTL_SECONDS
+    seconds_left = max(0, int(expires_at - now))
 
     return {
         "ok": True,
         "session_id": sid,
-        "mode": sess.get("mode", "server"),
         "status": sess.get("status", "downloading"),
-        "phase": sess.get("phase"),
         "percent": sess.get("percent", 0),
         "current_human": sess.get("current_human", "0 B"),
         "total_human": sess.get("total_human", "0 B"),
         "speed_human": sess.get("speed_human", "0 B/s"),
         "elapsed": elapsed,
         "eta_seconds": sess.get("eta_seconds"),
-        "file_name": sess.get("current_file_name", sess.get("file_name", "")),
-        "current_file_index": sess.get("current_file_index", 0),
-        "total_files": sess.get("total_files", len(sess.get("files", []))),
-        "completed_files": sess.get("completed_files", 0),
-        "failed_files": sess.get("failed_files", 0),
+        "file_name": sess.get("file_name", ""),
         "finished": bool(sess.get("finished")),
         "error": sess.get("error"),
         "save_status": sess.get("save_status"),
         "save_error": sess.get("save_error"),
         "save_url": sess.get("save_url"),
+        "expires_at": expires_at,
+        "seconds_left": seconds_left,
+        "ttl_seconds": SESSION_TTL_SECONDS,
     }
 
 
@@ -964,6 +816,7 @@ def _upload_to_hf_worker(
         if error:
             s["save_status"] = "error"
             s["save_error"] = error
+            _persist_sessions()
             return
         work_dir = s.get("dir", "")
 
@@ -975,6 +828,7 @@ def _upload_to_hf_worker(
             return
         s["save_status"] = "done"
         s["save_url"] = _hf_blob_url(repo_type, repo_id, path_in_repo)
+    _persist_sessions()
 
 
 async def _get_save_hf_payload(request: Request) -> Dict[str, Any]:
@@ -1036,6 +890,7 @@ async def torrent_save_hf(request: Request):
         s["save_status"] = "uploading"
         s["save_error"] = None
         s["save_url"] = None
+    _persist_sessions()
 
     t = threading.Thread(
         target=_upload_to_hf_worker,
@@ -1050,6 +905,181 @@ async def torrent_save_hf(request: Request):
         "file_name": filename,
         "path_in_repo": path_in_repo,
     }
+
+
+@router.post("/colab-start")
+async def torrent_colab_start(request: Request):
+    body = await request.json()
+    magnet = str(body.get("magnet") or "").strip()
+    token = str(body.get("token") or "").strip()
+    repo_id = str(body.get("repo_id") or "").strip()
+    repo_type = str(body.get("repo_type") or "dataset").strip().lower()
+    folder = _safe_folder(str(body.get("folder") or ""))
+    files = body.get("files") or []
+    existing_sid = str(body.get("session_id") or "").strip()
+
+    if not magnet or not MAGNET_RE.match(magnet):
+        raise HTTPException(400, "magnet is required")
+    if not token:
+        raise HTTPException(400, "token is required")
+    if not HF_REPO_ID_RE.match(repo_id):
+        raise HTTPException(400, "repo_id not valid")
+    if repo_type not in HF_REPO_TYPES:
+        raise HTTPException(400, "repo_type not valid")
+    if not files:
+        raise HTTPException(400, "files is required")
+
+    _cleanup_stale_sessions()
+
+    now = time.time()
+
+    if existing_sid:
+        with _sessions_lock:
+            sess = _sessions.get(existing_sid)
+            if sess:
+                merged = list(sess.get("colab_files") or [])
+                seen = {(int(f.get("index", 0)), str(f.get("name", ""))) for f in merged}
+                for f in files:
+                    key = (int(f.get("index", 0)), str(f.get("name", "")))
+                    if key not in seen:
+                        merged.append({
+                            "index": int(f.get("index", 0)),
+                            "name": str(f.get("name", "")),
+                            "size": int(f.get("size", 0)),
+                        })
+                        seen.add(key)
+                sess["colab_files"] = merged
+                sess["magnet"] = magnet
+                sess["colab_token"] = token
+                sess["colab_repo_id"] = repo_id
+                sess["colab_repo_type"] = repo_type
+                sess["colab_folder"] = folder
+                sess["expires_at"] = now + SESSION_TTL_SECONDS
+                sid = existing_sid
+                total_files = len(merged)
+        _persist_sessions()
+        return {
+            "ok": True,
+            "session_id": sid,
+            "files_count": total_files,
+            "appended": True,
+            "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
+        }
+
+    sid = uuid.uuid4().hex[:16]
+
+    with _sessions_lock:
+        _sessions[sid] = {
+            "session_id": sid,
+            "magnet": magnet,
+            "file_index": 0,
+            "file_name": "",
+            "dir": _session_dir(sid),
+            "status": "colab",
+            "percent": 0,
+            "current_human": "0 B",
+            "total_human": "0 B",
+            "speed_human": "0 B/s",
+            "eta_seconds": None,
+            "finished": False,
+            "error": None,
+            "created_at": now,
+            "started_at": now,
+            "expires_at": now + SESSION_TTL_SECONDS,
+            "colab_files": [
+                {
+                    "index": int(f.get("index", 0)),
+                    "name": str(f.get("name", "")),
+                    "size": int(f.get("size", 0)),
+                }
+                for f in files
+            ],
+            "colab_token": token,
+            "colab_repo_id": repo_id,
+            "colab_repo_type": repo_type,
+            "colab_folder": folder,
+        }
+
+    _persist_sessions()
+
+    return {
+        "ok": True,
+        "session_id": sid,
+        "files_count": len(files),
+        "appended": False,
+        "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
+    }
+
+
+@router.get("/colab-config")
+async def torrent_colab_config(session_id: str = Query(...)):
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if not sess:
+            raise HTTPException(410, "session not found or expired")
+        files = list(sess.get("colab_files") or [])
+        magnet = sess.get("magnet")
+        token = sess.get("colab_token")
+        repo_id = sess.get("colab_repo_id")
+        repo_type = sess.get("colab_repo_type") or "dataset"
+        folder = sess.get("colab_folder") or ""
+
+    if not files:
+        raise HTTPException(404, "no files in session")
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "magnet": magnet,
+        "files": files,
+        "token": token,
+        "repo_id": repo_id,
+        "repo_type": repo_type,
+        "folder": folder,
+    }
+
+
+@router.post("/colab-update")
+async def torrent_colab_update(request: Request, session_id: str = Query(...)):
+    body = await request.json()
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if not sess:
+            raise HTTPException(410, "session not found or expired")
+
+        for key in (
+            "status", "phase", "percent", "current_human", "total_human",
+            "speed_human", "eta_seconds", "file_name", "current_file_index",
+            "total_files", "completed_files", "failed_files", "finished",
+            "error", "save_status", "save_error", "save_url",
+        ):
+            if key in body:
+                sess[key] = body[key]
+
+        sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
+
+    _persist_sessions()
+
+    return {"ok": True}
+
+
+@router.get("/colab-session")
+async def torrent_colab_session(session_id: str = Query(...)):
+    now = time.time()
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if not sess:
+            raise HTTPException(410, "session not found or expired")
+        expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
+        seconds_left = max(0, int(expires_at - now))
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "expires_at": expires_at,
+            "seconds_left": seconds_left,
+            "ttl_seconds": SESSION_TTL_SECONDS,
+            "status": sess.get("status"),
+        }
 
 
 @router.delete("/session/{sid}")
@@ -1067,6 +1097,7 @@ async def torrent_session_delete(sid: str):
             pass
 
     shutil.rmtree(sess.get("dir", ""), ignore_errors=True)
+    _persist_sessions()
     return {"ok": True, "session_id": sid}
 
 
@@ -1101,3 +1132,6 @@ async def torrent_disk():
         "used_human": _human_size(stats["used_bytes"]),
         "free_human": _human_size(stats["free_bytes"]),
     }
+
+
+_load_sessions()
