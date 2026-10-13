@@ -105,6 +105,9 @@ def _persist_sessions() -> None:
                     "save_status": sess.get("save_status"),
                     "save_error": sess.get("save_error"),
                     "save_url": sess.get("save_url"),
+                    "total_size_bytes": sess.get("total_size_bytes", 0),
+                    "total_speed_bps": sess.get("total_speed_bps", 0),
+                    "total_elapsed_seconds": sess.get("total_elapsed_seconds", 0),
                 }
         tmp = SESSIONS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -402,6 +405,9 @@ async def torrent_progress(sid: str):
         "expires_at": expires_at,
         "seconds_left": seconds_left,
         "ttl_seconds": SESSION_TTL_SECONDS,
+        "total_size_bytes": sess.get("total_size_bytes", 0),
+        "total_speed_bps": sess.get("total_speed_bps", 0),
+        "total_elapsed_seconds": sess.get("total_elapsed_seconds", 0),
     }
 
 
@@ -469,6 +475,9 @@ async def torrent_colab_start(request: Request):
                 sess["save_status"] = None
                 sess["save_error"] = None
                 sess["save_url"] = None
+                sess["total_size_bytes"] = 0
+                sess["total_speed_bps"] = 0
+                sess["total_elapsed_seconds"] = 0
                 sid = existing_sid
                 total_files = len(merged)
         _persist_sessions()
@@ -516,6 +525,9 @@ async def torrent_colab_start(request: Request):
             "colab_repo_id": repo_id,
             "colab_repo_type": repo_type,
             "colab_folder": folder,
+            "total_size_bytes": 0,
+            "total_speed_bps": 0,
+            "total_elapsed_seconds": 0,
         }
 
     _persist_sessions()
@@ -570,6 +582,7 @@ async def torrent_colab_update(request: Request, session_id: str = Query(...)):
             "speed_human", "eta_seconds", "file_name", "current_file_index",
             "total_files", "completed_files", "failed_files", "finished",
             "error", "save_status", "save_error", "save_url",
+            "total_size_bytes", "total_speed_bps", "total_elapsed_seconds",
         ):
             if key in body:
                 sess[key] = body[key]
