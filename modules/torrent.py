@@ -103,11 +103,16 @@ def _persist_sessions() -> None:
                     "file_name": sess.get("file_name"),
                     "dir": sess.get("dir"),
                     "status": sess.get("status"),
+                    "phase": sess.get("phase"),
                     "percent": sess.get("percent", 0),
                     "current_human": sess.get("current_human", "0 B"),
                     "total_human": sess.get("total_human", "0 B"),
                     "speed_human": sess.get("speed_human", "0 B/s"),
                     "eta_seconds": sess.get("eta_seconds"),
+                    "current_file_index": sess.get("current_file_index", 0),
+                    "total_files": sess.get("total_files", 0),
+                    "completed_files": sess.get("completed_files", 0),
+                    "failed_files": sess.get("failed_files", 0),
                     "finished": sess.get("finished", False),
                     "error": sess.get("error"),
                     "created_at": sess.get("created_at"),
@@ -634,11 +639,16 @@ async def torrent_download(
             "file_name": file_name_value,
             "dir": _session_dir(sid),
             "status": "starting",
+            "phase": "download",
             "percent": 0,
             "current_human": "0 B",
             "total_human": "0 B",
             "speed_human": "0 B/s",
             "eta_seconds": None,
+            "current_file_index": 0,
+            "total_files": 0,
+            "completed_files": 0,
+            "failed_files": 0,
             "finished": False,
             "error": None,
             "created_at": time.time(),
@@ -697,6 +707,7 @@ async def torrent_progress(sid: str):
         "ok": True,
         "session_id": sid,
         "status": sess.get("status", "downloading"),
+        "phase": sess.get("phase"),
         "percent": sess.get("percent", 0),
         "current_human": sess.get("current_human", "0 B"),
         "total_human": sess.get("total_human", "0 B"),
@@ -704,6 +715,10 @@ async def torrent_progress(sid: str):
         "elapsed": elapsed,
         "eta_seconds": sess.get("eta_seconds"),
         "file_name": sess.get("file_name", ""),
+        "current_file_index": sess.get("current_file_index", 0),
+        "total_files": sess.get("total_files", 0),
+        "completed_files": sess.get("completed_files", 0),
+        "failed_files": sess.get("failed_files", 0),
         "finished": bool(sess.get("finished")),
         "error": sess.get("error"),
         "save_status": sess.get("save_status"),
@@ -955,6 +970,22 @@ async def torrent_colab_start(request: Request):
                 sess["colab_repo_type"] = repo_type
                 sess["colab_folder"] = folder
                 sess["expires_at"] = now + SESSION_TTL_SECONDS
+                sess["status"] = "colab"
+                sess["phase"] = "download"
+                sess["percent"] = 0
+                sess["current_human"] = "0 B"
+                sess["total_human"] = "0 B"
+                sess["speed_human"] = "0 B/s"
+                sess["eta_seconds"] = None
+                sess["current_file_index"] = 0
+                sess["total_files"] = 0
+                sess["completed_files"] = 0
+                sess["failed_files"] = 0
+                sess["finished"] = False
+                sess["error"] = None
+                sess["save_status"] = None
+                sess["save_error"] = None
+                sess["save_url"] = None
                 sid = existing_sid
                 total_files = len(merged)
         _persist_sessions()
@@ -976,11 +1007,16 @@ async def torrent_colab_start(request: Request):
             "file_name": "",
             "dir": _session_dir(sid),
             "status": "colab",
+            "phase": "download",
             "percent": 0,
             "current_human": "0 B",
             "total_human": "0 B",
             "speed_human": "0 B/s",
             "eta_seconds": None,
+            "current_file_index": 0,
+            "total_files": 0,
+            "completed_files": 0,
+            "failed_files": 0,
             "finished": False,
             "error": None,
             "created_at": now,
