@@ -12,3 +12,5 @@ aiohttp
 httpx
 huggingface_hub
 cryptography
+mutagen
+Pillow
