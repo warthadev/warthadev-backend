@@ -41,7 +41,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["ytdl", "telegram", "token_api", "proxy", "hf", "torrent", "universal"]
+    modules_to_load = ["ytdl", "telegram", "token_api", "proxy", "hf", "torrent", "universal", "extractaudio"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:
@@ -183,7 +183,7 @@ def health_check():
 
 
 @app.get("/config")
-def get_config():
+def get_frontend_config_endpoint():
     return get_frontend_config()
 
 
