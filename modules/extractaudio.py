@@ -1,13 +1,13 @@
 # modules/extractaudio.py
 import os
-import io
 import re
 import time
 import shutil
 import logging
 import subprocess
 import tempfile
-from typing import Optional, Dict, Any
+from typing import Optional
+from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, validator
@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/audio", tags=["audio"])
 
 DOWNLOAD_TIMEOUT = 300
-CONVERT_TIMEOUT = 180
+CONVERT_TIMEOUT = 300
 MAX_AUDIO_BYTES = 200 * 1024 * 1024
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+STREAM_EXTS = (".m3u8", ".mpd")
+PROTOCOL_WHITELIST = "file,http,https,tcp,tls,crypto,data"
 
 
 class ConvertRequest(BaseModel):
@@ -82,7 +85,16 @@ def _check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-async def _download_audio(url: str, output_path: str) -> bool:
+def _is_stream_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or "").lower()
+        return path.endswith(STREAM_EXTS)
+    except Exception:
+        return False
+
+
+async def _download_direct(url: str, output_path: str) -> bool:
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=30.0, read=DOWNLOAD_TIMEOUT, write=30.0, pool=30.0),
@@ -108,7 +120,7 @@ async def _download_audio(url: str, output_path: str) -> bool:
                     async for chunk in resp.aiter_bytes(chunk_size=256 * 1024):
                         total_written += len(chunk)
                         if total_written > MAX_AUDIO_BYTES:
-                            logger.error(f"Audio exceeded limit during download: {total_written}")
+                            logger.error(f"Audio exceeded limit: {total_written}")
                             return False
                         f.write(chunk)
 
@@ -155,14 +167,49 @@ def _process_cover(input_path: str, output_path: str, size: int) -> bool:
         return False
 
 
-def _convert_to_mp3(raw_file: str, mp3_path: str, bitrate: str) -> bool:
+def _probe_duration(file_path: str) -> Optional[float]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            value = result.stdout.strip()
+            if value:
+                return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def _convert_to_mp3(input_source: str, mp3_path: str, bitrate: str, is_stream: bool = False) -> bool:
     if not _check_ffmpeg():
         logger.error("ffmpeg not available")
         return False
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", raw_file,
+    ]
+
+    if is_stream:
+        cmd.extend([
+            "-protocol_whitelist", PROTOCOL_WHITELIST,
+            "-user_agent", USER_AGENT,
+            "-headers", f"User-Agent: {USER_AGENT}\r\n",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ])
+
+    cmd.extend([
+        "-i", input_source,
         "-vn",
         "-c:a", "libmp3lame",
         "-b:a", bitrate,
@@ -171,12 +218,13 @@ def _convert_to_mp3(raw_file: str, mp3_path: str, bitrate: str) -> bool:
         "-id3v2_version", "3",
         "-write_id3v1", "1",
         mp3_path,
-    ]
+    ])
 
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=CONVERT_TIMEOUT)
         if result.returncode != 0:
-            logger.error(f"ffmpeg convert failed: {result.stderr[:300]}")
+            err = result.stderr.decode("utf-8", errors="ignore")[:500] if isinstance(result.stderr, bytes) else str(result.stderr)[:500]
+            logger.error(f"ffmpeg convert failed: {err}")
             return False
         return os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0
     except subprocess.TimeoutExpired:
@@ -248,16 +296,29 @@ async def convert_audio(req: ConvertRequest):
     cover_in = os.path.join(tmp_dir, "cover_in.jpg")
     cover_out = os.path.join(tmp_dir, "cover_out.jpg")
 
+    is_stream = _is_stream_url(req.audio_url)
+    input_source = req.audio_url
+
     try:
-        logger.info(f"audio/convert start: {req.audio_url[:80]}")
+        logger.info(f"audio/convert start: {req.audio_url[:80]} stream={is_stream}")
 
-        ok = await _download_audio(req.audio_url, raw_path)
-        if not ok:
-            raise HTTPException(502, "Failed to download audio source")
+        if not is_stream:
+            ok = await _download_direct(req.audio_url, raw_path)
+            if not ok:
+                raise HTTPException(502, "Failed to download audio source")
 
-        logger.info(f"audio downloaded: {os.path.getsize(raw_path)} bytes")
+            size = os.path.getsize(raw_path)
+            logger.info(f"audio downloaded: {size} bytes")
 
-        converted = _convert_to_mp3(raw_path, mp3_path, req.bitrate)
+            if size < 4096:
+                logger.error(f"audio file too small: {size} bytes")
+                raise HTTPException(502, "Audio source too small or invalid")
+
+            input_source = raw_path
+        else:
+            logger.info("HLS/DASH stream detected, using ffmpeg direct fetch")
+
+        converted = _convert_to_mp3(input_source, mp3_path, req.bitrate, is_stream=is_stream)
         if not converted:
             raise HTTPException(500, "Failed to convert audio to MP3")
 
@@ -291,7 +352,6 @@ async def convert_audio(req: ConvertRequest):
             mp3_path,
             media_type="audio/mpeg",
             filename=filename,
-            background=None,
         )
     except HTTPException:
         try:
