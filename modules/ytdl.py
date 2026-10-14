@@ -44,6 +44,15 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
+BOT_BLOCK_MARKERS = [
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "bot check",
+    "429",
+    "too many requests",
+]
+
 
 class VideoRequest(BaseModel):
     url: str
@@ -72,6 +81,11 @@ class MuxRequest(BaseModel):
         if not v or not v.strip():
             return "video_download"
         return v.strip()
+
+
+def _is_bot_block(error_msg: str) -> bool:
+    lower = error_msg.lower()
+    return any(marker in lower for marker in BOT_BLOCK_MARKERS)
 
 
 class CobaltAPI:
@@ -302,48 +316,93 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+YOUTUBE_CLIENT_ROTATIONS = [
+    None,
+    ["android", "web_safari"],
+    ["ios", "mweb"],
+    ["tv_embedded", "web_embedded"],
+    ["web_safari", "web"],
+    ["mweb", "web"],
+    ["android"],
+    ["ios"],
+    ["tv"],
+    ["web"],
+]
+
+
 def extract_youtube_info(url: str, proxy: Optional[str] = None, cookies_file: Optional[str] = None) -> Dict[str, Any]:
     target_url = _normalize_url(url)
+    last_error: Optional[str] = None
 
-    try:
-        logger.info(f"YouTube extraction: {target_url}")
-        opts = get_ydl_opts(proxy=proxy, cookies_file=cookies_file)
+    for client_index, client in enumerate(YOUTUBE_CLIENT_ROTATIONS):
+        try:
+            logger.info(f"YouTube extraction attempt {client_index + 1} client={client}: {target_url}")
+            opts = get_ydl_opts(proxy=proxy, cookies_file=cookies_file)
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(target_url, download=False)
+            if client:
+                opts["extractor_args"] = {
+                    "youtube": {
+                        "player_client": client,
+                        "skip": ["hls", "dash"],
+                    },
+                    "generic": ["impersonate"],
+                }
 
-        if not info:
-            return {"success": False, "message": "Could not extract info"}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target_url, download=False)
 
-        if "entries" in info and isinstance(info["entries"], list):
-            if not info["entries"]:
-                return {"success": False, "message": "No entries found"}
-            info = info["entries"][0]
+            if not info:
+                last_error = "Could not extract info"
+                continue
 
-        selected = _select_best_formats(info)
-        if not selected.get("success"):
-            return selected
+            if "entries" in info and isinstance(info["entries"], list):
+                if not info["entries"]:
+                    last_error = "No entries found"
+                    continue
+                info = info["entries"][0]
 
-        return {
-            "success": True,
-            "title": info.get("title", "Video"),
-            "uploader": info.get("uploader") or info.get("channel"),
-            "duration": info.get("duration_string") or f"{info.get('duration', 0)}s",
-            "thumbnail": info.get("thumbnail"),
-            "platform": info.get("extractor_key", "youtube"),
-            "mp4_formats": selected["mp4_formats"],
-            "mp3_formats": selected["mp3_formats"],
-        }
+            selected = _select_best_formats(info)
+            if not selected.get("success"):
+                last_error = selected.get("message") or "No formats"
+                continue
 
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"yt-dlp error: {error_msg}")
-        if "private" in error_msg.lower():
-            return {"success": False, "message": "Video bersifat private"}
-        return {"success": False, "message": error_msg[:150]}
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return {"success": False, "message": str(e)[:150]}
+            return {
+                "success": True,
+                "title": info.get("title", "Video"),
+                "uploader": info.get("uploader") or info.get("channel"),
+                "duration": info.get("duration_string") or f"{info.get('duration', 0)}s",
+                "thumbnail": info.get("thumbnail"),
+                "platform": info.get("extractor_key", "youtube"),
+                "mp4_formats": selected["mp4_formats"],
+                "mp3_formats": selected["mp3_formats"],
+            }
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e)
+            last_error = error_msg
+            logger.warning(f"YouTube attempt {client_index + 1} failed: {error_msg[:200]}")
+
+            if _is_bot_block(error_msg):
+                continue
+
+            if "private" in error_msg.lower():
+                return {"success": False, "message": "Video bersifat private"}
+            continue
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"YouTube attempt {client_index + 1} unexpected error: {last_error[:200]}")
+            continue
+
+    if last_error:
+        logger.error(f"YouTube extraction exhausted all clients: {last_error[:200]}")
+        if _is_bot_block(last_error):
+            return {
+                "success": False,
+                "message": "YOUTUBE_BOT_BLOCK",
+                "detail": "YouTube memblokir IP server. Gunakan tombol Run in Colab untuk download via Colab.",
+            }
+        return {"success": False, "message": last_error[:150]}
+
+    return {"success": False, "message": "Extraction failed"}
 
 
 async def extract_video_logic(url: str) -> Dict[str, Any]:
@@ -384,7 +443,49 @@ async def extract_video_logic(url: str) -> Dict[str, Any]:
 
     if is_youtube:
         logger.info(f"Using yt-dlp for: {target_url}")
-        return extract_youtube_info(target_url)
+        result = extract_youtube_info(target_url)
+
+        if result.get("success"):
+            return result
+
+        if result.get("message") == "YOUTUBE_BOT_BLOCK":
+            logger.info(f"YouTube blocked, trying Cobalt fallback for: {target_url}")
+            cobalt_result = await cobalt.fetch(target_url, audio_only=False)
+
+            if cobalt_result.get("success") and cobalt_result.get("url"):
+                formatted = cobalt.format_response(cobalt_result, "YouTube Video")
+                if formatted:
+                    formatted["platform"] = "youtube-cobalt"
+                    formatted["colab_only"] = True
+                    return formatted
+
+            cobalt_audio = await cobalt.fetch(target_url, audio_only=True)
+            if cobalt_audio.get("success") and cobalt_audio.get("url"):
+                return {
+                    "success": True,
+                    "title": "YouTube Audio",
+                    "platform": "youtube-cobalt",
+                    "colab_only": True,
+                    "mp4_formats": [],
+                    "mp3_formats": [{
+                        "quality": "HQ",
+                        "audio_url": cobalt_audio.get("url"),
+                        "bitrate": None,
+                    }],
+                    "best_muxed": {
+                        "video_url": cobalt_audio.get("url"),
+                        "resolution": "audio",
+                        "ext": "mp3"
+                    }
+                }
+
+            return {
+                "success": False,
+                "message": "YOUTUBE_BOT_BLOCK",
+                "detail": "YouTube memblokir IP server. Gunakan tombol Run in Colab untuk download via Colab.",
+            }
+
+        return result
 
     logger.info(f"Fallback to yt-dlp for: {target_url}")
     return extract_youtube_info(target_url)
@@ -649,7 +750,10 @@ async def handle_ytdl(request: VideoRequest):
         dc.log_disk_stats("[extract] ")
         result = await extract_video_logic(request.url)
         if not result.get("success"):
-            return JSONResponse(status_code=400, content=result)
+            status_code = 400
+            if result.get("message") == "YOUTUBE_BOT_BLOCK":
+                status_code = 400
+            return JSONResponse(status_code=status_code, content=result)
         return result
     except Exception as e:
         logger.error(f"Endpoint error: {e}")
