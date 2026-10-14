@@ -237,6 +237,49 @@ def _normalize_url(url: str) -> str:
     return target_url
 
 
+def _format_bitrate_label(value: Optional[float]) -> str:
+    if not value:
+        return ""
+    try:
+        bitrate = float(value)
+    except Exception:
+        return ""
+    if bitrate <= 0:
+        return ""
+    if bitrate >= 1000:
+        return f"{bitrate / 1000:.1f} Mbps"
+    return f"{int(round(bitrate))} kbps"
+
+
+def _format_size_label(value: Optional[int]) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        size = int(value)
+    except Exception:
+        return None
+    if size <= 0:
+        return None
+    return size
+
+
+def _codec_short_label(codec: Optional[str]) -> str:
+    if not codec:
+        return "unknown"
+    lower = codec.lower()
+    if "opus" in lower:
+        return "opus"
+    if "mp4a" in lower or "aac" in lower:
+        return "aac"
+    if "mp3" in lower:
+        return "mp3"
+    if "vorbis" in lower:
+        return "vorbis"
+    if "flac" in lower:
+        return "flac"
+    return codec.split(".")[0] if "." in codec else codec
+
+
 def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
     raw_formats = info.get("formats", []) or []
     if not raw_formats:
@@ -300,18 +343,52 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             "needs_mux": not has_audio,
             "height": h,
             "width": w,
-            "filesize": size,
+            "filesize": _format_size_label(size),
         })
 
     mp4_formats = mp4_formats[:10]
 
+    seen_audio_signatures = set()
     mp3_formats = []
-    for idx, f in enumerate(audio_only[:3], 1):
-        quality = "HQ" if idx == 1 else f"Quality {idx}"
+    sorted_audio = sorted(
+        audio_only,
+        key=lambda x: (x.get("abr") or x.get("tbr") or 0),
+        reverse=True,
+    )
+
+    for f in sorted_audio:
+        url = f.get("url")
+        if not url:
+            continue
+
+        abr = f.get("abr") or f.get("tbr") or 0
+        acodec = f.get("acodec") or ""
+        ext = f.get("ext") or ""
+
+        signature = f"{acodec}|{ext}|{int(abr) if abr else 0}"
+        if signature in seen_audio_signatures:
+            continue
+        seen_audio_signatures.add(signature)
+
+        codec_label = _codec_short_label(acodec)
+        bitrate_label = _format_bitrate_label(abr)
+        bitrate_value = int(round(abr)) if abr else None
+
+        if bitrate_label:
+            display_quality = f"{codec_label.upper()} {bitrate_label}"
+        else:
+            display_quality = codec_label.upper()
+
+        size = f.get("filesize") or f.get("filesize_approx")
+
         mp3_formats.append({
-            "quality": quality,
-            "audio_url": f.get("url"),
-            "bitrate": f.get("abr") or f.get("tbr"),
+            "quality": display_quality,
+            "audio_url": url,
+            "bitrate": bitrate_value,
+            "codec": codec_label,
+            "ext": ext,
+            "format_id": f.get("format_id"),
+            "filesize": _format_size_label(size),
         })
 
     return {
@@ -477,6 +554,10 @@ async def extract_video_logic(url: str) -> Dict[str, Any]:
                         "quality": "HQ",
                         "audio_url": cobalt_audio.get("url"),
                         "bitrate": None,
+                        "codec": "mp3",
+                        "ext": "mp3",
+                        "format_id": None,
+                        "filesize": None,
                     }],
                     "best_muxed": {
                         "video_url": cobalt_audio.get("url"),
