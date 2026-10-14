@@ -49,8 +49,18 @@ BOT_BLOCK_MARKERS = [
     "confirm you're not a bot",
     "confirm you’re not a bot",
     "bot check",
+]
+
+RATE_LIMIT_MARKERS = [
     "429",
     "too many requests",
+]
+
+YOUTUBE_CLIENT_ROTATIONS = [
+    ["android", "web_safari"],
+    ["ios", "mweb"],
+    ["tv_embedded"],
+    ["web"],
 ]
 
 
@@ -86,6 +96,11 @@ class MuxRequest(BaseModel):
 def _is_bot_block(error_msg: str) -> bool:
     lower = error_msg.lower()
     return any(marker in lower for marker in BOT_BLOCK_MARKERS)
+
+
+def _is_rate_limit(error_msg: str) -> bool:
+    lower = error_msg.lower()
+    return any(marker in lower for marker in RATE_LIMIT_MARKERS)
 
 
 class CobaltAPI:
@@ -187,26 +202,16 @@ cobalt = CobaltAPI()
 
 def get_ydl_opts(proxy: Optional[str] = None, cookies_file: Optional[str] = None) -> Dict[str, Any]:
     opts = {
-        "quiet": False,
-        "no_warnings": False,
+        "quiet": True,
+        "no_warnings": True,
         "skip_download": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "socket_timeout": 30,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 5,
-        "sleep_interval": 3,
-        "max_sleep_interval": 8,
-        "sleep_interval_requests": 1,
+        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 1,
         "format": "bv*+ba/b",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "web", "mweb", "android"],
-                "skip": ["hls", "dash"],
-            },
-            "generic": ["impersonate"],
-        },
         "http_headers": {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -316,37 +321,22 @@ def _select_best_formats(info: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-YOUTUBE_CLIENT_ROTATIONS = [
-    None,
-    ["android", "web_safari"],
-    ["ios", "mweb"],
-    ["tv_embedded", "web_embedded"],
-    ["web_safari", "web"],
-    ["mweb", "web"],
-    ["android"],
-    ["ios"],
-    ["tv"],
-    ["web"],
-]
-
-
 def extract_youtube_info(url: str, proxy: Optional[str] = None, cookies_file: Optional[str] = None) -> Dict[str, Any]:
     target_url = _normalize_url(url)
     last_error: Optional[str] = None
+    bot_blocked = False
+    rate_limited = False
 
     for client_index, client in enumerate(YOUTUBE_CLIENT_ROTATIONS):
         try:
-            logger.info(f"YouTube extraction attempt {client_index + 1} client={client}: {target_url}")
+            logger.info(f"YouTube attempt {client_index + 1} client={client}: {target_url}")
             opts = get_ydl_opts(proxy=proxy, cookies_file=cookies_file)
-
-            if client:
-                opts["extractor_args"] = {
-                    "youtube": {
-                        "player_client": client,
-                        "skip": ["hls", "dash"],
-                    },
-                    "generic": ["impersonate"],
-                }
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": client,
+                    "skip": ["hls", "dash"],
+                },
+            }
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(target_url, download=False)
@@ -382,7 +372,12 @@ def extract_youtube_info(url: str, proxy: Optional[str] = None, cookies_file: Op
             logger.warning(f"YouTube attempt {client_index + 1} failed: {error_msg[:200]}")
 
             if _is_bot_block(error_msg):
-                continue
+                bot_blocked = True
+
+            if _is_rate_limit(error_msg):
+                rate_limited = True
+                logger.info(f"YouTube rate limited (429), breaking rotation early")
+                break
 
             if "private" in error_msg.lower():
                 return {"success": False, "message": "Video bersifat private"}
@@ -392,14 +387,16 @@ def extract_youtube_info(url: str, proxy: Optional[str] = None, cookies_file: Op
             logger.warning(f"YouTube attempt {client_index + 1} unexpected error: {last_error[:200]}")
             continue
 
+    if bot_blocked or rate_limited:
+        logger.info(f"YouTube blocked (bot={bot_blocked}, rate={rate_limited}), signalling frontend to use Colab")
+        return {
+            "success": False,
+            "message": "YOUTUBE_BOT_BLOCK",
+            "detail": "YouTube memblokir IP server. Gunakan tombol Run in Colab untuk download via Colab.",
+        }
+
     if last_error:
         logger.error(f"YouTube extraction exhausted all clients: {last_error[:200]}")
-        if _is_bot_block(last_error):
-            return {
-                "success": False,
-                "message": "YOUTUBE_BOT_BLOCK",
-                "detail": "YouTube memblokir IP server. Gunakan tombol Run in Colab untuk download via Colab.",
-            }
         return {"success": False, "message": last_error[:150]}
 
     return {"success": False, "message": "Extraction failed"}
@@ -450,7 +447,11 @@ async def extract_video_logic(url: str) -> Dict[str, Any]:
 
         if result.get("message") == "YOUTUBE_BOT_BLOCK":
             logger.info(f"YouTube blocked, trying Cobalt fallback for: {target_url}")
-            cobalt_result = await cobalt.fetch(target_url, audio_only=False)
+            try:
+                cobalt_result = await cobalt.fetch(target_url, audio_only=False)
+            except Exception as e:
+                logger.warning(f"Cobalt video fetch failed: {e}")
+                cobalt_result = {"success": False}
 
             if cobalt_result.get("success") and cobalt_result.get("url"):
                 formatted = cobalt.format_response(cobalt_result, "YouTube Video")
@@ -459,7 +460,12 @@ async def extract_video_logic(url: str) -> Dict[str, Any]:
                     formatted["colab_only"] = True
                     return formatted
 
-            cobalt_audio = await cobalt.fetch(target_url, audio_only=True)
+            try:
+                cobalt_audio = await cobalt.fetch(target_url, audio_only=True)
+            except Exception as e:
+                logger.warning(f"Cobalt audio fetch failed: {e}")
+                cobalt_audio = {"success": False}
+
             if cobalt_audio.get("success") and cobalt_audio.get("url"):
                 return {
                     "success": True,
@@ -750,10 +756,7 @@ async def handle_ytdl(request: VideoRequest):
         dc.log_disk_stats("[extract] ")
         result = await extract_video_logic(request.url)
         if not result.get("success"):
-            status_code = 400
-            if result.get("message") == "YOUTUBE_BOT_BLOCK":
-                status_code = 400
-            return JSONResponse(status_code=status_code, content=result)
+            return JSONResponse(status_code=400, content=result)
         return result
     except Exception as e:
         logger.error(f"Endpoint error: {e}")
