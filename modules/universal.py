@@ -139,6 +139,11 @@ def _persist_sessions() -> None:
                     "colab_repo_id": sess.get("colab_repo_id"),
                     "colab_repo_type": sess.get("colab_repo_type"),
                     "colab_folder": sess.get("colab_folder"),
+                    "files": sess.get("files") or [],
+                    "probe": sess.get("probe", False),
+                    "probe_done": sess.get("probe_done", False),
+                    "probe_result": sess.get("probe_result"),
+                    "probe_error": sess.get("probe_error"),
                     "save_status": sess.get("save_status"),
                     "save_error": sess.get("save_error"),
                     "save_url": sess.get("save_url"),
@@ -192,6 +197,169 @@ def _cleanup_stale_sessions() -> None:
         _persist_sessions()
 
 
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _normalize_files(raw: Any, default_audio_only: bool) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for f in raw or []:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or "")
+        if name in seen:
+            continue
+        seen.add(name)
+        fid = f.get("format_id")
+        out.append({
+            "id": uuid.uuid4().hex[:8],
+            "index": _to_int(f.get("index")),
+            "name": name,
+            "size": _to_int(f.get("size")),
+            "format_id": str(fid).strip() if fid else None,
+            "audio_only": bool(f.get("audio_only", default_audio_only)),
+        })
+    return out
+
+
+def _res_label(w: int, h: int) -> str:
+    shorter = min(w, h) if w > 0 and h > 0 else h
+    if shorter >= 2160:
+        return "4K"
+    if shorter >= 1440:
+        return "2K"
+    if shorter >= 1080:
+        return "1080p FHD"
+    if shorter >= 720:
+        return "720p HD"
+    if shorter >= 480:
+        return "480p"
+    if shorter >= 360:
+        return "360p"
+    return f"{shorter}p"
+
+
+def _codec_label(acodec: Optional[str]) -> str:
+    a = (acodec or "").lower()
+    if a.startswith("mp4a") or a == "aac":
+        return "aac"
+    if a.startswith("opus"):
+        return "opus"
+    if a.startswith("vorbis"):
+        return "vorbis"
+    if a.startswith("mp3"):
+        return "mp3"
+    return a.split(".")[0][:8] or "audio"
+
+
+def _build_probe_response(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn the trimmed yt-dlp info sent by Colab into the ExtractResponse shape
+    the frontend already renders (DlUniversal). Every video entry carries the
+    yt-dlp format selector Colab must use to download exactly that quality."""
+    raw = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+
+    def has_audio(f: Dict[str, Any]) -> bool:
+        return f.get("acodec") not in (None, "none", "unknown")
+
+    def no_video(f: Dict[str, Any]) -> bool:
+        return f.get("vcodec") in (None, "none")
+
+    audio_only = [f for f in raw if has_audio(f) and no_video(f)]
+    videos = [f for f in raw if f.get("height") and not no_video(f) and f.get("format_id")]
+
+    best_by_label: Dict[str, Any] = {}
+    for f in videos:
+        h = _to_int(f.get("height"))
+        w = _to_int(f.get("width"))
+        if h <= 0:
+            continue
+        label = _res_label(w, h)
+        rank = (1 if f.get("ext") == "mp4" else 0, float(f.get("tbr") or 0))
+        cur = best_by_label.get(label)
+        if cur is None or rank > cur[0]:
+            best_by_label[label] = (rank, f, h, w)
+
+    entries = sorted(best_by_label.items(), key=lambda kv: kv[1][2], reverse=True)[:12]
+    mp4_formats: List[Dict[str, Any]] = []
+    for label, (_rank, f, h, w) in entries:
+        fid = str(f["format_id"])
+        muxed = not has_audio(f)
+        if muxed:
+            selector = (
+                f"{fid}+bestaudio[ext=m4a]/{fid}+bestaudio"
+                if f.get("ext") == "mp4" else f"{fid}+bestaudio"
+            )
+        else:
+            selector = fid
+        item: Dict[str, Any] = {
+            "resolution": label,
+            "video_url": "",
+            "audio_url": None,
+            "needs_mux": muxed,
+            "height": h,
+            "width": w,
+            "format_id": selector,
+            "ext": "mp4",
+        }
+        size = f.get("filesize") or f.get("filesize_approx")
+        if size:
+            item["filesize"] = int(size)
+        mp4_formats.append(item)
+
+    mp3_formats: List[Dict[str, Any]] = [{
+        "quality": "Best (auto)",
+        "audio_url": "",
+        "format_id": "bestaudio",
+        "ext": "mp3",
+    }]
+    seen_sig = set()
+    for f in sorted(audio_only, key=lambda x: (x.get("abr") or x.get("tbr") or 0), reverse=True):
+        if not f.get("format_id"):
+            continue
+        abr = f.get("abr") or f.get("tbr") or 0
+        codec = _codec_label(f.get("acodec"))
+        ext = f.get("ext") or ""
+        sig = f"{codec}|{ext}|{int(abr)}"
+        if sig in seen_sig:
+            continue
+        seen_sig.add(sig)
+        item = {
+            "quality": f"{codec.upper()} {int(round(abr))}k" if abr else codec.upper(),
+            "audio_url": "",
+            "format_id": str(f["format_id"]),
+            "codec": codec,
+            "ext": ext,
+        }
+        if abr:
+            item["bitrate"] = int(round(abr))
+        size = f.get("filesize") or f.get("filesize_approx")
+        if size:
+            item["filesize"] = int(size)
+        mp3_formats.append(item)
+        if len(mp3_formats) >= 9:
+            break
+
+    duration = info.get("duration_string")
+    if not duration and info.get("duration"):
+        duration = f"{int(info['duration'])}s"
+
+    return {
+        "success": True,
+        "platform": info.get("extractor_key") or "YouTube",
+        "title": info.get("title") or "Video",
+        "uploader": info.get("uploader") or info.get("channel"),
+        "duration": duration,
+        "thumbnail": info.get("thumbnail"),
+        "view_count": info.get("view_count"),
+        "mp4_formats": mp4_formats,
+        "mp3_formats": mp3_formats,
+    }
+
+
 @router.post("/start")
 async def universal_start(request: Request):
     body = await request.json()
@@ -204,7 +372,9 @@ async def universal_start(request: Request):
     repo_id = str(body.get("repo_id") or "").strip()
     repo_type = str(body.get("repo_type") or "dataset").strip().lower()
     folder = _safe_folder(str(body.get("folder") or ""))
-    files = body.get("files") or []
+    probe = bool(body.get("probe", False))
+    existing_sid = str(body.get("session_id") or "").strip()
+    files = _normalize_files(body.get("files"), audio_only)
 
     if not url or not URL_RE.match(url):
         raise HTTPException(400, "url is required")
@@ -214,14 +384,60 @@ async def universal_start(request: Request):
         raise HTTPException(400, "repo_id not valid")
     if repo_type not in HF_REPO_TYPES:
         raise HTTPException(400, "repo_type not valid")
-    if not files:
+    if not probe and not files:
         raise HTTPException(400, "files is required")
 
     _cleanup_stale_sessions()
 
     now = time.time()
-    sid = uuid.uuid4().hex[:16]
     url_type = _detect_url_type(url)
+
+    # Append to an existing session (same url) instead of creating a new one.
+    if existing_sid:
+        appended = False
+        total_files = 0
+        with _sessions_lock:
+            sess = _sessions.get(existing_sid)
+            if sess and sess.get("url") == url:
+                known = {f.get("name") for f in (sess.get("files") or [])}
+                merged = list(sess.get("files") or []) + [f for f in files if f["name"] not in known]
+                sess["files"] = merged
+                sess["colab_token"] = token
+                sess["colab_repo_id"] = repo_id
+                sess["colab_repo_type"] = repo_type
+                sess["colab_folder"] = folder
+                sess["expires_at"] = now + SESSION_TTL_SECONDS
+                sess["status"] = "colab"
+                sess["phase"] = "download"
+                sess["percent"] = 0
+                sess["current_human"] = "0 B"
+                sess["total_human"] = "0 B"
+                sess["speed_human"] = "0 B/s"
+                sess["eta_seconds"] = None
+                sess["current_file_index"] = 0
+                sess["total_files"] = 0
+                sess["completed_files"] = 0
+                sess["failed_files"] = 0
+                sess["finished"] = False
+                sess["error"] = None
+                sess["save_status"] = None
+                sess["save_error"] = None
+                sess["save_url"] = None
+                total_files = len(merged)
+                appended = True
+        if appended:
+            _persist_sessions()
+            return {
+                "ok": True,
+                "session_id": existing_sid,
+                "files_count": total_files,
+                "url_type": url_type,
+                "appended": True,
+                "probe": False,
+                "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
+            }
+
+    sid = uuid.uuid4().hex[:16]
 
     with _sessions_lock:
         _sessions[sid] = {
@@ -232,6 +448,11 @@ async def universal_start(request: Request):
             "format_id": format_id,
             "quality": quality,
             "custom_filename": custom_filename,
+            "files": files,
+            "probe": probe,
+            "probe_done": False,
+            "probe_result": None,
+            "probe_error": None,
             "dir": _session_dir(sid),
             "status": "colab",
             "phase": "download",
@@ -266,6 +487,7 @@ async def universal_start(request: Request):
         "files_count": len(files),
         "url_type": url_type,
         "appended": False,
+        "probe": probe,
         "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
     }
 
@@ -276,34 +498,26 @@ async def universal_colab_config(session_id: str = Query(...)):
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
-        url = sess.get("url")
-        url_type = sess.get("url_type") or "direct"
-        audio_only = bool(sess.get("audio_only", False))
-        format_id = sess.get("format_id")
-        quality = sess.get("quality")
-        custom_filename = sess.get("custom_filename")
-        token = sess.get("colab_token")
-        repo_id = sess.get("colab_repo_id")
-        repo_type = sess.get("colab_repo_type") or "dataset"
-        folder = sess.get("colab_folder") or ""
+        data = {
+            "ok": True,
+            "session_id": session_id,
+            "url": sess.get("url"),
+            "url_type": sess.get("url_type") or "direct",
+            "audio_only": bool(sess.get("audio_only", False)),
+            "format_id": sess.get("format_id"),
+            "quality": sess.get("quality"),
+            "custom_filename": sess.get("custom_filename"),
+            "files": list(sess.get("files") or []),
+            "probe": bool(sess.get("probe")) and not sess.get("probe_done"),
+            "token": sess.get("colab_token"),
+            "repo_id": sess.get("colab_repo_id"),
+            "repo_type": sess.get("colab_repo_type") or "dataset",
+            "folder": sess.get("colab_folder") or "",
+        }
 
-    if not url:
+    if not data["url"]:
         raise HTTPException(404, "no url in session")
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "url": url,
-        "url_type": url_type,
-        "audio_only": audio_only,
-        "format_id": format_id,
-        "quality": quality,
-        "custom_filename": custom_filename,
-        "token": token,
-        "repo_id": repo_id,
-        "repo_type": repo_type,
-        "folder": folder,
-    }
+    return data
 
 
 @router.post("/colab-update")
@@ -324,11 +538,41 @@ async def universal_colab_update(request: Request, session_id: str = Query(...))
             if key in body:
                 sess[key] = body[key]
 
+        probe_info = body.get("probe_info")
+        if isinstance(probe_info, dict):
+            try:
+                sess["probe_result"] = _build_probe_response(probe_info)
+                sess["probe_done"] = True
+                sess["probe_error"] = None
+            except Exception as e:
+                sess["probe_error"] = f"probe parse failed: {str(e)[:200]}"
+        elif body.get("probe_error"):
+            sess["probe_error"] = str(body["probe_error"])[:300]
+
+        done_id = str(body.get("file_id") or "")
+        if done_id and body.get("save_status") == "done":
+            sess["files"] = [f for f in (sess.get("files") or []) if f.get("id") != done_id]
+
         sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
 
     _persist_sessions()
 
     return {"ok": True}
+
+
+@router.get("/probe-result")
+async def universal_probe_result(session_id: str = Query(...)):
+    with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if not sess:
+            raise HTTPException(410, "session not found or expired")
+        result = sess.get("probe_result")
+        err = sess.get("probe_error")
+    if result:
+        return {"ok": True, "status": "ready", "data": result}
+    if err:
+        return {"ok": True, "status": "error", "error": err}
+    return {"ok": True, "status": "waiting"}
 
 
 @router.get("/colab-session")
@@ -347,7 +591,7 @@ async def universal_colab_session(session_id: str = Query(...)):
             "seconds_left": seconds_left,
             "ttl_seconds": SESSION_TTL_SECONDS,
             "status": sess.get("status"),
-            "files_count": 1,
+            "files_count": len(sess.get("files") or []) or 1,
         }
 
 
