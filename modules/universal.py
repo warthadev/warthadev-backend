@@ -86,8 +86,6 @@ async def universal_colab_start(request: Request):
         raise HTTPException(400, "repo_id format 'owner/name' required")
     if repo_type not in {"dataset", "model", "space"}:
         raise HTTPException(400, "repo_type not valid")
-    if not formats:
-        raise HTTPException(400, "formats required")
 
     _cleanup_stale_sessions()
     now = time.time()
@@ -102,8 +100,8 @@ async def universal_colab_start(request: Request):
             "colab_repo_id": repo_id,
             "colab_repo_type": repo_type,
             "colab_folder": folder,
-            "status": "waiting", # Status awal
-            "phase": "download",
+            "status": "waiting", 
+            "phase": "resolve",
             "percent": 0,
             "current_human": "0 B",
             "total_human": "0 B",
@@ -141,9 +139,9 @@ async def universal_colab_config(session_id: str = Query(...)):
             "folder": sess.get("colab_folder") or "",
         }
 
+
 @router.get("/colab-check")
 async def universal_colab_check(session_id: str = Query(...)):
-    # Endpoint ini dipanggil sama Colab buat nanya "Udah dipilih belum?"
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
@@ -152,6 +150,7 @@ async def universal_colab_check(session_id: str = Query(...)):
             "ok": True,
             "status": sess.get("status"),
         }
+
 
 @router.post("/colab-update")
 async def universal_colab_update(request: Request, session_id: str = Query(...)):
