@@ -68,57 +68,6 @@ def _safe_folder(folder: str) -> str:
     return "/".join(parts)
 
 
-@router.post("/extract")
-async def universal_extract(request: Request):
-    body = await request.json()
-    url = str(body.get("url") or "").strip()
-    if not url:
-        raise HTTPException(400, "url is required")
-
-    try:
-        from yt_dlp import YoutubeDL
-    except ImportError:
-        raise HTTPException(500, "yt-dlp is not installed on backend")
-
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}
-    
-    try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise HTTPException(400, f"Failed to extract: {str(e)[:100]}")
-
-    if not info:
-        raise HTTPException(400, "No info found")
-
-    title = info.get("title") or info.get("id") or "download"
-    formats = []
-    idx = 1
-
-    for f in info.get("formats", []):
-        height = f.get("height")
-        vcodec = (f.get("vcodec") or "none").lower()
-        acodec = (f.get("acodec") or "none").lower()
-        if vcodec == "none" and acodec == "none":
-            continue
-
-        if height and vcodec != "none":
-            name = f"{title} [{height}p] ({f.get('ext', 'mp4')})"
-            size = f.get("filesize") or f.get("filesize_approx") or 0
-            formats.append({"index": idx, "name": name, "size": size, "format_id": f.get("format_id")})
-            idx += 1
-        elif acodec != "none" and vcodec == "none":
-            name = f"{title} [Audio] ({f.get('ext', 'm4a')})"
-            size = f.get("filesize") or f.get("filesize_approx") or 0
-            formats.append({"index": idx, "name": name, "size": size, "format_id": f.get("format_id")})
-            idx += 1
-
-    if not formats:
-        formats.append({"index": 1, "name": f"{title} [Best Auto]", "size": 0, "format_id": "best"})
-
-    return {"ok": True, "formats": formats}
-
-
 @router.post("/colab-start")
 async def universal_colab_start(request: Request):
     body = await request.json()
@@ -127,6 +76,7 @@ async def universal_colab_start(request: Request):
     repo_id = str(body.get("repo_id") or "").strip()
     repo_type = str(body.get("repo_type") or "dataset").strip().lower()
     folder = _safe_folder(str(body.get("folder") or ""))
+    action = str(body.get("action") or "resolve").strip().lower()
     formats = body.get("formats") or []
 
     if not url:
@@ -137,8 +87,9 @@ async def universal_colab_start(request: Request):
         raise HTTPException(400, "repo_id format 'owner/name' required")
     if repo_type not in {"dataset", "model", "space"}:
         raise HTTPException(400, "repo_type not valid")
-    if not formats:
-        raise HTTPException(400, "formats required")
+    
+    if action == "download" and not formats:
+        raise HTTPException(400, "formats required for download action")
 
     _cleanup_stale_sessions()
     now = time.time()
@@ -148,13 +99,14 @@ async def universal_colab_start(request: Request):
         _sessions[sid] = {
             "session_id": sid,
             "url": url,
+            "action": action,
             "formats": formats,
             "colab_token": token,
             "colab_repo_id": repo_id,
             "colab_repo_type": repo_type,
             "colab_folder": folder,
             "status": "colab",
-            "phase": "download",
+            "phase": "resolve" if action == "resolve" else "download",
             "percent": 0,
             "current_human": "0 B",
             "total_human": "0 B",
@@ -185,6 +137,7 @@ async def universal_colab_config(session_id: str = Query(...)):
             "ok": True,
             "session_id": session_id,
             "url": sess.get("url"),
+            "action": sess.get("action"),
             "formats": sess.get("formats"),
             "token": sess.get("colab_token"),
             "repo_id": sess.get("colab_repo_id"),
@@ -203,7 +156,7 @@ async def universal_colab_update(request: Request, session_id: str = Query(...))
         for key in (
             "status", "phase", "percent", "current_human", "total_human",
             "speed_human", "eta_seconds", "file_name", "finished",
-            "error", "save_status", "save_error", "save_url"
+            "error", "save_status", "save_error", "save_url", "formats"
         ):
             if key in body:
                 sess[key] = body[key]
@@ -239,6 +192,7 @@ async def universal_colab_session(session_id: str = Query(...)):
             "save_status": sess.get("save_status"),
             "save_error": sess.get("save_error"),
             "save_url": sess.get("save_url"),
+            "formats": sess.get("formats"),
         }
 
 
