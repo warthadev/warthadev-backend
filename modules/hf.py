@@ -175,7 +175,7 @@ class HFCrossCopyRequest(BaseModel):
     dst_repo_type: str
     dst_path_prefix: str = ""
     src_base_path: str = ""
-    src_token: str
+    src_token: str = ""
     dst_token: str
     delete_source: bool = True
 
@@ -212,10 +212,16 @@ class HFCrossCopyRequest(BaseModel):
             return ""
         return v.strip().strip("/")
 
-    @validator("src_token", "dst_token")
-    def validate_tokens(cls, v: str) -> str:
+    @validator("src_token", pre=True, always=True)
+    def normalize_src_token(cls, v):
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    @validator("dst_token")
+    def validate_dst_token(cls, v: str) -> str:
         if not v or not v.strip():
-            raise ValueError("token must not be empty")
+            raise ValueError("dst_token must not be empty")
         return v.strip()
 
 
@@ -284,7 +290,7 @@ def _get_hf_api(token: str):
             500,
             "huggingface_hub is not installed on the server. Please contact the administrator."
         )
-    return HfApi(token=token)
+    return HfApi(token=token or None)
 
 
 def _map_repo_type(repo_type: str) -> str:
@@ -1132,7 +1138,6 @@ async def cross_copy(request: HFCrossCopyRequest):
     copied_paths = [t["dst_path"] for t in target_map]
 
     if not request.delete_source:
-        # Plain copy: leave the source untouched, nothing to verify or delete.
         _invalidate_folder_cache(request.dst_repo_id, request.dst_repo_type, request.dst_token)
         return {
             "ok": True,
@@ -1326,8 +1331,6 @@ async def squash_history(request: HFSquashHistoryRequest):
         raise HTTPException(400, "repo_id must be in format 'owner/name'")
 
     try:
-        # super_squash_history is blocking and can take a while on big repos,
-        # so run it in a worker thread to keep the event loop free.
         await asyncio.to_thread(
             api.super_squash_history,
             repo_id=repo_id,
