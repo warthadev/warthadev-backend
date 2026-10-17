@@ -41,7 +41,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["ytdl", "telegram", "token_api", "proxy", "hf", "torrent", "universal"]
+    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:
@@ -71,7 +71,7 @@ async def lifespan(app_instance: FastAPI):
 
 app = FastAPI(
     title="Wartha Sensei API",
-    description="Backend for WarthaCV - Video Downloader, Telegram Integration, Token API",
+    description="Backend for WarthaCV - Torrent Downloader, Telegram Integration, Token API",
     version="1.0.0",
     lifespan=lifespan
 )
