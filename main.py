@@ -41,7 +41,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent"]
+    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent", "universal"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:
