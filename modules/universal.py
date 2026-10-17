@@ -1,10 +1,11 @@
+# backend/modules/universal.py
 import os
 import time
 import uuid
 import json
 import threading
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any
 from fastapi import APIRouter, HTTPException, Request, Query
 
 logger = logging.getLogger(__name__)
@@ -17,13 +18,42 @@ SESSIONS_FILE = os.environ.get("UNIVERSAL_SESSIONS_FILE", "/tmp/wartha-universal
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
+VALID_MODES = {"auto", "video", "audio", "hls", "dash", "direct"}
+
 
 def _persist_sessions() -> None:
     try:
         with _sessions_lock:
             snapshot = {}
             for sid, sess in _sessions.items():
-                snapshot[sid] = sess
+                snapshot[sid] = {
+                    "session_id": sid,
+                    "url": sess.get("url"),
+                    "mode": sess.get("mode"),
+                    "audio_quality": sess.get("audio_quality"),
+                    "video_quality": sess.get("video_quality"),
+                    "colab_token": sess.get("colab_token"),
+                    "colab_repo_id": sess.get("colab_repo_id"),
+                    "colab_repo_type": sess.get("colab_repo_type"),
+                    "colab_folder": sess.get("colab_folder"),
+                    "colab_url": sess.get("colab_url"),
+                    "status": sess.get("status"),
+                    "phase": sess.get("phase"),
+                    "percent": sess.get("percent", 0),
+                    "current_human": sess.get("current_human", "0 B"),
+                    "total_human": sess.get("total_human", "0 B"),
+                    "speed_human": sess.get("speed_human", "0 B/s"),
+                    "eta_seconds": sess.get("eta_seconds"),
+                    "file_name": sess.get("file_name"),
+                    "finished": sess.get("finished", False),
+                    "error": sess.get("error"),
+                    "save_status": sess.get("save_status"),
+                    "save_error": sess.get("save_error"),
+                    "save_url": sess.get("save_url"),
+                    "created_at": sess.get("created_at"),
+                    "started_at": sess.get("started_at"),
+                    "expires_at": sess.get("expires_at"),
+                }
         tmp = SESSIONS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
@@ -45,6 +75,7 @@ def _load_sessions() -> None:
                 if exp and exp < now:
                     continue
                 _sessions[sid] = data
+        logger.info(f"universal loaded {len(_sessions)} session(s) from disk")
     except Exception as e:
         logger.warning(f"universal load_sessions failed: {e}")
 
@@ -70,29 +101,6 @@ def _safe_folder(folder: str) -> str:
     return "/".join(parts)
 
 
-@router.post("/extract")
-async def universal_extract(request: Request):
-    body = await request.json()
-    url = str(body.get("url") or "").strip()
-    
-    if not url:
-        raise HTTPException(400, "url is required")
-
-    # Placeholder response to simulate format extraction.
-    # We will return a mock format list so the frontend logic can be tested.
-    # In a real scenario, the frontend calls Colab to resolve formats via a temporary session.
-    
-    return {
-        "ok": True,
-        "url": url,
-        "formats": [
-            {"index": 1, "name": "Video 1080p (mp4)", "size": 0, "format_id": "bestvideo[height<=1080]+bestaudio/best"},
-            {"index": 2, "name": "Video 720p (mp4)", "size": 0, "format_id": "bestvideo[height<=720]+bestaudio/best"},
-            {"index": 3, "name": "Audio (mp3)", "size": 0, "format_id": "bestaudio/best"},
-        ],
-        "detail": "Format list extracted"
-    }
-
 @router.post("/colab-start")
 async def universal_colab_start(request: Request):
     body = await request.json()
@@ -101,7 +109,9 @@ async def universal_colab_start(request: Request):
     repo_id = str(body.get("repo_id") or "").strip()
     repo_type = str(body.get("repo_type") or "dataset").strip().lower()
     folder = _safe_folder(str(body.get("folder") or ""))
-    formats = body.get("formats") or []
+    mode = str(body.get("mode") or "auto").strip().lower()
+    audio_quality = str(body.get("audio_quality") or "best").strip().lower()
+    video_quality = str(body.get("video_quality") or "best").strip().lower()
 
     if not url:
         raise HTTPException(400, "url is required")
@@ -113,8 +123,8 @@ async def universal_colab_start(request: Request):
         raise HTTPException(400, "repo_id must be format 'owner/name'")
     if repo_type not in {"dataset", "model", "space"}:
         raise HTTPException(400, "repo_type not valid")
-    if not formats:
-        raise HTTPException(400, "formats is required")
+    if mode not in VALID_MODES:
+        raise HTTPException(400, "mode not valid")
 
     _cleanup_stale_sessions()
     now = time.time()
@@ -124,11 +134,14 @@ async def universal_colab_start(request: Request):
         _sessions[sid] = {
             "session_id": sid,
             "url": url,
-            "formats": formats,
+            "mode": mode,
+            "audio_quality": audio_quality,
+            "video_quality": video_quality,
             "colab_token": token,
             "colab_repo_id": repo_id,
             "colab_repo_type": repo_type,
             "colab_folder": folder,
+            "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
             "status": "colab",
             "phase": "resolve",
             "percent": 0,
@@ -152,7 +165,7 @@ async def universal_colab_start(request: Request):
     return {
         "ok": True,
         "session_id": sid,
-        "files_count": len(formats)
+        "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
     }
 
 
@@ -166,7 +179,9 @@ async def universal_colab_config(session_id: str = Query(...)):
             "ok": True,
             "session_id": session_id,
             "url": sess.get("url"),
-            "formats": sess.get("formats"),
+            "mode": sess.get("mode"),
+            "audio_quality": sess.get("audio_quality"),
+            "video_quality": sess.get("video_quality"),
             "token": sess.get("colab_token"),
             "repo_id": sess.get("colab_repo_id"),
             "repo_type": sess.get("colab_repo_type") or "dataset",
@@ -226,6 +241,7 @@ async def universal_colab_session(session_id: str = Query(...)):
             "save_url": sess.get("save_url"),
         }
 
+
 @router.delete("/session/{sid}")
 async def universal_session_delete(sid: str):
     with _sessions_lock:
@@ -234,6 +250,7 @@ async def universal_session_delete(sid: str):
         raise HTTPException(404, "session not found")
     _persist_sessions()
     return {"ok": True, "session_id": sid}
+
 
 @router.get("/health")
 async def universal_health():
@@ -244,5 +261,6 @@ async def universal_health():
         "sessions": count,
         "ttl_seconds": SESSION_TTL_SECONDS,
     }
+
 
 _load_sessions()
