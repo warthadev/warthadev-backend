@@ -1,4 +1,4 @@
-# Wartha Sensei Backend API
+## Wartha Sensei Backend API
 
 Backend infrastructure for the Wartha Sensei platform, a comprehensive all in one web application providing cloud management, universal media downloading, and AI tools. Engineered with FastAPI and deployed via Docker on Hugging Face Spaces.
 
