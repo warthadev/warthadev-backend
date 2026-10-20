@@ -1,3 +1,4 @@
+# requirements.txt
 fastapi
 uvicorn[standard]
 pydantic
@@ -14,3 +15,4 @@ huggingface_hub
 cryptography
 mutagen
 Pillow
+beautifulsoup4
