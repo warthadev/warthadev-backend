@@ -13,6 +13,8 @@ from typing import Dict, Any
 from urllib.parse import urlparse, unquote
 from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, Query
+import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ RESOLVE_TIMEOUT = int(os.environ.get("UNIVERSAL_RESOLVE_TIMEOUT", "40"))
 RESOLVE_CACHE_TTL = int(os.environ.get("UNIVERSAL_RESOLVE_CACHE_TTL", "600"))
 MP3_LABEL = "320k"
 BEST_FORMAT = "bestvideo*+bestaudio/bestvideo*/best"
-DIRECT_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".ts", ".mp3", ".m4a", ".zip", ".rar", ".7z", ".pdf")
+DIRECT_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".ts", ".mp3", ".m4a", ".zip", ".rar", ".7z", ".pdf", ".apk", ".exe", ".iso")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 SKIP_SERVER_HOSTS = tuple(
@@ -139,7 +141,43 @@ def _build_formats(info: Dict[str, Any]):
     return out
 
 
+def _resolve_mediafire(url: str) -> Dict[str, Any]:
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, 'html.parser')
+        
+        btn = soup.find('a', {'id': 'downloadButton'})
+        name_elem = soup.find('div', {'class': 'dl-btn-label'})
+        
+        if not btn:
+            return {"ok": False, "reason": "Tombol download MediaFire tidak ditemukan (URL salah/private)."}
+            
+        direct_url = btn.get('href')
+        temp_name = name_elem.text.strip() if name_elem else "download"
+        
+        return {
+            "ok": True, 
+            "source": "server", 
+            "title": temp_name, 
+            "thumbnail": None,
+            "uploader": "MediaFire", 
+            "duration": None,
+            "formats": [{"index": 1, "name": temp_name, "size": 0, "format_id": "direct", "url": direct_url}]
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"MediaFire Error: {_clean_err(e)[:150]}"}
+
+
 def _resolve_sync(url: str) -> Dict[str, Any]:
+    host = (urlparse(url).hostname or "").lower()
+    
+    if "mediafire.com" in host:
+        res = _resolve_mediafire(url)
+        if res.get("ok"):
+            return res
+        return res
+
     path = urlparse(url).path
     if path.lower().endswith(DIRECT_EXTS):
         fname = unquote(os.path.basename(path)) or "download"
