@@ -1,3 +1,4 @@
+# modules/universal.py
 import os
 import time
 import re
@@ -27,18 +28,13 @@ SID_RE = re.compile(r"^[0-9a-f]{16}$")
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Resolve di server (metadata saja, TIDAK ada byte media yang lewat server ini)
-# ---------------------------------------------------------------------------
 RESOLVE_TIMEOUT = int(os.environ.get("UNIVERSAL_RESOLVE_TIMEOUT", "40"))
 RESOLVE_CACHE_TTL = int(os.environ.get("UNIVERSAL_RESOLVE_CACHE_TTL", "600"))
-MP3_LABEL = "MP3 320k"  # samakan dengan MP3_BITRATE di cell Colab
+MP3_LABEL = "320k"
 BEST_FORMAT = "bestvideo*+bestaudio/bestvideo*/best"
 DIRECT_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".ts", ".mp3", ".m4a", ".zip", ".rar", ".7z", ".pdf")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# Host yang langsung diserahkan ke Colab (IP datacenter diblokir YouTube). Kosongkan env ini kalau
-# server sudah pakai cookies/proxy dan mau coba resolve YouTube di server juga.
 SKIP_SERVER_HOSTS = tuple(
     h.strip().lower()
     for h in os.environ.get("UNIVERSAL_SERVER_SKIP_HOSTS", "youtube.com,youtu.be,youtube-nocookie.com").split(",")
@@ -47,7 +43,7 @@ SKIP_SERVER_HOSTS = tuple(
 
 _resolve_cache: TTLCache = TTLCache(maxsize=64, ttl=RESOLVE_CACHE_TTL)
 _resolve_cache_lock = threading.Lock()
-_resolve_lock = threading.Lock()  # satu extract sekaligus, jaga RAM free tier
+_resolve_lock = threading.Lock()
 
 
 def _clean_err(text: str) -> str:
@@ -55,7 +51,6 @@ def _clean_err(text: str) -> str:
 
 
 def _is_public_url(url: str) -> bool:
-    """Tolak localhost / IP privat supaya endpoint ini tidak bisa dipakai scan jaringan internal."""
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https") or not p.hostname:
@@ -96,9 +91,6 @@ def _pick_thumbnail(info: Dict[str, Any]):
 
 
 def _build_formats(info: Dict[str, Any]):
-    """Daftar kualitas otomatis dari apa yang benar-benar ada di link.
-    format_id berbasis tinggi (height<=N) supaya tetap valid saat Colab extract ulang
-    dengan client yang berbeda."""
     title = info.get("title") or "download"
     duration = info.get("duration") or 0
     flist = info.get("formats") or []
@@ -262,7 +254,7 @@ async def universal_resolve(request: Request):
         with _resolve_cache_lock:
             _resolve_cache[url] = result
         return result
-    result["fallback"] = True  # web akan lanjut ke jalur Colab
+    result["fallback"] = True
     return result
 
 
@@ -278,7 +270,6 @@ async def universal_colab_start(request: Request):
     if not isinstance(formats, list):
         formats = []
     formats = [f for f in formats if isinstance(f, dict)][:50]
-    # preselected = web sudah memilih kualitas (hasil resolve server), Colab langsung download
     preselected = bool(body.get("preselected")) and len(formats) > 0
 
     if not url:
@@ -296,8 +287,6 @@ async def universal_colab_start(request: Request):
     now = time.time()
     reused = False
 
-    # ID tetap: pakai ID dari client kalau formatnya valid (16 hex). Kalau sesinya sudah hilang
-    # (Render restart / expired), sesi dibuat ulang dengan ID yang SAMA.
     if existing_sid and SID_RE.match(existing_sid):
         sid = existing_sid
     else:
@@ -312,7 +301,6 @@ async def universal_colab_start(request: Request):
         "colab_repo_id": repo_id,
         "colab_repo_type": repo_type,
         "colab_folder": folder,
-        # "newurl" = sinyal untuk Colab yang sedang standby: ambil URL baru lalu resolve ulang
         "status": "waiting",
         "phase": "resolve",
         "percent": 0,
