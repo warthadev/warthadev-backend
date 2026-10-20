@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-21-gdown"
+WORKER_VERSION = "2026-10-21-gdown-folder"
 
 def run_colab_worker():
     print(f"[universal] worker version: {WORKER_VERSION}")
@@ -790,7 +790,12 @@ def run_colab_worker():
 
     def _upload_one_file(local_path, hf_token, repo_id, repo_type, folder, idx, total_files):
         fname = os.path.basename(local_path)
-        try: size = os.path.getsize(local_path)
+        is_dir = os.path.isdir(local_path)
+        try:
+            if is_dir:
+                size = sum(os.path.getsize(os.path.join(r_, f_)) for r_, _d, fs_ in os.walk(local_path) for f_ in fs_)
+            else:
+                size = os.path.getsize(local_path)
         except Exception: size = 0
 
         _set_state(phase="uploading", current_file=fname, current_index=idx, percent=0,
@@ -822,8 +827,12 @@ def run_colab_worker():
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
             path_in_repo = f"{folder}/{fname}" if folder else fname
-            api.upload_file(path_or_fileobj=local_path, path_in_repo=path_in_repo, repo_id=repo_id,
-                            repo_type=repo_type, commit_message=f"Add {fname}")
+            if is_dir:
+                api.upload_folder(folder_path=local_path, path_in_repo=path_in_repo, repo_id=repo_id,
+                                  repo_type=repo_type, commit_message=f"Add {fname}")
+            else:
+                api.upload_file(path_or_fileobj=local_path, path_in_repo=path_in_repo, repo_id=repo_id,
+                                repo_type=repo_type, commit_message=f"Add {fname}")
             stop["stop"] = True
             prefix = {"dataset": "datasets/", "space": "spaces/", "model": "models/"}.get(repo_type, "")
             save_url = f"https://huggingface.co/{prefix}{repo_id}/blob/main/{path_in_repo}"
@@ -946,19 +955,20 @@ def run_colab_worker():
                         
                         if not downloaded:
                             dest, err = None, "Folder Google Drive kosong atau gagal diunduh"
-                        else:
-                            if len(downloaded) == 1:
-                                dest = os.path.join(out_dir, base)
-                                os.rename(downloaded[0], dest)
+                        elif "/folders/" in direct_url:
+                            # pertahankan struktur folder (tanpa zip); upload sebagai folder
+                            entries = os.listdir(dest_dir)
+                            if len(entries) == 1 and os.path.isdir(os.path.join(dest_dir, entries[0])):
+                                dest = os.path.join(dest_dir, entries[0])
                             else:
-                                dest = os.path.join(out_dir, base + ".zip")
-                                shutil.make_archive(os.path.join(out_dir, base), 'zip', dest_dir)
-                                shutil.rmtree(dest_dir, ignore_errors=True)
-                            
+                                dest = dest_dir
+                        else:
+                            dest = os.path.join(out_dir, base)
+                            os.rename(downloaded[0], dest)
                             ok, msg = _check_file(dest)
                             if not ok:
                                 dest, err = None, msg
-                                
+
                 elif direct_url: 
                     dest, err = _download_aria2(direct_url, base, base, out_dir)
                 else: 
