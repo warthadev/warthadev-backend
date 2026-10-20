@@ -41,7 +41,7 @@ def run_colab_worker():
 
         # Paksa install gdown versi stabil buat nangani folder
         _run_quiet([sys.executable, "-m", "pip", "uninstall", "-y", "gdown"])
-        _run_quiet([sys.executable, "-m", "pip", "install", "-q", "gdown==4.7.1"])
+        _run_quiet([sys.executable, "-m", "pip", "install", "-q", "gdown==4.6.0"])
 
         need_pip = [pkg for mod, pkg in _PIP_PKGS.items() if importlib.util.find_spec(mod) is None]
         if need_pip:
@@ -925,9 +925,9 @@ def run_colab_worker():
                     dest = os.path.join(out_dir, base)
                     
                     if "folders/" in direct_url:
-                        r = subprocess.run(["gdown", "--folder", "--fuzzy", direct_url, "-O", dest], capture_output=True, text=True)
+                        r = subprocess.run(["gdown", "--folder", direct_url, "-O", dest], capture_output=True, text=True)
                     else:
-                        r = subprocess.run(["gdown", "--fuzzy", direct_url, "-O", dest], capture_output=True, text=True)
+                        r = subprocess.run(["gdown", direct_url, "-O", dest], capture_output=True, text=True)
                         
                     if r.returncode != 0: 
                         dest, err = None, f"gdown error: {r.stderr[:200]}"
