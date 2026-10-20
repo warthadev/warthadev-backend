@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-21-universal+torrent"
+WORKER_VERSION = "2026-10-21-universal+torrent-sorted"
 
 def run_colab_worker():
     print(f"[universal] worker version: {WORKER_VERSION}")
@@ -1331,6 +1331,10 @@ def run_colab_worker():
         if not (hf_token and repo_id):
             _set_state(phase="error", message="", error="Config torrent tidak berisi token / repo Hugging Face.")
             return
+
+        def _nat(f):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(f.get("name", "")))]
+        files = sorted(files, key=_nat)  # urut nama (natural), bukan urutan internal torrent
 
         total = len(files)
         completed = failed = 0
