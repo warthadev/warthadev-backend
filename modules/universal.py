@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/universal", tags=["universal"])
 
+_PROC_STARTED = time.time()
+
 SESSION_TTL_SECONDS = int(os.environ.get("UNIVERSAL_SESSION_TTL", str(6 * 60 * 60)))
 SESSIONS_FILE = os.environ.get("UNIVERSAL_SESSIONS_FILE", "/tmp/wartha-universal-sessions.json")
 
@@ -337,6 +339,7 @@ async def universal_colab_start(request: Request):
             _sessions[sid] = {"session_id": sid, "created_at": now, "started_at": now, **fresh}
 
     _persist_sessions()
+    logger.info(f"universal colab-start sid={sid} reused={reused} pid={os.getpid()} sessions={len(_sessions)}")
     return {"ok": True, "session_id": sid, "reused": reused}
 
 
@@ -400,6 +403,7 @@ async def universal_colab_session(session_id: str = Query(...)):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
+            logger.warning(f"universal colab-session MISS sid={session_id} pid={os.getpid()} known={len(_sessions)}")
             raise HTTPException(410, "session not found or expired")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         return {
@@ -434,6 +438,8 @@ async def universal_health():
         "status": "healthy",
         "sessions": count,
         "ttl_seconds": SESSION_TTL_SECONDS,
+        "pid": os.getpid(),
+        "uptime_seconds": int(time.time() - _PROC_STARTED),
     }
 
 _load_sessions()
