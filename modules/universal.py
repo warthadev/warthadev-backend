@@ -15,7 +15,6 @@ from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, Query
 import requests
 from bs4 import BeautifulSoup
-from mega import Mega
 import gdown
 
 logger = logging.getLogger(__name__)
@@ -173,14 +172,12 @@ def _resolve_mediafire(url: str) -> Dict[str, Any]:
 
 def _resolve_mega(url: str) -> Dict[str, Any]:
     try:
-        m = Mega()
-        file_info = m.get_public_url_info(url)
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        r.raise_for_status()
         
-        if not file_info:
-            return {"ok": False, "reason": "Gagal mengambil info dari link MEGA."}
-            
-        name = file_info.get('name', 'mega_file')
-        size = file_info.get('size', 0)
+        soup = BeautifulSoup(r.content, 'html.parser')
+        title_tag = soup.find('title')
+        name = title_tag.text.replace("MEGA", "").strip() if title_tag else "mega_file"
         
         return {
             "ok": True,
@@ -189,7 +186,7 @@ def _resolve_mega(url: str) -> Dict[str, Any]:
             "thumbnail": None,
             "uploader": "MEGA",
             "duration": None,
-            "formats": [{"index": 1, "name": name, "size": size, "format_id": "direct", "url": url}]
+            "formats": [{"index": 1, "name": name, "size": 0, "format_id": "direct", "url": url}]
         }
     except Exception as e:
         return {"ok": False, "reason": f"MEGA Error: {_clean_err(e)[:150]}"}
