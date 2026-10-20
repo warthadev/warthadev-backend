@@ -904,7 +904,7 @@ def run_colab_worker():
                 dest, err = _download_image(_image_urls.get(fmt_id), base, out_dir)
             elif is_direct:
                 _set_state(message="Downloading file...")
-                direct_url = item.get("url") 
+                direct_url = item.get("url") or url
                 
                 if direct_url and "mega.nz" in direct_url:
                     _set_state(message="Downloading via megadl...")
@@ -1001,7 +1001,12 @@ def run_colab_worker():
         formats = []
         info = None
 
-        if path_l.endswith(DIRECT_EXTS):
+        _h = _host(url)
+        if _h == "mega.nz" or _h.endswith(".mega.nz") or _h == "drive.google.com" or _h == "docs.google.com":
+            # MEGA / Google Drive: jangan lewat yt-dlp (error 'bool'), langsung handler direct
+            fname = "gdrive_download" if "google.com" in _h else "mega_download"
+            formats = [{"index": 1, "name": fname, "size": 0, "format_id": "direct", "url": url}]
+        elif path_l.endswith(DIRECT_EXTS):
             fname = _safe_name(os.path.basename(urlparse(url).path)) or "download"
             formats = [{"index": 1, "name": fname, "size": 0, "format_id": "direct"}]
         else:
