@@ -35,6 +35,14 @@ BEST_FORMAT = "bestvideo*+bestaudio/bestvideo*/best"
 DIRECT_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".ts", ".mp3", ".m4a", ".zip", ".rar", ".7z", ".pdf")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+# Host yang langsung diserahkan ke Colab (IP datacenter diblokir YouTube). Kosongkan env ini kalau
+# server sudah pakai cookies/proxy dan mau coba resolve YouTube di server juga.
+SKIP_SERVER_HOSTS = tuple(
+    h.strip().lower()
+    for h in os.environ.get("UNIVERSAL_SERVER_SKIP_HOSTS", "youtube.com,youtu.be,youtube-nocookie.com").split(",")
+    if h.strip()
+)
+
 _resolve_cache: TTLCache = TTLCache(maxsize=64, ttl=RESOLVE_CACHE_TTL)
 _resolve_cache_lock = threading.Lock()
 _resolve_lock = threading.Lock()  # satu extract sekaligus, jaga RAM free tier
@@ -57,6 +65,11 @@ def _is_public_url(url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _skip_on_server(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in SKIP_SERVER_HOSTS)
 
 
 def _est_size(f: Dict[str, Any], duration: Any) -> int:
@@ -142,6 +155,8 @@ def _resolve_sync(url: str) -> Dict[str, Any]:
             "formats": [{"index": 1, "name": fname, "size": 0, "format_id": "direct"}],
         }
 
+    if _skip_on_server(url):
+        return {"ok": False, "reason": "resolved via Colab"}
     if not _is_public_url(url):
         return {"ok": False, "reason": "url not allowed"}
     if not _resolve_lock.acquire(blocking=False):
