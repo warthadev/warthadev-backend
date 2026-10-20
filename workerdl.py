@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-21-mega-mediafire"
+WORKER_VERSION = "2026-10-21-universal+torrent"
 
 def run_colab_worker():
     print(f"[universal] worker version: {WORKER_VERSION}")
@@ -111,6 +111,7 @@ def run_colab_worker():
         "eta_seconds": None, "message": "", "error": "",
     }
     _stop = threading.Event()
+    _mode = {"v": "universal"}
     _runner = None
     _image_urls = {}
 
@@ -224,7 +225,7 @@ def run_colab_worker():
         <div style="font-family:monospace;margin:10px 0;background:linear-gradient(135deg,#0f0f1e,#1a1a2e,#16213e);
                     border-radius:12px;border:1px solid #2a2a4a;padding:16px;color:#e0e0e0;">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                <div style="color:#4CAF50;font-size:16px;font-weight:bold;letter-spacing:1px;">UNIVERSAL COLAB</div>
+                <div style="color:#4CAF50;font-size:16px;font-weight:bold;letter-spacing:1px;">{_mode["v"].upper()} COLAB</div>
                 <div style="color:{color};font-size:11px;font-weight:bold;background:rgba(255,255,255,0.05);
                             padding:4px 10px;border-radius:20px;border:1px solid {color};">{label}</div>
             </div>
@@ -246,7 +247,7 @@ def run_colab_worker():
 
     def _post_update(payload, retries=POST_RETRY_COUNT):
         if not SESSION_ID or not BACKEND_URL: return False
-        url = f"{BACKEND_URL.rstrip('/')}/universal/colab-update"
+        url = f"{BACKEND_URL.rstrip('/')}/{_mode["v"]}/colab-update"
         import requests
         for attempt in range(retries):
             try:
@@ -258,7 +259,7 @@ def run_colab_worker():
 
     def _fetch_config(session_id, backend_url):
         import requests
-        url = f"{backend_url.rstrip('/')}/universal/colab-config"
+        url = f"{backend_url.rstrip('/')}/{_mode["v"]}/colab-config"
         for attempt in range(POST_RETRY_COUNT):
             try:
                 r = requests.get(url, params={"session_id": session_id}, timeout=30)
@@ -270,7 +271,7 @@ def run_colab_worker():
     def _check_status(session_id, backend_url):
         import requests
         try:
-            r = requests.get(f"{backend_url.rstrip('/')}/universal/colab-check",
+            r = requests.get(f"{backend_url.rstrip('/')}/{_mode["v"]}/colab-check",
                              params={"session_id": session_id}, timeout=15)
             if r.ok: return r.json().get("status")
         except Exception: pass
@@ -912,8 +913,11 @@ def run_colab_worker():
             out.append({"index": len(out) + 1, "name": nm, "size": sz, "format_id": "direct", "url": link})
         return out, (None if out else "Tidak ada file yang bisa diunduh")
 
-    def _upload_one_file(local_path, hf_token, repo_id, repo_type, folder, idx, total_files):
+    def _upload_one_file(local_path, hf_token, repo_id, repo_type, folder, idx, total_files, report_name=None, extra=None):
         fname = os.path.basename(local_path)
+        rname = report_name or fname
+        _extra = extra or {}
+        def _pu(payload, **kw): return _post_update({**payload, **_extra}, **kw)
         is_dir = os.path.isdir(local_path)
         try:
             if is_dir:
@@ -925,7 +929,7 @@ def run_colab_worker():
         _set_state(phase="uploading", current_file=fname, current_index=idx, percent=0,
                    current_human="0 B", total_human=_format_size(size), speed_human="0 B/s",
                    eta_seconds=None, message="Uploading to Hugging Face...", error="")
-        _post_update({"status": "uploading", "phase": "upload", "save_status": "uploading", "file_name": fname,
+        _pu({"status": "uploading", "phase": "upload", "save_status": "uploading", "file_name": rname,
                       "percent": 0, "current_human": "0 B", "total_human": _format_size(size), "speed_human": "0 B/s"})
 
         stop = {"stop": False}
@@ -943,8 +947,8 @@ def run_colab_worker():
                 upd = {"percent": int(frac * 100), "current_human": _format_size(cur), "total_human": _format_size(size),
                        "speed_human": _format_size(spd) + "/s", "eta_seconds": eta}
                 _set_state(phase="uploading", message="", **upd)
-                _post_update({"status": "uploading", "phase": "upload", "save_status": "uploading",
-                              "file_name": fname, **upd}, retries=1)
+                _pu({"status": "uploading", "phase": "upload", "save_status": "uploading",
+                              "file_name": rname, **upd}, retries=1)
 
         threading.Thread(target=animate, daemon=True).start()
         try:
@@ -962,15 +966,15 @@ def run_colab_worker():
             save_url = f"https://huggingface.co/{prefix}{repo_id}/blob/main/{path_in_repo}"
             _set_state(phase="uploading", percent=100, current_human=_format_size(size),
                        total_human=_format_size(size), speed_human="0 B/s", eta_seconds=0, message="Uploaded")
-            _post_update({"status": "saved", "save_status": "done", "save_url": save_url, "file_name": fname,
+            _pu({"status": "saved", "save_status": "done", "save_url": save_url, "file_name": rname,
                           "phase": "upload", "percent": 100, "current_human": _format_size(size),
                           "total_human": _format_size(size), "speed_human": "0 B/s"})
             return True, save_url
         except Exception as e:
             stop["stop"] = True
             err = _clean_err(e)[:300]
-            _post_update({"status": "error", "save_status": "error", "save_error": err,
-                          "file_name": fname, "phase": "upload"})
+            _pu({"status": "error", "save_status": "error", "save_error": err,
+                          "file_name": rname, "phase": "upload"})
             return False, err
 
     def _fail(msg, phase="resolve"):
@@ -1189,7 +1193,7 @@ def run_colab_worker():
         _post_update({"status": "waiting", "phase": "resolve", "finished": False, "formats": formats,
                       "meta": _meta_from_info(info)})
 
-    def _start_session(session_id, backend_url):
+    def _start_universal(session_id, backend_url):
         nonlocal SESSION_ID, BACKEND_URL
         session_id = (session_id or "").strip()
         backend_url = (backend_url or "").strip()
@@ -1272,6 +1276,203 @@ def run_colab_worker():
             first_round = False
             _set_state(message=_state["message"] + " Menunggu pilihan berikutnya di web...")
 
+    # ---------------- TORRENT ----------------
+    def _find_target_file(work_dir, target_name):
+        if not target_name: return None
+        tl = target_name.lower()
+        for root, _d, fs in os.walk(work_dir):
+            for f in fs:
+                if f.endswith((".aria2", ".torrent")) or f == "input.txt": continue
+                if f.lower() == tl: return os.path.join(root, f)
+        return None
+
+    def _find_largest_file(work_dir):
+        best = None
+        for root, _d, fs in os.walk(work_dir):
+            for f in fs:
+                if f.endswith((".aria2", ".torrent")) or f == "input.txt": continue
+                c = os.path.join(root, f)
+                if best is None or os.path.getsize(c) > os.path.getsize(best): best = c
+        return best
+
+    def _bt_download_one(magnet, file_index, file_name, work_dir, idx, total):
+        input_file = os.path.join(work_dir, "input.txt")
+        with open(input_file, "w") as fh: fh.write(magnet + "\n")
+        cmd = ["aria2c", "--enable-dht=true", "--enable-dht6=false", "--bt-enable-lpd=true", "--bt-max-peers=200",
+               "--max-connection-per-server=16", "--split=16", "--min-split-size=1M", "--seed-time=0",
+               "--file-allocation=none", "--summary-interval=1", "--console-log-level=notice",
+               "--show-console-readout=true", "--download-result=full",
+               f"--select-file={file_index}", f"--input-file={input_file}", "--dir", work_dir]
+        last = 0
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            if _stop.is_set():
+                proc.terminate()
+                break
+            line = line.rstrip()
+            if not line: continue
+            parsed = _parse_aria2_line(line)
+            if not parsed or time.time() - last < 3: continue
+            last = time.time()
+            _set_state(phase="downloading", current_file=file_name, current_index=idx, total_files=total, **parsed)
+            _post_update({"status": "downloading", "phase": "download", "file_name": file_name,
+                          "current_file_index": idx, "total_files": total, **parsed}, retries=1)
+        try: proc.wait(timeout=30)
+        except Exception: proc.kill()
+        return -1 if _stop.is_set() else proc.returncode
+
+    def _start_torrent(cfg):
+        magnet, files = cfg.get("magnet"), cfg.get("files") or []
+        hf_token, repo_id = cfg.get("token"), cfg.get("repo_id")
+        repo_type, folder = cfg.get("repo_type") or "dataset", cfg.get("folder") or ""
+        if not magnet or not files:
+            _set_state(phase="error", message="", error="Config torrent tidak lengkap (magnet/files kosong).")
+            return
+        if not (hf_token and repo_id):
+            _set_state(phase="error", message="", error="Config torrent tidak berisi token / repo Hugging Face.")
+            return
+
+        total = len(files)
+        completed = failed = 0
+        ok_bytes, ok_secs = 0, 0.0
+        _state["files"] = [{"name": f.get("name", ""), "size": f.get("size", 0), "_status": "pending",
+                            "_index": f.get("index")} for f in files]
+        _set_state(phase="downloading", total_files=total, completed_files=0, failed_files=0, percent=0,
+                   current_human="0 B", total_human="0 B", speed_human="0 B/s", eta_seconds=None,
+                   message=f"Session ready \u00b7 {total} file(s)", error="")
+
+        def counts(): return {"total_files": total, "completed_files": completed, "failed_files": failed}
+        def row(i, st):
+            if 0 <= i - 1 < len(_state["files"]): _state["files"][i - 1]["_status"] = st
+
+        downloaded = []
+        for idx, f in enumerate(files, start=1):
+            if _stop.is_set(): break
+            file_index, file_name = f.get("index"), f.get("name") or ""
+            if not file_index:
+                failed += 1; row(idx, "error")
+                _set_state(failed_files=failed, error=f"Skip: file_index missing for {file_name}")
+                continue
+            row(idx, "downloading")
+            _set_state(phase="downloading", current_file=file_name, current_index=idx, total_files=total,
+                       completed_files=completed, failed_files=failed, percent=0, current_human="0 B",
+                       total_human="0 B", speed_human="0 B/s", eta_seconds=None, message="", error="")
+            work_dir = os.path.join(TEMP_PATH, f"torrent_{int(time.time())}_{idx}")
+            os.makedirs(work_dir, exist_ok=True)
+            try:
+                _post_update({"status": "downloading", "phase": "download", "file_name": file_name, "percent": 0,
+                              "speed_human": "0 B/s", "current_file_index": idx, **counts()})
+                rc = _bt_download_one(magnet, file_index, file_name, work_dir, idx, total)
+                if _stop.is_set():
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    break
+                actual = _find_target_file(work_dir, file_name) or _find_largest_file(work_dir) if rc == 0 else None
+                if rc != 0 or not actual:
+                    failed += 1; row(idx, "error")
+                    err = f"aria2 exit code {rc}" if rc != 0 else "file not found after download"
+                    _set_state(failed_files=failed, error=f"[{idx}/{total}] Download failed: {err}")
+                    _post_update({"status": "error", "error": err, "file_name": file_name, "phase": "download",
+                                  "current_file_index": idx, **counts()})
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    continue
+                size = os.path.getsize(actual)
+                row(idx, "downloaded")
+                _set_state(phase="downloading", current_file=file_name, current_index=idx, percent=100,
+                           current_human=_format_size(size), total_human=_format_size(size),
+                           speed_human="0 B/s", eta_seconds=0, message="", error="")
+                _post_update({"status": "downloading", "phase": "download", "file_name": file_name, "percent": 100,
+                              "current_human": _format_size(size), "total_human": _format_size(size),
+                              "speed_human": "0 B/s", "current_file_index": idx, **counts()})
+                downloaded.append({"idx": idx, "file_name": file_name, "path": actual, "work_dir": work_dir, "size": size})
+            except Exception as e:
+                failed += 1; row(idx, "error")
+                err = _clean_err(e)[:200]
+                _set_state(failed_files=failed, error=f"[{idx}/{total}] Exception: {err}")
+                _post_update({"status": "error", "error": err, "file_name": file_name, "phase": "download",
+                              "current_file_index": idx, **counts()})
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+        if _stop.is_set():
+            for it in downloaded: shutil.rmtree(it["work_dir"], ignore_errors=True)
+            _on_stopped()
+            return
+
+        _set_state(phase="uploading", completed_files=0, failed_files=failed,
+                   message=f"Starting upload {len(downloaded)} file(s)", error="")
+        for it in downloaded:
+            idx, file_name = it["idx"], it["file_name"]
+            row(idx, "uploading")
+            t0 = time.time()
+            _set_state(phase="uploading", current_file=file_name, current_index=idx, completed_files=completed,
+                       failed_files=failed, percent=0, current_human="0 B", total_human=_format_size(it["size"]),
+                       speed_human="0 B/s", eta_seconds=None, message="", error="")
+            ok, _res = _upload_one_file(it["path"], hf_token, repo_id, repo_type, folder, idx, total,
+                                        report_name=file_name,
+                                        extra={"current_file_index": idx, "total_files": total,
+                                               "completed_files": completed, "failed_files": failed})
+            if ok:
+                completed += 1; ok_bytes += it["size"]; ok_secs += time.time() - t0; row(idx, "done")
+            else:
+                failed += 1; row(idx, "error")
+                _set_state(error=f"[{idx}/{total}] Upload failed: {_res}")
+            _set_state(completed_files=completed, failed_files=failed)
+            _post_update({"current_file_index": idx, **counts()})
+            shutil.rmtree(it["work_dir"], ignore_errors=True)
+
+        final = "done" if failed == 0 else "error"
+        _set_state(phase=final, completed_files=completed, failed_files=failed, percent=100, speed_human="0 B/s",
+                   eta_seconds=None, message=f"Finished: {completed} saved, {failed} failed (from {total})",
+                   error="" if failed == 0 else f"{failed} file(s) failed")
+        payload = {"status": final, "finished": True, "phase": "done", "percent": 100, **counts(),
+                   "total_size_bytes": int(ok_bytes), "total_elapsed_seconds": float(ok_secs),
+                   "total_speed_bps": int(ok_bytes / ok_secs) if ok_secs > 0 else 0}
+        if failed > 0:
+            payload["error"] = f"{failed} file(s) failed out of {total}"
+            payload["save_status"] = "done" if completed > 0 else "error"
+        _post_update(payload)
+
+    def _detect_mode(session_id, backend_url):
+        import requests
+        base, last = backend_url.rstrip("/"), None
+        for mode in ("universal", "torrent"):
+            for attempt in range(POST_RETRY_COUNT):
+                try:
+                    r = requests.get(f"{base}/{mode}/colab-config", params={"session_id": session_id}, timeout=30)
+                    if r.ok:
+                        j = r.json()
+                        if j.get("ok"): return mode, j, None
+                        break
+                    if r.status_code in (404, 410):
+                        if mode == "torrent" and r.status_code == 404:
+                            last = "Session torrent ini sudah tidak punya file tersisa."
+                        break
+                except Exception: pass
+                if attempt < POST_RETRY_COUNT - 1: time.sleep(POST_RETRY_DELAY * (attempt + 1))
+        return None, None, last
+
+    def _start_session(session_id, backend_url):
+        nonlocal SESSION_ID, BACKEND_URL
+        session_id = (session_id or "").strip()
+        backend_url = (backend_url or "").strip()
+        _notes.clear()
+        _ensure_dirs()
+        if not session_id or not backend_url:
+            _set_state(phase="error", error="Session ID and Backend URL are required")
+            return
+        SESSION_ID, BACKEND_URL = session_id, backend_url
+        _set_state(phase="fetching", message="Mendeteksi tipe session (universal / torrent)...", error="")
+        mode, cfg, why = _detect_mode(session_id, backend_url)
+        if not mode:
+            _set_state(phase="error", message="",
+                       error=why or "Session tidak ditemukan di universal maupun torrent. Cek Session ID / Backend URL.")
+            return
+        _mode["v"] = mode
+        if mode == "torrent":
+            _set_state(message="Session torrent terdeteksi")
+            _start_torrent(cfg)
+        else:
+            _start_universal(session_id, backend_url)
+
     def _on_stopped():
         _set_state(phase="error", message="", error="Dihentikan. Tekan START DOWNLOAD lagi (Session ID sama).")
         _post_update({"status": "error", "phase": "resolve", "error": "Dihentikan dari Colab", "finished": True})
@@ -1314,9 +1515,9 @@ def run_colab_worker():
         display(HTML("""
         <div style="font-family:monospace;margin:10px 0;padding:18px;background:linear-gradient(135deg,#0f0f1e,#1a1a2e,#16213e);
                     border-radius:12px;border:1px solid #2a2a4a;color:#e0e0e0;">
-            <div style="color:#4CAF50;font-size:18px;font-weight:bold;letter-spacing:2px;text-align:center;">UNIVERSAL COLAB</div>
+            <div style="color:#4CAF50;font-size:18px;font-weight:bold;letter-spacing:2px;text-align:center;">UNIVERSAL + TORRENT COLAB</div>
             <div style="color:#888;font-size:12px;margin-top:4px;text-align:center;">
-                Download media universal di Colab · Upload otomatis ke Hugging Face</div>
+                Download media universal &amp; torrent di Colab · Upload otomatis ke Hugging Face</div>
             <div style="margin-top:18px;">
                 <label style="font-size:11px;color:#888;letter-spacing:1px;">SESSION ID</label>
                 <input id="uvd-session-id" type="text" placeholder="paste dari kernel log"
