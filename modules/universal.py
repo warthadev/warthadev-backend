@@ -155,6 +155,15 @@ def _resolve_mediafire(url: str) -> Dict[str, Any]:
             return {"ok": False, "reason": "Tombol download MediaFire tidak ditemukan (URL salah/private)."}
             
         direct_url = btn.get('href')
+        scrambled = btn.get('data-scrambled-url')
+        if scrambled:
+            try:
+                import base64
+                direct_url = base64.b64decode(scrambled).decode()
+            except Exception:
+                pass
+        if not direct_url or not str(direct_url).startswith("http"):
+            return {"ok": False, "reason": "Link download MediaFire tidak valid."}
         temp_name = name_elem.text.strip() if name_elem else "download"
         
         return {
