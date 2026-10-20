@@ -194,5 +194,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         proxy_headers=True,
-        forwarded_allow_ips="*"
+        forwarded_allow_ips="*",
+        workers=1  # sesi (torrent/universal) disimpan di memori proses, jadi harus 1 worker
     )
