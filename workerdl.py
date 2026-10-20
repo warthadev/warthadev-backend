@@ -284,7 +284,8 @@ def run_colab_worker():
         try:
             with open(path, "rb") as f:
                 head = f.read(512).lstrip().lower()
-            if head.startswith((b"<!doc", b"<html")): return False, "Isi file ternyata HTML (bukan file asli)"
+            if head.startswith((b"<!doc", b"<html")): 
+                return False, "File terdeteksi sebagai HTML (kemungkinan halaman peringatan Google Drive)"
         except Exception as e: return False, f"Error baca file: {e}"
         return True, "OK"
 
@@ -907,11 +908,18 @@ def run_colab_worker():
                 elif direct_url and ("drive.google.com" in direct_url or "docs.google.com" in direct_url):
                     _set_state(message="Downloading via gdown...")
                     dest = os.path.join(out_dir, base)
+                    
                     if "folders/" in direct_url:
-                        r = subprocess.run(["gdown", "--folder", direct_url, "-O", dest], capture_output=True, text=True)
+                        r = subprocess.run(["gdown", "--folder", "--fuzzy", direct_url, "-O", dest], capture_output=True, text=True)
                     else:
-                        r = subprocess.run(["gdown", direct_url, "-O", dest], capture_output=True, text=True)
-                    if r.returncode != 0: dest, err = None, f"gdown error: {r.stderr[:200]}"
+                        r = subprocess.run(["gdown", "--fuzzy", direct_url, "-O", dest], capture_output=True, text=True)
+                        
+                    if r.returncode != 0: 
+                        dest, err = None, f"gdown error: {r.stderr[:200]}"
+                    else:
+                        ok, msg = _check_file(dest)
+                        if not ok:
+                            dest, err = None, msg
                 elif direct_url: dest, err = _download_aria2(direct_url, base, base, out_dir)
                 else: dest, err = _download_aria2(url, base, base, out_dir)
             else:
