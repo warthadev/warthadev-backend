@@ -27,37 +27,52 @@ def run_colab_worker():
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def _ensure_deps():
+        from IPython.display import display, HTML
+        display(HTML("""
+        <div style="font-family:monospace; padding: 15px; background: #1e1e1e; border-radius: 8px; border-left: 4px solid #2196F3; color: #e0e0e0; margin-bottom: 10px;">
+            <b style="color: #2196F3;">[SETUP]</b> Memeriksa dan menginstal dependencies...
+        </div>
+        """))
+
         need_apt = [pkg for b, pkg in _APT_PKGS.items() if not shutil.which(b)]
         if need_apt:
-            print(f"[setup] install apt: {', '.join(need_apt)}")
             _run_quiet(["apt-get", "update", "-qq"])
-            r = _run_quiet(["apt-get", "install", "-y", "-qq", *need_apt])
-            if r.returncode != 0:
-                print("[setup] apt gagal:\n" + (r.stdout or "")[-400:])
+            _run_quiet(["apt-get", "install", "-y", "-qq", *need_apt])
+
+        # Paksa install gdown versi stabil buat nangani folder
+        _run_quiet([sys.executable, "-m", "pip", "uninstall", "-y", "gdown"])
+        _run_quiet([sys.executable, "-m", "pip", "install", "-q", "gdown==4.7.1"])
 
         need_pip = [pkg for mod, pkg in _PIP_PKGS.items() if importlib.util.find_spec(mod) is None]
         if need_pip:
-            print(f"[setup] install pip: {', '.join(need_pip)}")
-            r = _run_quiet([sys.executable, "-m", "pip", "install", "-q", *need_pip])
-            if r.returncode != 0:
-                print("[setup] pip gagal:\n" + (r.stdout or "")[-400:])
+            _run_quiet([sys.executable, "-m", "pip", "install", "-q", *need_pip])
 
         if UPGRADE_YTDLP:
-            print("[setup] update yt-dlp...")
             _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp", "gallery-dl"])
 
         importlib.invalidate_caches()
 
         missing = [b for b in _APT_PKGS if not shutil.which(b)]
         missing += [mod for mod in _PIP_PKGS if importlib.util.find_spec(mod) is None]
+        
         if missing:
-            print(f"[setup] MASIH KURANG: {', '.join(missing)} (cek koneksi runtime)")
+            err_msg = f"MASIH KURANG: {', '.join(missing)} (cek koneksi runtime)"
+            display(HTML(f"""
+            <div style="font-family:monospace; padding: 15px; background: #2a1a1a; border-radius: 8px; border-left: 4px solid #F44336; color: #F44336; margin-bottom: 10px;">
+                <b>[ERROR]</b> {err_msg}
+            </div>
+            """))
+            raise RuntimeError(err_msg)
         else:
-            print("[setup] semua dependency siap")
+            display(HTML("""
+            <div style="font-family:monospace; padding: 15px; background: #1a2e1a; border-radius: 8px; border-left: 4px solid #4CAF50; color: #4CAF50; margin-bottom: 10px;">
+                <b>[SETUP]</b> Semua dependency siap.
+            </div>
+            """))
 
     _ensure_deps()
 
-    from IPython.display import display, HTML, JSON
+    from IPython.display import display, HTML, JSON, clear_output
 
     COLAB_SAVE = "/content/Universal"
     TEMP_PATH = "/content/Temp"
