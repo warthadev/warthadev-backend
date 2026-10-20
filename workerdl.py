@@ -39,10 +39,6 @@ def run_colab_worker():
             _run_quiet(["apt-get", "update", "-qq"])
             _run_quiet(["apt-get", "install", "-y", "-qq", *need_apt])
 
-        # Paksa install gdown versi stabil buat nangani folder
-        _run_quiet([sys.executable, "-m", "pip", "uninstall", "-y", "gdown"])
-        _run_quiet([sys.executable, "-m", "pip", "install", "-q", "gdown==4.6.0"])
-
         need_pip = [pkg for mod, pkg in _PIP_PKGS.items() if importlib.util.find_spec(mod) is None]
         if need_pip:
             _run_quiet([sys.executable, "-m", "pip", "install", "-q", *need_pip])
@@ -72,7 +68,7 @@ def run_colab_worker():
 
     _ensure_deps()
 
-    from IPython.display import display, HTML, JSON, clear_output
+    from IPython.display import display, HTML, JSON
 
     COLAB_SAVE = "/content/Universal"
     TEMP_PATH = "/content/Temp"
@@ -921,22 +917,44 @@ def run_colab_worker():
                         if files: os.rename(os.path.join(out_dir, files[0]), dest)
                         else: dest, err = None, "File MEGA tidak ditemukan setelah download"
                 elif direct_url and ("drive.google.com" in direct_url or "docs.google.com" in direct_url):
-                    _set_state(message="Downloading via gdown...")
-                    dest = os.path.join(out_dir, base)
+                    _set_state(message="Downloading via gallery-dl...")
+                    dest_dir = os.path.join(out_dir, base)
+                    os.makedirs(dest_dir, exist_ok=True)
                     
-                    if "folders/" in direct_url:
-                        r = subprocess.run(["gdown", "--folder", direct_url, "-O", dest], capture_output=True, text=True)
+                    cmd = [sys.executable, "-m", "gallery_dl", "-D", dest_dir, direct_url]
+                    if os.path.exists(COOKIES_FILE):
+                        cmd.insert(3, "--cookies")
+                        cmd.insert(4, COOKIES_FILE)
+                    
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    if r.returncode != 0:
+                        dest, err = None, f"gallery-dl error: {r.stderr[:200]}"
                     else:
-                        r = subprocess.run(["gdown", direct_url, "-O", dest], capture_output=True, text=True)
+                        downloaded = []
+                        for root, dirs, files in os.walk(dest_dir):
+                            for f in files:
+                                downloaded.append(os.path.join(root, f))
                         
-                    if r.returncode != 0: 
-                        dest, err = None, f"gdown error: {r.stderr[:200]}"
-                    else:
-                        ok, msg = _check_file(dest)
-                        if not ok:
-                            dest, err = None, msg
-                elif direct_url: dest, err = _download_aria2(direct_url, base, base, out_dir)
-                else: dest, err = _download_aria2(url, base, base, out_dir)
+                        if not downloaded:
+                            dest, err = None, "Folder Google Drive kosong atau gagal diunduh"
+                        else:
+                            if len(downloaded) == 1:
+                                dest = os.path.join(out_dir, base)
+                                os.rename(downloaded[0], dest)
+                            else:
+                                dest = os.path.join(out_dir, base + ".zip")
+                                shutil.make_archive(os.path.join(out_dir, base), 'zip', dest_dir)
+                                shutil.rmtree(dest_dir, ignore_errors=True)
+                            
+                            ok, msg = _check_file(dest)
+                            if not ok:
+                                dest, err = None, msg
+                                
+                elif direct_url: 
+                    dest, err = _download_aria2(direct_url, base, base, out_dir)
+                else: 
+                    dest, err = _download_aria2(url, base, base, out_dir)
             else:
                 dest, err = _download_ytdlp(url, fmt_id, base, first_strat, base, out_dir, audio=is_audio, info=info)
 
