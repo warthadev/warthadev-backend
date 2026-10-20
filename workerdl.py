@@ -15,7 +15,10 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
+WORKER_VERSION = "2026-10-21-gdown"
+
 def run_colab_worker():
+    print(f"[universal] worker version: {WORKER_VERSION}")
     UPGRADE_YTDLP = True
     _PIP_PKGS = {
         "requests": "requests", "yt_dlp": "yt-dlp", "gallery_dl": "gallery-dl",
