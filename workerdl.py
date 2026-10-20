@@ -917,19 +917,24 @@ def run_colab_worker():
                         if files: os.rename(os.path.join(out_dir, files[0]), dest)
                         else: dest, err = None, "File MEGA tidak ditemukan setelah download"
                 elif direct_url and ("drive.google.com" in direct_url or "docs.google.com" in direct_url):
-                    _set_state(message="Downloading via gallery-dl...")
+                    _set_state(message="Downloading via gdown...")
                     dest_dir = os.path.join(out_dir, base)
                     os.makedirs(dest_dir, exist_ok=True)
-                    
-                    cmd = [sys.executable, "-m", "gallery_dl", "-D", dest_dir, direct_url]
-                    if os.path.exists(COOKIES_FILE):
-                        cmd.insert(3, "--cookies")
-                        cmd.insert(4, COOKIES_FILE)
-                    
+
+                    try:
+                        import gdown  # noqa: F401
+                    except Exception:
+                        _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", "gdown"])
+
+                    if "/folders/" in direct_url:
+                        cmd = [sys.executable, "-m", "gdown", "--folder", direct_url, "-O", dest_dir, "--remaining-ok"]
+                    else:
+                        cmd = [sys.executable, "-m", "gdown", "--fuzzy", direct_url, "-O", dest_dir + os.sep]
+
                     r = subprocess.run(cmd, capture_output=True, text=True)
-                    
+
                     if r.returncode != 0:
-                        dest, err = None, f"gallery-dl error: {r.stderr[:200]}"
+                        dest, err = None, f"gdown error: {(r.stderr or r.stdout)[-300:]}"
                     else:
                         downloaded = []
                         for root, dirs, files in os.walk(dest_dir):
