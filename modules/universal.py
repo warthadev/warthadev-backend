@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Query
 import requests
 from bs4 import BeautifulSoup
 from mega import Mega
+import gdown
 
 logger = logging.getLogger(__name__)
 
@@ -181,8 +182,6 @@ def _resolve_mega(url: str) -> Dict[str, Any]:
         name = file_info.get('name', 'mega_file')
         size = file_info.get('size', 0)
         
-        # mega.py get_public_url_info biasanya cuma buat 1 file
-        # Untuk folder butuh penanganan khusus, tapi ini bisa handle file tunggal dengan baik
         return {
             "ok": True,
             "source": "server",
@@ -196,20 +195,39 @@ def _resolve_mega(url: str) -> Dict[str, Any]:
         return {"ok": False, "reason": f"MEGA Error: {_clean_err(e)[:150]}"}
 
 
+def _resolve_gdrive(url: str) -> Dict[str, Any]:
+    try:
+        info = gdown.download(url=url, skip_download=True, quiet=True)
+        
+        if not info:
+            return {"ok": False, "reason": "Gagal membaca link Google Drive (mungkin private)."}
+        
+        name = getattr(info, 'path', 'gdrive_download')
+        
+        return {
+            "ok": True,
+            "source": "server",
+            "title": name,
+            "thumbnail": None,
+            "uploader": "Google Drive",
+            "duration": None,
+            "formats": [{"index": 1, "name": name, "size": 0, "format_id": "direct", "url": url}]
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"Google Drive Error: {_clean_err(e)[:150]}"}
+
+
 def _resolve_sync(url: str) -> Dict[str, Any]:
     host = (urlparse(url).hostname or "").lower()
     
     if "mediafire.com" in host:
-        res = _resolve_mediafire(url)
-        if res.get("ok"):
-            return res
-        return res
+        return _resolve_mediafire(url)
 
     if "mega.nz" in host:
-        res = _resolve_mega(url)
-        if res.get("ok"):
-            return res
-        return res
+        return _resolve_mega(url)
+
+    if "drive.google.com" in host or "docs.google.com" in host:
+        return _resolve_gdrive(url)
 
     path = urlparse(url).path
     if path.lower().endswith(DIRECT_EXTS):
