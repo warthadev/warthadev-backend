@@ -194,12 +194,13 @@ def _resolve_mega(url: str) -> Dict[str, Any]:
 
 def _resolve_gdrive(url: str) -> Dict[str, Any]:
     try:
-        info = gdown.download(url=url, skip_download=True, quiet=True)
+        # Menggunakan requests dan bs4 untuk mengambil nama folder/file dari halaman Drive
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, 'html.parser')
         
-        if not info:
-            return {"ok": False, "reason": "Gagal membaca link Google Drive (mungkin private)."}
-        
-        name = getattr(info, 'path', 'gdrive_download')
+        title_tag = soup.find('title')
+        name = title_tag.text.replace(" - Google Drive", "").strip() if title_tag else "gdrive_download"
         
         return {
             "ok": True,
