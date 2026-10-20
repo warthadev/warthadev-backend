@@ -15,6 +15,7 @@ from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, Query
 import requests
 from bs4 import BeautifulSoup
+from mega import Mega
 
 logger = logging.getLogger(__name__)
 
@@ -169,11 +170,43 @@ def _resolve_mediafire(url: str) -> Dict[str, Any]:
         return {"ok": False, "reason": f"MediaFire Error: {_clean_err(e)[:150]}"}
 
 
+def _resolve_mega(url: str) -> Dict[str, Any]:
+    try:
+        m = Mega()
+        file_info = m.get_public_url_info(url)
+        
+        if not file_info:
+            return {"ok": False, "reason": "Gagal mengambil info dari link MEGA."}
+            
+        name = file_info.get('name', 'mega_file')
+        size = file_info.get('size', 0)
+        
+        # mega.py get_public_url_info biasanya cuma buat 1 file
+        # Untuk folder butuh penanganan khusus, tapi ini bisa handle file tunggal dengan baik
+        return {
+            "ok": True,
+            "source": "server",
+            "title": name,
+            "thumbnail": None,
+            "uploader": "MEGA",
+            "duration": None,
+            "formats": [{"index": 1, "name": name, "size": size, "format_id": "direct", "url": url}]
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"MEGA Error: {_clean_err(e)[:150]}"}
+
+
 def _resolve_sync(url: str) -> Dict[str, Any]:
     host = (urlparse(url).hostname or "").lower()
     
     if "mediafire.com" in host:
         res = _resolve_mediafire(url)
+        if res.get("ok"):
+            return res
+        return res
+
+    if "mega.nz" in host:
+        res = _resolve_mega(url)
         if res.get("ok"):
             return res
         return res
