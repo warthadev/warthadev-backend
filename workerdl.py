@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-21-gdown-folder"
+WORKER_VERSION = "2026-10-21-mega-mediafire"
 
 def run_colab_worker():
     print(f"[universal] worker version: {WORKER_VERSION}")
@@ -788,6 +788,130 @@ def run_colab_worker():
             finally: shutil.rmtree(tmp, ignore_errors=True)
         return None, last_err
 
+    def _proc_run(cmd, watch_dir, names, label, tool="gdown", parse_pct=False):
+        import types
+        fd, logp = tempfile.mkstemp(prefix="uvd_log_", dir=TEMP_PATH)
+        out = os.fdopen(fd, "w")
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, text=True)
+        last_b, last_t, spd = 0, time.time(), 0.0
+        while proc.poll() is None:
+            if _stop.is_set():
+                proc.terminate()
+                break
+            time.sleep(1)
+            cur, got = 0, set()
+            for r_, _d, fs_ in os.walk(watch_dir):
+                for f_ in fs_:
+                    try: cur += os.path.getsize(os.path.join(r_, f_))
+                    except OSError: pass
+                    got.add(f_)
+            now = time.time()
+            inst = (cur - last_b) / max(now - last_t, 1e-6)
+            spd = inst if spd == 0 else spd * 0.6 + inst * 0.4
+            last_b, last_t = cur, now
+            upd = {"current_human": _format_size(cur), "speed_human": _format_size(spd) + "/s", "total_human": "-"}
+            msg = f"Downloading via {tool}..."
+            if names:
+                done = len(names & got)
+                upd["percent"] = min(99, int(done * 100 / len(names)))
+                msg = f"Downloading {done}/{len(names)} file"
+            elif parse_pct:
+                try:
+                    with open(logp, "rb") as fh:
+                        fh.seek(0, 2); sz = fh.tell(); fh.seek(max(0, sz - 2000))
+                        tail = fh.read().decode("utf-8", "ignore")
+                    ms = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", tail)
+                    if ms: upd["percent"] = min(99, int(float(ms[-1])))
+                except Exception: pass
+            _set_state(phase="downloading", message=msg, **upd)
+            _post_update({"status": "downloading", "phase": "download", "file_name": label, **upd}, retries=1)
+        try: proc.wait(timeout=30)
+        except Exception: proc.kill()
+        try: out.close()
+        except Exception: pass
+        try:
+            with open(logp, "r", errors="ignore") as fh: txt = fh.read()
+            os.remove(logp)
+        except Exception: txt = ""
+        return types.SimpleNamespace(returncode=proc.returncode if proc.returncode is not None else 1, stdout=txt, stderr=txt)
+
+    def _finalize_dl(dest_dir, downloaded, is_folder, base, out_dir):
+        if not downloaded: return None, "Folder kosong atau gagal diunduh"
+        if is_folder:
+            entries = os.listdir(dest_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(dest_dir, entries[0])):
+                return os.path.join(dest_dir, entries[0]), None
+            newdest = os.path.join(out_dir, base)
+            os.rename(dest_dir, newdest)
+            return newdest, None
+        real = os.path.basename(downloaded[0])
+        final = real if (base in ("gdrive_download", "mega_download") or not os.path.splitext(base)[1]) else base
+        dest = os.path.join(out_dir, final)
+        os.rename(downloaded[0], dest)
+        ok, msg = _check_file(dest)
+        return (dest, None) if ok else (None, msg)
+
+    def _mediafire_direct(page_url):
+        import requests, base64
+        try:
+            r = requests.get(page_url, headers={"User-Agent": UA}, timeout=30)
+            html = r.text
+        except Exception as e: return None, f"MediaFire: {_clean_err(e)[:150]}"
+        m = re.search(r'data-scrambled-url="([^"]+)"', html)
+        if m:
+            try: return base64.b64decode(m.group(1)).decode(), None
+            except Exception: pass
+        m = re.search(r'id="downloadButton"[^>]*href="(https?://[^"]+)"', html) or \
+            re.search(r'href="(https?://download[^"]*mediafire\.com[^"]+)"', html)
+        if m: return m.group(1).replace("&amp;", "&"), None
+        return None, "Link download MediaFire tidak ketemu (file private/dihapus?)"
+
+    def _mediafire_formats(url):
+        import requests
+        path = urlparse(url).path
+        m = re.search(r"/folder/([A-Za-z0-9]+)", path) or re.search(r"mediafire\.com/#([A-Za-z0-9]+)", url)
+        if not m:
+            parts = path.split("/")
+            name = "mediafire_download"
+            if "file" in parts:
+                i = parts.index("file")
+                if len(parts) > i + 2 and parts[i + 2] not in ("", "file"): name = unquote(parts[i + 2])
+            return [{"index": 1, "name": _safe_name(name) or "mediafire_download", "size": 0, "format_id": "direct", "url": url}], None
+
+        api = "https://www.mediafire.com/api/1.5/folder/get_content.php"
+        def _list(key, depth=0):
+            files = []
+            for ctype in ("files", "folders"):
+                chunk = 1
+                while True:
+                    r = requests.get(api, params={"folder_key": key, "content_type": ctype, "chunk": chunk,
+                                                  "chunk_size": 1000, "response_format": "json"},
+                                     headers={"User-Agent": UA}, timeout=30)
+                    fc = r.json()["response"]["folder_content"]
+                    if ctype == "files": files.extend(fc.get("files", []))
+                    elif depth < 5:
+                        for d in fc.get("folders", []): files.extend(_list(d["folderkey"], depth + 1))
+                    if fc.get("more_chunks") == "yes": chunk += 1
+                    else: break
+            return files
+        try: files = _list(m.group(1))
+        except Exception as e: return [], f"MediaFire folder: {_clean_err(e)[:150]}"
+        if not files: return [], "Folder MediaFire kosong atau private"
+        out, seen = [], {}
+        for i, f in enumerate(files, start=1):
+            nm = _safe_name(f.get("filename") or f"file_{i}") or f"file_{i}"
+            if nm in seen:
+                seen[nm] += 1
+                root, ext = os.path.splitext(nm)
+                nm = f"{root} ({seen[nm]}){ext}"
+            else: seen[nm] = 0
+            try: sz = int(f.get("size") or 0)
+            except Exception: sz = 0
+            link = (f.get("links") or {}).get("normal_download")
+            if not link: continue
+            out.append({"index": len(out) + 1, "name": nm, "size": sz, "format_id": "direct", "url": link})
+        return out, (None if out else "Tidak ada file yang bisa diunduh")
+
     def _upload_one_file(local_path, hf_token, repo_id, repo_type, folder, idx, total_files):
         fname = os.path.basename(local_path)
         is_dir = os.path.isdir(local_path)
@@ -920,17 +1044,18 @@ def run_colab_worker():
                 
                 if direct_url and "mega.nz" in direct_url:
                     _set_state(message="Downloading via megadl...")
-                    dest = os.path.join(out_dir, base)
+                    dest_dir = os.path.join(out_dir, "_dl")
+                    os.makedirs(dest_dir, exist_ok=True)
                     if not shutil.which("megadl"): _run_quiet(["apt-get", "install", "-y", "-qq", "megatools"])
-                    r = subprocess.run(["megadl", "--path", out_dir, direct_url], capture_output=True, text=True)
-                    if r.returncode != 0: dest, err = None, f"megadl error: {r.stderr[:200]}"
+                    r = _proc_run(["megadl", "--path", dest_dir, direct_url], dest_dir, set(), base, tool="megadl", parse_pct=True)
+                    if r.returncode != 0:
+                        dest, err = None, f"megadl error: {r.stderr[-300:]}"
                     else:
-                        files = [f for f in os.listdir(out_dir) if not f.endswith(".tmp")]
-                        if files: os.rename(os.path.join(out_dir, files[0]), dest)
-                        else: dest, err = None, "File MEGA tidak ditemukan setelah download"
+                        downloaded = [os.path.join(r_, f_) for r_, _d, fs_ in os.walk(dest_dir) for f_ in fs_ if not f_.endswith(".tmp")]
+                        dest, err = _finalize_dl(dest_dir, downloaded, ("/folder/" in direct_url or "#F!" in direct_url), base, out_dir)
                 elif direct_url and ("drive.google.com" in direct_url or "docs.google.com" in direct_url):
                     _set_state(message="Downloading via gdown...")
-                    dest_dir = os.path.join(out_dir, base)
+                    dest_dir = os.path.join(out_dir, "_dl")
                     os.makedirs(dest_dir, exist_ok=True)
 
                     try:
@@ -938,37 +1063,33 @@ def run_colab_worker():
                     except Exception:
                         _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", "gdown"])
 
-                    if "/folders/" in direct_url:
-                        cmd = [sys.executable, "-m", "gdown", "--folder", direct_url, "-O", dest_dir, "--remaining-ok"]
+                    names = set()
+                    is_folder = "/folders/" in direct_url
+                    if is_folder:
+                        _set_state(message="Membaca isi folder Drive...")
+                        def _list_folder():
+                            import gdown
+                            fl = gdown.download_folder(url=direct_url, skip_download=True, quiet=True, remaining_ok=True)
+                            return [os.path.basename(f.path) for f in (fl or [])]
+                        lst, _lerr = _with_timeout(_list_folder, 120)
+                        if lst:
+                            names = set(lst)
+                            _set_state(message=f"Folder berisi {len(names)} file")
+                        cmd = [sys.executable, "-m", "gdown", "-q", "--folder", direct_url, "-O", dest_dir, "--remaining-ok"]
                     else:
-                        cmd = [sys.executable, "-m", "gdown", "--fuzzy", direct_url, "-O", dest_dir + os.sep]
+                        cmd = [sys.executable, "-m", "gdown", "-q", "--fuzzy", direct_url, "-O", dest_dir + os.sep]
 
-                    r = subprocess.run(cmd, capture_output=True, text=True)
-
+                    r = _proc_run(cmd, dest_dir, names, base)
                     if r.returncode != 0:
                         dest, err = None, f"gdown error: {(r.stderr or r.stdout)[-300:]}"
                     else:
-                        downloaded = []
-                        for root, dirs, files in os.walk(dest_dir):
-                            for f in files:
-                                downloaded.append(os.path.join(root, f))
-                        
-                        if not downloaded:
-                            dest, err = None, "Folder Google Drive kosong atau gagal diunduh"
-                        elif "/folders/" in direct_url:
-                            # pertahankan struktur folder (tanpa zip); upload sebagai folder
-                            entries = os.listdir(dest_dir)
-                            if len(entries) == 1 and os.path.isdir(os.path.join(dest_dir, entries[0])):
-                                dest = os.path.join(dest_dir, entries[0])
-                            else:
-                                dest = dest_dir
-                        else:
-                            dest = os.path.join(out_dir, base)
-                            os.rename(downloaded[0], dest)
-                            ok, msg = _check_file(dest)
-                            if not ok:
-                                dest, err = None, msg
-
+                        downloaded = [os.path.join(r_, f_) for r_, _d, fs_ in os.walk(dest_dir) for f_ in fs_]
+                        dest, err = _finalize_dl(dest_dir, downloaded, is_folder, base, out_dir)
+                elif direct_url and "mediafire.com" in _host(direct_url) and not _host(direct_url).startswith("download"):
+                    _set_state(message="Mencari link MediaFire...")
+                    real_url, merr = _mediafire_direct(direct_url)
+                    if not real_url: dest, err = None, merr
+                    else: dest, err = _download_aria2(real_url, base, base, out_dir)
                 elif direct_url: 
                     dest, err = _download_aria2(direct_url, base, base, out_dir)
                 else: 
@@ -1024,6 +1145,11 @@ def run_colab_worker():
             # MEGA / Google Drive: jangan lewat yt-dlp (error 'bool'), langsung handler direct
             fname = "gdrive_download" if "google.com" in _h else "mega_download"
             formats = [{"index": 1, "name": fname, "size": 0, "format_id": "direct", "url": url}]
+        elif "mediafire.com" in _h and not _h.startswith("download"):
+            formats, merr = _mediafire_formats(url)
+            if not formats:
+                _fail(f"MediaFire: {merr}"[:400])
+                return None
         elif path_l.endswith(DIRECT_EXTS):
             fname = _safe_name(os.path.basename(urlparse(url).path)) or "download"
             formats = [{"index": 1, "name": fname, "size": 0, "format_id": "direct"}]
