@@ -16,3 +16,4 @@ mutagen
 Pillow
 beautifulsoup4
 mega.py
+gdown
