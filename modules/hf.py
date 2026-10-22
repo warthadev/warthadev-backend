@@ -1131,14 +1131,28 @@ async def cross_copy(request: HFCrossCopyRequest):
         if request.src_repo_id == request.dst_repo_id and src_path == dst_path:
             continue
 
-        copy_operations.append(
-            CommitOperationCopy(
-                src_path_in_repo=src_path,
-                path_in_repo=dst_path,
-                src_repo_id=request.src_repo_id,
-                src_repo_type=src_repo_type,
-            )
+        same_repo = (
+            request.src_repo_id == request.dst_repo_id
+            and src_repo_type == dst_repo_type
         )
+        if same_repo:
+            # HF menolak src_repo_id yang sama dengan repo tujuan
+            # ("Source and target must be different repositories").
+            copy_operations.append(
+                CommitOperationCopy(
+                    src_path_in_repo=src_path,
+                    path_in_repo=dst_path,
+                )
+            )
+        else:
+            copy_operations.append(
+                CommitOperationCopy(
+                    src_path_in_repo=src_path,
+                    path_in_repo=dst_path,
+                    src_repo_id=request.src_repo_id,
+                    src_repo_type=src_repo_type,
+                )
+            )
         target_map.append({
             "src_path": src_path,
             "dst_path": dst_path,
