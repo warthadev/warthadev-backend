@@ -153,6 +153,7 @@ class HFMoveFolderRequest(HFBulkRequest):
 
 class HFDeleteRequest(HFBulkRequest):
     paths: List[str]
+    ignore_missing: bool = False
 
     @validator("paths")
     def validate_paths(cls, v: List[str]) -> List[str]:
@@ -980,6 +981,29 @@ async def delete_files(request: HFDeleteRequest):
 
     try:
         from huggingface_hub import CommitOperationDelete
+
+        if request.ignore_missing:
+            # Dipakai untuk thumbs: tidak semua file punya thumb, dan satu path
+            # yang tidak ada bikin seluruh commit delete gagal. Filter dulu.
+            existing: set = set()
+            try:
+                infos = api.get_paths_info(
+                    repo_id=request.repo_id,
+                    paths=cleaned_paths,
+                    repo_type=repo_type,
+                )
+                existing = {
+                    (getattr(i, "path", "") or "").strip("/") for i in infos
+                }
+            except Exception as e:
+                logger.warning(f"delete ignore_missing: get_paths_info failed ({e}), fallback to tree listing")
+                wanted = {p.strip("/") for p in cleaned_paths}
+                for entry in _expand_src_paths(api, request.repo_id, repo_type, cleaned_paths):
+                    if entry["src_path"].strip("/") in wanted:
+                        existing.add(entry["src_path"].strip("/"))
+            cleaned_paths = [p for p in cleaned_paths if p.strip("/") in existing]
+            if not cleaned_paths:
+                return {"ok": True, "deleted": [], "count": 0, "message": "Nothing to delete"}
 
         operations = [CommitOperationDelete(path_in_repo=p) for p in cleaned_paths]
 
