@@ -110,6 +110,7 @@ class HFMoveBulkAnyRequest(HFBulkRequest):
     src_paths: List[str]
     dst_folder: str = ""
     base_path: str = ""
+    mirror_base_path: Optional[str] = None
 
     @validator("src_paths")
     def validate_src_paths(cls, v: List[str]) -> List[str]:
@@ -128,6 +129,12 @@ class HFMoveBulkAnyRequest(HFBulkRequest):
 
     @validator("base_path")
     def validate_base_path(cls, v: str) -> str:
+        if v is None:
+            return ""
+        return v.strip().strip("/")
+
+    @validator("mirror_base_path")
+    def validate_mirror_base_path(cls, v: str) -> str:
         if v is None:
             return ""
         return v.strip().strip("/")
@@ -695,6 +702,7 @@ async def move_bulk(request: HFMoveBulkAnyRequest):
     cleaned_paths = [_validate_path_security(p) for p in request.src_paths]
     dst_folder = _validate_path_security(request.dst_folder) if request.dst_folder else ""
     base_path = request.base_path or ""
+    mirror_base = request.mirror_base_path or ""
 
     if not cleaned_paths:
         raise HTTPException(400, "No valid src_paths")
@@ -715,21 +723,20 @@ async def move_bulk(request: HFMoveBulkAnyRequest):
         logger.error(f"Move-bulk: expand src paths failed: {e}")
         raise _hf_error_to_response(e)
 
-    if not expanded:
-        return {
-            "ok": True,
-            "moved": [],
-            "count": 0,
-            "skipped": cleaned_paths,
-            "message": "No matching files or folders found",
-        }
-
     operations = []
     target_map: List[Dict[str, Any]] = []
 
     for entry in expanded:
         src_path = entry["src_path"]
         rel_path = entry["rel_path"]
+
+        if mirror_base:
+            if src_path.startswith(mirror_base + "/"):
+                rel_path = src_path[len(mirror_base) + 1:]
+            elif src_path == mirror_base:
+                rel_path = os.path.basename(src_path)
+            else:
+                rel_path = src_path
 
         if dst_folder:
             dst_path = f"{dst_folder}/{rel_path}".strip("/")
