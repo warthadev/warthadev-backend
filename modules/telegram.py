@@ -555,11 +555,19 @@ async def get_chat_files(request: Request, chat_id: int, limit: int = None):
                     "date": int(msg.date.timestamp()) if msg.date else None,
                 }
                 new_files.append(file_data)
-                save_file(chat_id, msg.id, file_data)
+                try:
+                    save_file(chat_id, msg.id, file_data)
+                except Exception as e:
+                    print(f"[save_file] fail incremental {msg.id}: {e}")
         if not cached_files and not new_files:
-            full_files = await load_chat_files_full(client, chat_id, limit=limit)
+            scan_limit = limit if limit is not None else 300
+            full_files = await load_chat_files_full(client, chat_id, limit=scan_limit)
+            print(f"[get_chat_files] full_scan {chat_id}: {len(full_files)} files (limit={scan_limit})")
             for f in full_files:
-                save_file(chat_id, f["id"], f)
+                try:
+                    save_file(chat_id, f["id"], f)
+                except Exception as e:
+                    print(f"[save_file] fail full {f['id']}: {e}")
             total_size = sum(f["size"] for f in full_files)
             return {
                 "files": full_files,
@@ -603,7 +611,10 @@ async def refresh_chat_files(request: Request, chat_id: int):
     chat_has_files_cache.pop(cache_key, None)
     files = await load_chat_files_full(client, chat_id, limit=None)
     for f in files:
-        save_file(chat_id, f["id"], f)
+        try:
+            save_file(chat_id, f["id"], f)
+        except Exception as e:
+            print(f"[save_file] fail refresh {f['id']}: {e}")
     total_size = chat_total_size_cache.get(cache_key, 0)
     return {
         "files": files,
