@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-21-universal+torrent-sorted"
+WORKER_VERSION = "2026-10-31-universal+torrent-sorted-keepdash"
 
 def run_colab_worker():
     print(f"[universal] worker version: {WORKER_VERSION}")
@@ -277,15 +277,16 @@ def run_colab_worker():
         except Exception: pass
         return None
 
+    # ---- FILENAME HELPERS (tanda "-" dipertahankan, TIDAK diubah jadi "_") ----
     def _safe_name(name, fallback="download"):
         base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", unquote(str(name or "")))
-        base = re.sub(r"\s+", " ", base).strip().strip(".").replace("-", "_")
+        base = re.sub(r"\s+", " ", base).strip().strip(".")
         return (base or fallback)[:120]
 
     def _strip_ext(name): return re.sub(r"\.(mp4|mp3)$", "", str(name or ""), flags=re.IGNORECASE)
     def _base_from_item(name): return _safe_name(re.sub(r"\s*\(\w{2,5}\)\s*$", "", name or ""))
     def _display_name(item): return f"{item.get('name', '')} · {item.get('label')}" if item.get("label") else item.get("name", "")
-    def _video_base(name, label): return f"{_safe_name(name)[:105].replace('-', '_')} ({label})"
+    def _video_base(name, label): return f"{_safe_name(name)[:105]} ({label})"
 
     def _move_final(src, dst):
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
