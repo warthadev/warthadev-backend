@@ -1,4 +1,4 @@
-# main.py
+# /warthadev-backend/main.py
 import os
 import sys
 import time
@@ -41,7 +41,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent", "universal"]
+    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent", "universal", "agent"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:

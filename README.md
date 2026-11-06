@@ -31,3 +31,13 @@ FIREBASE_MESSAGING_SENDER_ID=""
 FIREBASE_APP_ID=""
 FIREBASE_MEASUREMENT_ID=""
 FIREBASE_SERVICE_ACCOUNT_JSON=""
+```
+
+### Agent Integration
+Required for authenticated multi-user model key storage and agent runtime requests.
+```env
+AGENT_ENCRYPTION_KEY=""
+AGENT_RUNTIME_URL="http://127.0.0.1:8788"
+AGENT_INTERNAL_API_KEY=""
+AGENT_TIMEOUT="210"
+```
