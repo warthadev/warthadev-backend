@@ -104,8 +104,9 @@ async def agent_models(authorization: str | None = Header(default=None)):
 
 @router.post("/chat")
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
-    user_id = _user_id(authorization)
-    email = _user_email(authorization)
+    claims = _claims(authorization)
+    user_id = str(claims["uid"])
+    email = str(claims.get("email") or "").strip().lower()
     provider = payload.provider.strip().lower()
     document = _key_doc(user_id, provider).get()
     server_managed = provider == "9router"
@@ -124,7 +125,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "")
     if not internal_key:
         raise HTTPException(status_code=500, detail="Agent runtime is not configured")
-    body = {"prompt": payload.prompt, "model": selected_model, "provider_api_key": provider_api_key, "user_email": email, "history": payload.history}
+    body = {"prompt": payload.prompt, "model": selected_model, "provider_api_key": provider_api_key, "user_email": email or user_id, "history": payload.history}
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
             response = await client.post(f"{agent_url}/v1/agent/run", headers={"X-Agent-Internal-Key": internal_key}, json=body)
