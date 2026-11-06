@@ -72,7 +72,7 @@ def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(
     user_id = _user_id(authorization)
     encrypted = _fernet().encrypt(payload.api_key.encode()).decode()
     _key_doc(user_id, payload.provider).set({"encryptedKey": encrypted, "model": payload.model, "fingerprint": _fingerprint(payload.api_key), "enabled": True}, merge=True)
-    return {"success": True, "provider": provider, "model": payload.model, "fingerprint": _fingerprint(payload.api_key)}
+    return {"success": True, "provider": payload.provider, "model": payload.model, "fingerprint": _fingerprint(payload.api_key)}
 
 @router.get("/keys")
 def list_agent_keys(authorization: str | None = Header(default=None)):
@@ -113,7 +113,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if not document.exists and not server_managed:
         raise HTTPException(status_code=404, detail="Provider key not found")
     data = document.to_dict() or {}
-    selected_model = payload.model or data.get("model")
+    selected_model = payload.model or data.get("model") or os.getenv("AGENT_DEFAULT_MODEL", "gemini/gemini-3.6-flash")
     _ensure_local_access(email, selected_model)
     provider_api_key = ""
     if document.exists:
