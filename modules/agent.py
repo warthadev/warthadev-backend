@@ -31,26 +31,41 @@ def _fernet() -> Fernet:
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Agent encryption key is invalid") from exc
 
-def _user_id(authorization: str | None) -> str:
+def _claims(authorization: str | None) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
         init_firestore()
         decoded = auth.verify_id_token(authorization[7:].strip())
-        uid = decoded.get("uid")
-        if not uid:
+        if not decoded.get("uid"):
             raise HTTPException(status_code=401, detail="Invalid authentication")
-        return uid
+        return decoded
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid authentication") from exc
+
+def _user_id(authorization: str | None) -> str:
+    return str(_claims(authorization)["uid"])
+
+def _user_email(authorization: str | None) -> str:
+    email = str(_claims(authorization).get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=403, detail="Verified email is required")
+    return email
 
 def _key_doc(user_id: str, provider: str):
     return init_firestore().collection("agent_users").document(user_id).collection("keys").document(provider)
 
 def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:12]
+
+def _is_local_model(model: str | None) -> bool:
+    return bool(model and model.strip().lower() == os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip().lower())
+
+def _ensure_local_access(email: str, model: str | None) -> None:
+    if _is_local_model(model) and email != os.getenv("AGENT_LOCAL_ALLOWED_EMAIL", "warthadev@gmail.com").strip().lower():
+        raise HTTPException(status_code=403, detail="Local agent access is restricted")
 
 @router.put("/keys")
 def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
@@ -74,10 +89,13 @@ def delete_agent_key(provider: str, authorization: str | None = Header(default=N
 @router.post("/chat")
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     user_id = _user_id(authorization)
+    email = _user_email(authorization)
     document = _key_doc(user_id, payload.provider).get()
     if not document.exists:
         raise HTTPException(status_code=404, detail="Provider key not found")
     data = document.to_dict() or {}
+    selected_model = payload.model or data.get("model")
+    _ensure_local_access(email, selected_model)
     try:
         provider_api_key = _fernet().decrypt(data["encryptedKey"].encode()).decode()
     except (KeyError, InvalidToken) as exc:
@@ -86,7 +104,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "")
     if not internal_key:
         raise HTTPException(status_code=500, detail="Agent runtime is not configured")
-    body = {"prompt": payload.prompt, "model": payload.model or data.get("model"), "provider_api_key": provider_api_key, "history": payload.history}
+    body = {"prompt": payload.prompt, "model": selected_model, "provider_api_key": provider_api_key, "user_email": email, "history": payload.history}
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
             response = await client.post(f"{agent_url}/v1/agent/run", headers={"X-Agent-Internal-Key": internal_key}, json=body)
