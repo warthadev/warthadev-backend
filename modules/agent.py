@@ -86,6 +86,22 @@ def delete_agent_key(provider: str, authorization: str | None = Header(default=N
     _key_doc(user_id, provider).delete()
     return {"success": True, "provider": provider}
 
+@router.get("/models")
+async def agent_models(authorization: str | None = Header(default=None)):
+    _claims(authorization)
+    agent_url = os.getenv("AGENT_RUNTIME_URL", "http://127.0.0.1:8788").rstrip("/")
+    internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "")
+    if not internal_key:
+        raise HTTPException(status_code=500, detail="Agent runtime is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
+            response = await client.get(f"{agent_url}/v1/models", headers={"X-Agent-Internal-Key": internal_key})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Agent runtime request failed")
+    return response.json()
+
 @router.post("/chat")
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     user_id = _user_id(authorization)
