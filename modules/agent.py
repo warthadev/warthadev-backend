@@ -72,7 +72,7 @@ def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(
     user_id = _user_id(authorization)
     encrypted = _fernet().encrypt(payload.api_key.encode()).decode()
     _key_doc(user_id, payload.provider).set({"encryptedKey": encrypted, "model": payload.model, "fingerprint": _fingerprint(payload.api_key), "enabled": True}, merge=True)
-    return {"success": True, "provider": payload.provider, "model": payload.model, "fingerprint": _fingerprint(payload.api_key)}
+    return {"success": True, "provider": provider, "model": payload.model, "fingerprint": _fingerprint(payload.api_key)}
 
 @router.get("/keys")
 def list_agent_keys(authorization: str | None = Header(default=None)):
@@ -90,16 +90,20 @@ def delete_agent_key(provider: str, authorization: str | None = Header(default=N
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     user_id = _user_id(authorization)
     email = _user_email(authorization)
-    document = _key_doc(user_id, payload.provider).get()
-    if not document.exists:
+    provider = payload.provider.strip().lower()
+    document = _key_doc(user_id, provider).get()
+    server_managed = provider == "9router"
+    if not document.exists and not server_managed:
         raise HTTPException(status_code=404, detail="Provider key not found")
     data = document.to_dict() or {}
     selected_model = payload.model or data.get("model")
     _ensure_local_access(email, selected_model)
-    try:
-        provider_api_key = _fernet().decrypt(data["encryptedKey"].encode()).decode()
-    except (KeyError, InvalidToken) as exc:
-        raise HTTPException(status_code=500, detail="Stored provider key is invalid") from exc
+    provider_api_key = ""
+    if document.exists:
+        try:
+            provider_api_key = _fernet().decrypt(data["encryptedKey"].encode()).decode()
+        except (KeyError, InvalidToken) as exc:
+            raise HTTPException(status_code=500, detail="Stored provider key is invalid") from exc
     agent_url = os.getenv("AGENT_RUNTIME_URL", "http://127.0.0.1:8788").rstrip("/")
     internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "")
     if not internal_key:
@@ -112,4 +116,4 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Agent runtime request failed")
-    return {"success": True, "userId": user_id, "provider": payload.provider, "data": response.json()}
+    return {"success": True, "userId": user_id, "provider": provider, "data": response.json()}
