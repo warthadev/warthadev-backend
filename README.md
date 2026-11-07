@@ -13,7 +13,7 @@ The backend is structured into distinct, independent routers to ensure high main
 | Telegram | `/telegram` | Telethon client wrapper, session validation, secure file streaming with HTTP Range requests, and Firestore metadata synchronization. |
 | Hugging Face | `/hf` | Comprehensive repository management including creation, deletion, renaming, file and folder movement/copying, cross account transfers, and history squashing. |
 | Proxy | `/proxy` | Media streaming proxy, direct file downloads, and Fernet based signed URL generation for integration with external media players. |
-| Token API | `/token` | Gemini API proxy for retrieving available models and validating API Keys. |
+| Token API | `/token` | AI Agent via 9Router untuk model aktif, termasuk model Gemini. |
 | Media Extractor | `/extract` | Direct video and audio link extraction using yt dlp, with a Cobalt API fallback for supported platforms. |
 
 ## Configuration

@@ -35,13 +35,12 @@ def get_frontend_config():
         },
         "features": {
             "telegram": bool(os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH")),
-            "gemini": bool(os.environ.get("GEMINI_API_KEY")),
         }
     }
 
 
 def load_modules(app_instance):
-    modules_to_load = ["telegram", "token_api", "proxy", "hf", "torrent", "universal", "agent", "router"]
+    modules_to_load = ["telegram", "proxy", "hf", "torrent", "universal", "agent", "router"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:

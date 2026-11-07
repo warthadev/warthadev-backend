@@ -113,7 +113,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if not document.exists and not server_managed:
         raise HTTPException(status_code=404, detail="Provider key not found")
     data = document.to_dict() or {}
-    selected_model = payload.model or data.get("model") or os.getenv("AGENT_DEFAULT_MODEL", "gemini/gemini-3.6-flash")
+    selected_model = payload.model or data.get("model") or os.getenv("AGENT_DEFAULT_MODEL", "mimo-v2.6:latest")
     _ensure_local_access(email, selected_model)
     provider_api_key = ""
     if document.exists:
