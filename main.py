@@ -111,7 +111,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "Range", "X-Telegram-Session"],
     expose_headers=[
         "Content-Range",
         "Accept-Ranges",
@@ -138,7 +138,7 @@ async def ensure_cors_headers(request: Request, call_next):
         if "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
             response.headers["Access-Control-Allow-Origin"] = origin if "*" not in ALLOWED_ORIGINS else "*"
             response.headers["Access-Control-Allow-Methods"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Range, X-Telegram-Session"
 
     return response
 
