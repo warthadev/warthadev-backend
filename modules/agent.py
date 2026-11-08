@@ -63,9 +63,22 @@ def _fingerprint(value: str) -> str:
 def _is_local_model(model: str | None) -> bool:
     return bool(model and model.strip().lower() == os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip().lower())
 
-def _ensure_local_access(email: str, model: str | None) -> None:
-    if _is_local_model(model) and email != os.getenv("AGENT_LOCAL_ALLOWED_EMAIL", "warthadev@gmail.com").strip().lower():
-        raise HTTPException(status_code=403, detail="Local agent access is restricted")
+def _ensure_local_access(user_id: str, model: str | None) -> None:
+    if not _is_local_model(model):
+        return
+    key_document = _key_doc(user_id, "9router").get()
+    key_data = key_document.to_dict() if key_document.exists else {}
+    if key_document.exists and not key_data.get("enabled", True):
+        raise HTTPException(status_code=403, detail="Local agent access requires a saved 9Router key")
+    encrypted_key = key_data.get("encryptedKey")
+    if isinstance(encrypted_key, str) and encrypted_key:
+        return
+    user_document = init_firestore().collection("users").document(user_id).get()
+    user_data = user_document.to_dict() if user_document.exists else {}
+    legacy_key = user_data.get("nineRouterApiKey")
+    if isinstance(legacy_key, str) and legacy_key.strip():
+        return
+    raise HTTPException(status_code=403, detail="Local agent access requires a saved 9Router key")
 
 @router.put("/keys")
 def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
@@ -114,9 +127,9 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         raise HTTPException(status_code=404, detail="Provider key not found")
     data = document.to_dict() or {}
     selected_model = payload.model or data.get("model") or os.getenv("AGENT_DEFAULT_MODEL", "mimo-v2.6:latest")
-    _ensure_local_access(email, selected_model)
+    _ensure_local_access(user_id, selected_model)
     provider_api_key = ""
-    if document.exists:
+    if document.exists and not _is_local_model(selected_model):
         try:
             provider_api_key = _fernet().decrypt(data["encryptedKey"].encode()).decode()
         except (KeyError, InvalidToken) as exc:
