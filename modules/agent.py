@@ -66,6 +66,8 @@ def _is_local_model(model: str | None) -> bool:
 def _ensure_local_access(user_id: str, model: str | None) -> None:
     if not _is_local_model(model):
         return
+    if os.getenv("AGENT_LOCAL_ACCESS_ALL_USERS", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        return
     key_document = _key_doc(user_id, "9router").get()
     key_data = key_document.to_dict() if key_document.exists else {}
     if key_document.exists and not key_data.get("enabled", True):
