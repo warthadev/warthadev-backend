@@ -13,7 +13,6 @@ from .firestore_storage import init_firestore
 from .router import UPSTREAM as ROUTER_UPSTREAM
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-LOCAL_MODEL_ALIAS = "openai-compatible-chat-0082e0a8-8fc6-41da-99d3-3c9f2f986404/mimo-v2.6:latest"
 
 
 class AgentKeyPayload(BaseModel):
@@ -161,13 +160,6 @@ async def _fetch_router_models(api_key: str) -> list[str]:
     return _extract_model_ids(payload)
 
 
-def _runtime_model(model: str) -> str:
-    local_model = os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip().lower()
-    normalized = model.strip().lower()
-    alias = os.getenv("AGENT_LOCAL_MODEL_ALIAS", LOCAL_MODEL_ALIAS).strip().lower()
-    return os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip() if normalized in {local_model, alias} else model
-
-
 def _agent_runtime_config() -> tuple[str, str]:
     runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip()
     if not runtime_url:
@@ -269,13 +261,10 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if selected_model not in available_models:
         raise HTTPException(status_code=403, detail="Model is not available for this account")
 
-    runtime_model = _runtime_model(selected_model)
-    local_model = os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip().lower()
-    provider_api_key = "" if runtime_model.strip().lower() == local_model else api_key
     body = {
         "prompt": payload.prompt,
-        "model": runtime_model,
-        "provider_api_key": provider_api_key,
+        "model": selected_model,
+        "provider_api_key": api_key,
         "user_email": str(claims.get("email") or user_id).strip().lower(),
         "history": payload.history,
     }

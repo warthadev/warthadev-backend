@@ -268,20 +268,57 @@ class AgentKeyIsolationTests(unittest.TestCase):
         runtime_call = next(call for call in StubAsyncClient.calls if call[0] == "POST")
         self.assertEqual(runtime_call[1], "https://runtime.example.test/v1/agent/run")
         self.assertEqual(runtime_call[2]["X-Agent-Internal-Key"], "internal-test-key")
+        self.assertEqual(runtime_call[3]["model"], "uid-a/allowed-model")
         self.assertEqual(runtime_call[3]["provider_api_key"], "private-key-for-a")
         self.assertNotIn("private-key-for-a", json.dumps(result))
 
-    def test_local_alias_is_canonicalized_only_after_catalog_authorization(self):
-        payload = agent.AgentChatPayload(prompt="hello", provider="9router", model=agent.LOCAL_MODEL_ALIAS)
+    def test_mimo_catalog_id_and_authenticated_users_key_reach_runtime_unchanged(self):
+        mimo_model_id = "openai-compatible-chat-test/mimo-v2.6:latest"
+        payload = agent.AgentChatPayload(prompt="mock-only", provider="9router", model=mimo_model_id)
         StubAsyncClient.post_handler = lambda _url, _headers, _body: FakeResponse({"success": True, "result": {"content": "ok"}})
         with patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": "uid-a@example.test"}), \
                 patch.object(agent, "_saved_key", return_value=("private-key-for-a", {})), \
-                patch.object(agent, "_fetch_router_models", return_value=[agent.LOCAL_MODEL_ALIAS]), \
+                patch.object(agent, "_fetch_router_models", return_value=[mimo_model_id]), \
                 patch.object(agent.httpx, "AsyncClient", StubAsyncClient):
             asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
         runtime_call = next(call for call in StubAsyncClient.calls if call[0] == "POST")
-        self.assertEqual(runtime_call[3]["model"], "mimo-v2.6:latest")
-        self.assertEqual(runtime_call[3]["provider_api_key"], "")
+        self.assertEqual(runtime_call[1], "https://runtime.example.test/v1/agent/run")
+        self.assertEqual(runtime_call[3]["model"], mimo_model_id)
+        self.assertEqual(runtime_call[3]["provider_api_key"], "private-key-for-a")
+
+    def test_chat_routes_local_and_cloud_catalog_models_with_isolated_account_keys(self):
+        selected_models = {
+            "uid-a": "openai-compatible-chat-test/mimo-v2.6:latest",
+            "uid-b": "google/gemini-test",
+        }
+        account_keys = {
+            "uid-a": "private-key-for-a",
+            "uid-b": "private-key-for-b",
+        }
+
+        def claims_for_token(authorization):
+            uid = (authorization or "").removeprefix("Bearer ")
+            return {"uid": uid, "email": f"{uid}@example.test"}
+
+        def models_for_key(api_key):
+            uid = "uid-a" if api_key == account_keys["uid-a"] else "uid-b"
+            return [selected_models[uid]]
+
+        def key_for_uid(uid, provider):
+            self.assertEqual(provider, "9router")
+            return account_keys[uid], {}
+
+        with patch.object(agent, "_claims", side_effect=claims_for_token), \
+                patch.object(agent, "_saved_key", side_effect=key_for_uid), \
+                patch.object(agent, "_fetch_router_models", side_effect=models_for_key), \
+                patch.object(agent.httpx, "AsyncClient", StubAsyncClient):
+            for uid, model in selected_models.items():
+                payload = agent.AgentChatPayload(prompt="mock-only", provider="9router", model=model)
+                asyncio.run(agent.agent_chat(payload, f"Bearer {uid}"))
+
+        runtime_calls = [call for call in StubAsyncClient.calls if call[0] == "POST"]
+        self.assertEqual([call[3]["model"] for call in runtime_calls], list(selected_models.values()))
+        self.assertEqual([call[3]["provider_api_key"] for call in runtime_calls], list(account_keys.values()))
 
 
 if __name__ == "__main__":
