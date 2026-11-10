@@ -1,6 +1,8 @@
 # /warthadev-backend/modules/agent.py
 import hashlib
+import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -13,6 +15,7 @@ from .firestore_storage import init_firestore
 from .router import UPSTREAM as ROUTER_UPSTREAM
 
 router = APIRouter(prefix="/agent", tags=["agent"])
+logger = logging.getLogger(__name__)
 
 
 class AgentKeyPayload(BaseModel):
@@ -177,6 +180,24 @@ def _agent_runtime_config() -> tuple[str, str]:
     return runtime_url.rstrip("/"), internal_key
 
 
+def _log_runtime_http_error(response: httpx.Response, elapsed_ms: int) -> None:
+    """Log bounded response metadata only; never log runtime request/response bodies."""
+    headers = response.headers
+    content_type = " ".join(str(headers.get("content-type", "")).split())[:120] or "unknown"
+    identifiers = {}
+    for name in ("x-request-id", "cf-ray", "via", "server"):
+        value = " ".join(str(headers.get(name, "")).split())[:200]
+        if value:
+            identifiers[name] = value
+    logger.warning(
+        "Agent runtime HTTP error status=%d elapsed_ms=%d content_type=%r identifiers=%r",
+        response.status_code,
+        elapsed_ms,
+        content_type,
+        identifiers,
+    )
+
+
 @router.put("/keys")
 def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
@@ -270,13 +291,16 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     }
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
+            request_started = time.perf_counter()
             response = await client.post(
                 f"{agent_url}/v1/agent/run",
                 headers={"X-Agent-Internal-Key": internal_key},
                 json=body,
             )
+            elapsed_ms = int((time.perf_counter() - request_started) * 1000)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
     if response.status_code >= 400:
+        _log_runtime_http_error(response, elapsed_ms)
         raise HTTPException(status_code=502, detail="Agent runtime request failed")
     return {"success": True, "userId": user_id, "provider": provider, "data": response.json()}

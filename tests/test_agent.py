@@ -55,10 +55,11 @@ class FakeDatabase:
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None, text=""):
         self._payload = payload
         self.status_code = status_code
-        self.text = ""
+        self.headers = headers or {}
+        self.text = text
 
     def json(self):
         return self._payload
@@ -285,6 +286,55 @@ class AgentKeyIsolationTests(unittest.TestCase):
         self.assertEqual(runtime_call[1], "https://runtime.example.test/v1/agent/run")
         self.assertEqual(runtime_call[3]["model"], mimo_model_id)
         self.assertEqual(runtime_call[3]["provider_api_key"], "private-key-for-a")
+
+    def test_runtime_http_error_logs_only_safe_response_metadata(self):
+        sensitive_prompt = "private-prompt-marker"
+        sensitive_key = "private-provider-key-marker"
+        sensitive_email = "private-user@example.test"
+        sensitive_body = "private-upstream-body-marker"
+        payload = agent.AgentChatPayload(prompt=sensitive_prompt, provider="9router", model="uid-a/allowed-model")
+        StubAsyncClient.post_handler = lambda _url, _headers, _body: FakeResponse(
+            {"error": sensitive_body},
+            502,
+            headers={
+                "content-type": "application/json",
+                "x-request-id": "request-123",
+                "cf-ray": "ray-456",
+                "via": "edge-proxy",
+                "server": "runtime-proxy",
+                "authorization": "private-authorization-marker",
+                "x-api-key": "private-header-key-marker",
+                "x-user-email": sensitive_email,
+            },
+            text=sensitive_body,
+        )
+        with patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": sensitive_email}), \
+                patch.object(agent, "_saved_key", return_value=(sensitive_key, {})), \
+                patch.object(agent, "_fetch_router_models", return_value=["uid-a/allowed-model"]), \
+                patch.object(agent.httpx, "AsyncClient", StubAsyncClient):
+            with self.assertLogs(agent.logger, level="WARNING") as captured:
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail, "Agent runtime request failed")
+        log_text = "\n".join(captured.output)
+        self.assertIn("status=502", log_text)
+        self.assertRegex(log_text, r"elapsed_ms=\d+")
+        self.assertIn("application/json", log_text)
+        for safe_identifier in ("request-123", "ray-456", "edge-proxy", "runtime-proxy"):
+            self.assertIn(safe_identifier, log_text)
+        for sensitive_value in (
+            sensitive_prompt,
+            sensitive_key,
+            sensitive_email,
+            sensitive_body,
+            "private-authorization-marker",
+            "private-header-key-marker",
+            "internal-test-key",
+        ):
+            self.assertNotIn(sensitive_value, log_text)
+        self.assertNotIn(sensitive_body, raised.exception.detail)
 
     def test_chat_routes_local_and_cloud_catalog_models_with_isolated_account_keys(self):
         selected_models = {
