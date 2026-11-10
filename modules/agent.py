@@ -143,6 +143,15 @@ async def _fetch_router_models(api_key: str) -> list[str]:
 
     if response.status_code in (401, 403):
         raise HTTPException(status_code=401, detail="9Router rejected the saved API key")
+    if response.status_code == 409:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        upstream_error = error_payload.get("error") if isinstance(error_payload, dict) else None
+        error_code = upstream_error.get("code") if isinstance(upstream_error, dict) else None
+        if error_code == "machine_cooldown":
+            raise HTTPException(status_code=503, detail="Server 9Router sedang cooldown. Katalog model akan tersedia lagi setelah server aktif.")
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="9Router model catalog request failed")
     try:

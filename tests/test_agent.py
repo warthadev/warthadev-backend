@@ -211,6 +211,15 @@ class AgentKeyIsolationTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 401)
         self.assertNotIn("private-key-for-a", raised.exception.detail)
 
+    def test_router_cooldown_has_a_specific_user_facing_message(self):
+        StubAsyncClient.get_handler = lambda _url, _headers: FakeResponse({"error": {"code": "machine_cooldown"}}, 409)
+        with patch.object(agent.httpx, "AsyncClient", StubAsyncClient):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(agent._fetch_router_models("private-key-for-a"))
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("sedang cooldown", raised.exception.detail)
+        self.assertNotIn("private-key-for-a", raised.exception.detail)
+
     def test_chat_rejects_a_model_not_in_the_signed_in_users_catalog(self):
         payload = agent.AgentChatPayload(prompt="hello", provider="9router", model="uid-b/private-model")
         with patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": "uid-a@example.test"}), \
