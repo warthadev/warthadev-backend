@@ -111,7 +111,7 @@ class AgentKeyIsolationTests(unittest.TestCase):
         StubAsyncClient.calls = []
         StubAsyncClient.get_handler = None
         StubAsyncClient.post_handler = None
-        self.env_patch = patch.dict(os.environ, {"AGENT_ENCRYPTION_KEY": self.fernet_key, "AGENT_INTERNAL_API_KEY": "internal-test-key"})
+        self.env_patch = patch.dict(os.environ, {"AGENT_ENCRYPTION_KEY": self.fernet_key, "AGENT_INTERNAL_API_KEY": "internal-test-key", "AGENT_RUNTIME_URL": "https://runtime.example.test"})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
 
@@ -232,6 +232,30 @@ class AgentKeyIsolationTests(unittest.TestCase):
         self.assertIn("not available for this account", raised.exception.detail)
         self.assertEqual(StubAsyncClient.calls, [])
 
+    def test_chat_requires_runtime_url_before_fetching_models(self):
+        payload = agent.AgentChatPayload(prompt="hello", provider="9router", model="uid-a/allowed-model")
+        with patch.dict(os.environ, {"AGENT_RUNTIME_URL": ""}), \
+                patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": "uid-a@example.test"}), \
+                patch.object(agent, "_saved_key", return_value=("private-key-for-a", {})), \
+                patch.object(agent, "_fetch_router_models") as fetch_models:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Agent runtime URL is not configured")
+        fetch_models.assert_not_called()
+        self.assertEqual(StubAsyncClient.calls, [])
+
+    def test_chat_requires_internal_runtime_key(self):
+        payload = agent.AgentChatPayload(prompt="hello", provider="9router", model="uid-a/allowed-model")
+        with patch.dict(os.environ, {"AGENT_INTERNAL_API_KEY": ""}), \
+                patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": "uid-a@example.test"}), \
+                patch.object(agent, "_saved_key", return_value=("private-key-for-a", {})):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Agent runtime internal API key is not configured")
+        self.assertEqual(StubAsyncClient.calls, [])
+
     def test_chat_passes_only_the_authenticated_users_key_after_model_validation(self):
         payload = agent.AgentChatPayload(prompt="hello", provider="9router", model="uid-a/allowed-model")
         StubAsyncClient.post_handler = lambda _url, _headers, _body: FakeResponse({"success": True, "result": {"content": "ok"}})
@@ -242,6 +266,8 @@ class AgentKeyIsolationTests(unittest.TestCase):
             result = asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
         self.assertTrue(result["success"])
         runtime_call = next(call for call in StubAsyncClient.calls if call[0] == "POST")
+        self.assertEqual(runtime_call[1], "https://runtime.example.test/v1/agent/run")
+        self.assertEqual(runtime_call[2]["X-Agent-Internal-Key"], "internal-test-key")
         self.assertEqual(runtime_call[3]["provider_api_key"], "private-key-for-a")
         self.assertNotIn("private-key-for-a", json.dumps(result))
 

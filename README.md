@@ -34,9 +34,10 @@ FIREBASE_SERVICE_ACCOUNT_JSON=""
 ```
 
 ### Agent Integration
-Required for authenticated multi-user model key storage and agent runtime requests.
+Required for authenticated multi-user model key storage and agent runtime requests. `AGENT_RUNTIME_URL` must always be set explicitly; the localhost example is for local development only. In production, use the runtime's reachable published URL.
 ```env
 AGENT_ENCRYPTION_KEY=""
+# Local development only; production must point to the deployed runtime.
 AGENT_RUNTIME_URL="http://127.0.0.1:8788"
 AGENT_INTERNAL_API_KEY=""
 AGENT_TIMEOUT="210"

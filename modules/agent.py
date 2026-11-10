@@ -168,6 +168,23 @@ def _runtime_model(model: str) -> str:
     return os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip() if normalized in {local_model, alias} else model
 
 
+def _agent_runtime_config() -> tuple[str, str]:
+    runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip()
+    if not runtime_url:
+        raise HTTPException(status_code=500, detail="Agent runtime URL is not configured")
+    try:
+        parsed_url = httpx.URL(runtime_url)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Agent runtime URL is invalid") from exc
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.host:
+        raise HTTPException(status_code=500, detail="Agent runtime URL is invalid")
+
+    internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "").strip()
+    if not internal_key:
+        raise HTTPException(status_code=500, detail="Agent runtime internal API key is not configured")
+    return runtime_url.rstrip("/"), internal_key
+
+
 @router.put("/keys")
 def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
@@ -247,6 +264,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
 
+    agent_url, internal_key = _agent_runtime_config()
     available_models = await _fetch_router_models(api_key)
     if selected_model not in available_models:
         raise HTTPException(status_code=403, detail="Model is not available for this account")
@@ -254,10 +272,6 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     runtime_model = _runtime_model(selected_model)
     local_model = os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip().lower()
     provider_api_key = "" if runtime_model.strip().lower() == local_model else api_key
-    agent_url = os.getenv("AGENT_RUNTIME_URL", "http://127.0.0.1:8788").rstrip("/")
-    internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "")
-    if not internal_key:
-        raise HTTPException(status_code=500, detail="Agent runtime is not configured")
     body = {
         "prompt": payload.prompt,
         "model": runtime_model,
