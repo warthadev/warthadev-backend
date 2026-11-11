@@ -370,6 +370,23 @@ class AgentKeyIsolationTests(unittest.TestCase):
         self.assertEqual([call[3]["model"] for call in runtime_calls], list(selected_models.values()))
         self.assertEqual([call[3]["provider_api_key"] for call in runtime_calls], list(account_keys.values()))
 
+    def test_only_explicit_runtime_capacity_statuses_are_forwarded_safely(self):
+        payload = agent.AgentChatPayload(prompt="private-prompt-marker", provider="9router", model="uid-a/allowed-model")
+        for status_code, expected_detail in (
+                (429, "Agent runtime rate limit (429)"),
+                (503, "Agent runtime temporarily unavailable (503)")):
+            with self.subTest(status_code=status_code):
+                StubAsyncClient.post_handler = lambda _url, _headers, _body: FakeResponse(
+                    {"detail": "private-response-body-marker"}, status_code, text="private-response-body-marker")
+                with patch.object(agent, "_claims", return_value={"uid": "uid-a", "email": "uid-a@example.test"}), \
+                        patch.object(agent, "_saved_key", return_value=("private-key-for-a", {})), \
+                        patch.object(agent, "_fetch_router_models", return_value=["uid-a/allowed-model"]), \
+                        patch.object(agent.httpx, "AsyncClient", StubAsyncClient):
+                    with self.assertLogs(agent.logger, level="WARNING") as captured:
+                        with self.assertRaises(HTTPException) as raised:
+                            asyncio.run(agent.agent_chat(payload, "Bearer uid-a"))
+                self.assertEqual((raised.exception.status_code, raised.exception.detail), (status_code, expected_detail))
+                self.assertNotIn("private-response-body-marker", "\n".join(captured.output))
 
 if __name__ == "__main__":
     unittest.main()

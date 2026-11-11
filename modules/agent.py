@@ -302,5 +302,9 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
     if response.status_code >= 400:
         _log_runtime_http_error(response, elapsed_ms)
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Agent runtime rate limit (429)")
+        if response.status_code == 503:
+            raise HTTPException(status_code=503, detail="Agent runtime temporarily unavailable (503)")
         raise HTTPException(status_code=502, detail="Agent runtime request failed")
     return {"success": True, "userId": user_id, "provider": provider, "data": response.json()}
