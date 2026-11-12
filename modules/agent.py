@@ -137,20 +137,47 @@ def _saved_key(user_id: str, provider: str) -> tuple[str, dict[str, Any]] | None
     return api_key, data
 
 
-def _extract_model_ids(payload: Any) -> list[str]:
-    """Extract only model IDs from OpenAI-compatible catalog response shapes."""
+def _extract_models(payload: Any) -> list[dict[str, Any]]:
+    """Extract model IDs and supported capability metadata from catalog responses."""
     if isinstance(payload, list):
-        result: list[str] = []
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for item in payload:
             if isinstance(item, str) and item.strip():
-                result.append(item.strip())
+                model_id = item.strip()
+                model = {"id": model_id}
             elif isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
-                result.append(item["id"].strip())
-        return list(dict.fromkeys(result))
+                model_id = item["id"].strip()
+                model = {"id": model_id}
+                sources = [
+                    source for source in (item.get("capabilities"), item, item.get("limits"))
+                    if isinstance(source, dict)
+                ]
+                safe_capabilities: dict[str, Any] = {}
+                for name in ("reasoning", "thinkingCanDisable", "vision", "tools"):
+                    value = next((source[name] for source in sources if name in source), None)
+                    if isinstance(value, bool):
+                        safe_capabilities[name] = value
+                limit_aliases = {
+                    "contextLength": ("contextLength", "context_length", "contextWindow", "context_window"),
+                    "maxOutputTokens": ("maxOutputTokens", "max_output_tokens", "maxCompletionTokens", "max_completion_tokens"),
+                }
+                for normalized_name, aliases in limit_aliases.items():
+                    value = next((source[key] for source in sources for key in aliases if key in source), None)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        safe_capabilities[normalized_name] = value
+                if safe_capabilities:
+                    model["capabilities"] = safe_capabilities
+            else:
+                continue
+            if model_id not in seen:
+                seen.add(model_id)
+                result.append(model)
+        return result
     if isinstance(payload, dict):
         for key in ("data", "models", "result"):
             if key in payload:
-                found = _extract_model_ids(payload[key])
+                found = _extract_models(payload[key])
                 if found or isinstance(payload[key], (list, dict)):
                     return found
     return []
@@ -161,7 +188,7 @@ def _router_models_url() -> str:
     return f"{upstream}/models"
 
 
-async def _fetch_router_models(api_key: str) -> list[str]:
+async def _fetch_router_models(api_key: str) -> list[dict[str, Any]]:
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "45"))) as client:
             response = await client.get(
@@ -188,7 +215,7 @@ async def _fetch_router_models(api_key: str) -> list[str]:
         payload = response.json()
     except ValueError as exc:
         raise HTTPException(status_code=502, detail="9Router returned an invalid model catalog") from exc
-    return _extract_model_ids(payload)
+    return _extract_models(payload)
 
 
 def _agent_runtime_config() -> tuple[str, str]:
@@ -308,7 +335,8 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
 
     agent_url, internal_key = _agent_runtime_config()
     available_models = await _fetch_router_models(api_key)
-    if selected_model not in available_models:
+    available_model_ids = {model["id"] for model in available_models}
+    if selected_model not in available_model_ids:
         raise HTTPException(status_code=403, detail="Model is not available for this account")
 
     body = {
