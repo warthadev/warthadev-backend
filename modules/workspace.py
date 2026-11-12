@@ -64,14 +64,27 @@ def _claims(authorization: str | None) -> dict[str, Any]:
 
 @functools.lru_cache(maxsize=1)
 def _verified_owner_uid() -> str:
-    """Resolve the fixed owner account to a Firebase UID, never from request data."""
+    """Resolve the explicitly pinned owner UID and fail closed on identity mismatch."""
+    configured_uid = os.getenv("AGENT_OWNER_UID", "").strip()
+    if not configured_uid:
+        logger.warning("Owner UID is not configured")
+        return ""
     try:
         init_firestore()
-        configured_uid = os.getenv("AGENT_OWNER_UID", "").strip()
-        record = auth.get_user(configured_uid) if configured_uid else auth.get_user_by_email(OWNER_EMAIL)
-        if (record.email or "").strip().lower() != OWNER_EMAIL or not record.email_verified:
+        record = auth.get_user(configured_uid)
+        record_uid = str(getattr(record, "uid", "") or "").strip()
+        if record_uid != configured_uid or bool(getattr(record, "disabled", False)):
             return ""
-        return record.uid
+        provider_data = getattr(record, "provider_data", None) or ()
+        has_expected_google_identity = any(
+            str(getattr(provider, "provider_id", "") or "").strip() == "google.com"
+            and str(getattr(provider, "email", "") or "").strip().lower() == OWNER_EMAIL
+            for provider in provider_data
+        )
+        if not has_expected_google_identity:
+            logger.warning("Configured owner UID does not match the expected Google identity")
+            return ""
+        return configured_uid
     except Exception as exc:
         logger.warning("Owner UID is unavailable (%s)", type(exc).__name__)
         return ""
@@ -79,12 +92,11 @@ def _verified_owner_uid() -> str:
 
 def is_owner_claims(claims: dict[str, Any]) -> bool:
     uid = str(claims.get("uid") or "")
-    email = str(claims.get("email") or "").strip().lower()
+    owner_uid = _verified_owner_uid()
     return bool(
         uid
-        and uid == _verified_owner_uid()
-        and email == OWNER_EMAIL
-        and claims.get("email_verified") is True
+        and owner_uid
+        and uid == owner_uid
     )
 
 
@@ -122,7 +134,10 @@ async def runtime_request(
 ) -> dict[str, Any]:
     runtime_url, internal_key = _runtime_config()
     headers = _identity_headers(claims, internal_key)
-    body = {"uid": str(claims["uid"]), **(payload or {})}
+    body_payload = dict(payload or {})
+    for identity_field in ("uid", "user_uid", "role", "owner_uid", "is_owner"):
+        body_payload.pop(identity_field, None)
+    body = {"uid": str(claims["uid"]), **body_payload}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(f"{runtime_url}{path}", headers=headers, json=body)
