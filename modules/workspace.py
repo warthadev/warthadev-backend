@@ -239,6 +239,20 @@ async def admin_update_local_model(payload: LocalModelPayload, authorization: st
     return await runtime_request("/v1/workspace/admin/models/local", claims, payload=payload.model_dump())
 
 
+@router.get("/admin/host/files")
+async def list_owner_host_files(path: str = Query(default="/", max_length=2048), authorization: str | None = Header(default=None)):
+    claims = _claims(authorization)
+    _require_owner(claims)
+    return await runtime_request("/v1/workspace/owner/list", claims, payload={"path": path})
+
+
+@router.get("/admin/host/file")
+async def read_owner_host_file(path: str = Query(..., min_length=1, max_length=2048), authorization: str | None = Header(default=None)):
+    claims = _claims(authorization)
+    _require_owner(claims)
+    return await runtime_request("/v1/workspace/owner/read", claims, payload={"path": path})
+
+
 @router.post("/host-actions/confirm")
 async def confirm_host_action(payload: HostActionConfirmationPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
