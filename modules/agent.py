@@ -35,6 +35,8 @@ class AgentChatPayload(BaseModel):
     prompt: str = Field(min_length=1)
     provider: str = Field(min_length=1, max_length=80)
     model: str | None = Field(default=None, max_length=200)
+    web_search: bool = False
+    search_query: str = Field(default="", max_length=500)
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     images: list[AgentImagePayload] = Field(default_factory=list)
 
@@ -311,6 +313,8 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     body = {
         "prompt": payload.prompt,
         "model": selected_model,
+        "web_search": payload.web_search,
+        "search_query": payload.search_query.strip() if payload.web_search else "",
         "provider_api_key": api_key,
         "user_email": str(claims.get("email") or user_id).strip().lower(),
         "history": payload.history,
