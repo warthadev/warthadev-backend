@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from .firestore_storage import init_firestore
 from .router import UPSTREAM as ROUTER_UPSTREAM
+from .workspace import _verified_owner_uid, is_owner_claims, runtime_request
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
@@ -218,6 +219,18 @@ async def _fetch_router_models(api_key: str) -> list[dict[str, Any]]:
     return _extract_models(payload)
 
 
+async def _local_model_ids(claims: dict[str, Any]) -> list[str]:
+    """Return only model IDs registered in this user's supervisor inventory."""
+    try:
+        inventory = await runtime_request("/v1/workspace/models/local", claims)
+    except HTTPException:
+        return []
+    raw_models = inventory.get("models", [])
+    if not isinstance(raw_models, list):
+        return []
+    return list(dict.fromkeys(model.strip() for model in raw_models if isinstance(model, str) and model.strip()))
+
+
 def _agent_runtime_config() -> tuple[str, str]:
     runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip()
     if not runtime_url:
@@ -309,11 +322,14 @@ async def agent_models(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
     saved = _saved_key(user_id, "9router")
-    if saved is None:
-        return {"configured": False, "models": []}
-    api_key, _ = saved
-    models = await _fetch_router_models(api_key)
-    return {"configured": True, "models": models}
+    local_model_ids = await _local_model_ids(claims)
+    models = await _fetch_router_models(saved[0]) if saved is not None else []
+    existing = {model.get("id") for model in models if isinstance(model, dict)}
+    for model_id in local_model_ids:
+        if model_id not in existing:
+            models.append({"id": model_id, "capabilities": {"local": True}})
+            existing.add(model_id)
+    return {"configured": saved is not None, "models": models}
 
 
 @router.post("/chat")
@@ -325,19 +341,25 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if provider != "9router":
         raise HTTPException(status_code=400, detail="Unsupported agent provider")
 
-    saved = _saved_key(user_id, provider)
-    if saved is None:
-        raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
-    api_key, _ = saved
     selected_model = (payload.model or "").strip()
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
 
+    local_model_ids = set(await _local_model_ids(claims))
+    if selected_model in local_model_ids:
+        api_key = ""
+    else:
+        saved = _saved_key(user_id, provider)
+        if saved is None:
+            raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
+        api_key, _ = saved
+
     agent_url, internal_key = _agent_runtime_config()
-    available_models = await _fetch_router_models(api_key)
-    available_model_ids = {model["id"] for model in available_models}
-    if selected_model not in available_model_ids:
-        raise HTTPException(status_code=403, detail="Model is not available for this account")
+    if selected_model not in local_model_ids:
+        available_models = await _fetch_router_models(api_key)
+        available_model_ids = {model["id"] for model in available_models}
+        if selected_model not in available_model_ids:
+            raise HTTPException(status_code=403, detail="Model is not available for this account")
 
     body = {
         "prompt": payload.prompt,
@@ -347,15 +369,23 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         "timezone": payload.timezone.strip() or "Asia/Jakarta",
         "provider_api_key": api_key,
         "user_email": str(claims.get("email") or user_id).strip().lower(),
+        "user_uid": user_id,
         "history": payload.history,
         "images": images,
+    }
+    owner_uid = _verified_owner_uid()
+    runtime_headers = {
+        "X-Agent-Internal-Key": internal_key,
+        "X-Agent-User-UID": user_id,
+        "X-Agent-User-Role": "owner" if is_owner_claims(claims) else "user",
+        "X-Agent-Owner-UID": owner_uid,
     }
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
             request_started = time.perf_counter()
             response = await client.post(
                 f"{agent_url}/v1/agent/run",
-                headers={"X-Agent-Internal-Key": internal_key},
+                headers=runtime_headers,
                 json=body,
             )
             elapsed_ms = int((time.perf_counter() - request_started) * 1000)
