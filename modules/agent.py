@@ -1,4 +1,6 @@
 # /warthadev-backend/modules/agent.py
+import base64
+import binascii
 import hashlib
 import logging
 import os
@@ -24,11 +26,34 @@ class AgentKeyPayload(BaseModel):
     model: str = Field(min_length=1, max_length=200)
 
 
+class AgentImagePayload(BaseModel):
+    mime_type: str = Field(min_length=1, max_length=32)
+    data: str = Field(min_length=1)
+
+
 class AgentChatPayload(BaseModel):
-    prompt: str = Field(min_length=1, max_length=24000)
+    prompt: str = Field(min_length=1)
     provider: str = Field(min_length=1, max_length=80)
     model: str | None = Field(default=None, max_length=200)
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
+    images: list[AgentImagePayload] = Field(default_factory=list)
+
+
+def _validate_chat_images(images: list[AgentImagePayload]) -> list[dict[str, str]]:
+    validated: list[dict[str, str]] = []
+    for image in images:
+        mime_type = image.mime_type.strip().lower()
+        encoded = image.data
+        if not mime_type.startswith("image/") or not encoded:
+            raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Image MIME type and data are required"})
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "An image payload is not valid base64"}) from exc
+        if not decoded:
+            raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Image data cannot be empty"})
+        validated.append({"mime_type": mime_type, "data": encoded})
+    return validated
 
 
 def _fernet() -> Fernet:
@@ -264,6 +289,7 @@ async def agent_models(authorization: str | None = Header(default=None)):
 @router.post("/chat")
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
+    images = _validate_chat_images(payload.images)
     user_id = str(claims["uid"])
     provider = payload.provider.strip().lower()
     if provider != "9router":
@@ -288,6 +314,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         "provider_api_key": api_key,
         "user_email": str(claims.get("email") or user_id).strip().lower(),
         "history": payload.history,
+        "images": images,
     }
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
@@ -302,6 +329,17 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
     if response.status_code >= 400:
         _log_runtime_http_error(response, elapsed_ms)
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = None
+        detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
+        if isinstance(detail, dict) and detail.get("code") == "vision_unsupported":
+            message = detail.get("message")
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "vision_unsupported", "message": message if isinstance(message, str) else "This model does not support image input"},
+            )
         if response.status_code == 429:
             raise HTTPException(status_code=429, detail="Agent runtime rate limit (429)")
         if response.status_code == 503:
