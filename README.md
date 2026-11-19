@@ -1,21 +1,27 @@
-# Wartha Sensei Chat Backend
+## Wartha Sensei Backend API
 
-A FastAPI backend for authenticated, text-only chat. The public API contains only health/root/config endpoints and the `/chat` contract; agent runtime, workspace, media, download, Telegram, Hugging Face, and token routes are not loaded.
+Backend infrastructure for the Wartha Sensei platform, a comprehensive all in one web application providing cloud management, universal media downloading, and AI tools. Engineered with FastAPI and deployed via Docker on Hugging Face Spaces.
 
-## Chat API
+## Core Architecture
 
-All `/chat` endpoints require `Authorization: Bearer <Firebase ID token>`.
+The backend is structured into distinct, independent routers to ensure high maintainability and separation of concerns:
 
-- `GET /chat/credentials` returns `{configured, model, fingerprint}`.
-- `PUT /chat/credentials` accepts `{api_key, model}` and returns `{success, model, fingerprint}`.
-- `DELETE /chat/credentials` disables the current encrypted credential document.
-- `GET /chat/models` returns `{configured, models:[{id}]}` from the upstream model catalog.
-- `POST /chat/completions` accepts standard OpenAI text-chat JSON and returns the upstream OpenAI response. `stream:true`, tool/function fields, multimodal content, and unsupported message roles are rejected.
-
-Credentials are encrypted with `AGENT_ENCRYPTION_KEY` and stored per Firebase UID under `agent_users/{uid}/keys/9router`. Existing `users/{uid}` legacy `nineRouterApiKey`/`nineRouterModel` values are read and migrated into the encrypted document without deleting the legacy fields.
+| Module | Endpoint Prefix | Capabilities |
+| :--- | :--- | :--- |
+| Torrent | `/torrent` | Metadata extraction via aria2c, Google Colab session orchestration, real time progress tracking, and data synchronization. |
+| Universal | `/universal` | Orchestration of universal media downloads via Google Colab. Supports extraction from YouTube, Instagram, TikTok, Twitter, Facebook, direct media URLs, and HLS/DASH streams. |
+| Telegram | `/telegram` | Telethon client wrapper, session validation, secure file streaming with HTTP Range requests, and Firestore metadata synchronization. |
+| Hugging Face | `/hf` | Comprehensive repository management including creation, deletion, renaming, file and folder movement/copying, cross account transfers, and history squashing. |
+| Proxy | `/proxy` | Media streaming proxy, direct file downloads, and Fernet based signed URL generation for integration with external media players. |
+| Token API | `/token` | AI Agent via 9Router untuk model aktif, termasuk model Gemini. |
+| Media Extractor | `/extract` | Direct video and audio link extraction using yt dlp, with a Cobalt API fallback for supported platforms. |
 
 ## Configuration
 
+The following environment variables must be configured in the deployment environment:
+
+### Firebase Integration
+Required for authentication and database operations.
 ```env
 FIREBASE_API_KEY=""
 FIREBASE_AUTH_DOMAIN=""
@@ -25,9 +31,14 @@ FIREBASE_MESSAGING_SENDER_ID=""
 FIREBASE_APP_ID=""
 FIREBASE_MEASUREMENT_ID=""
 FIREBASE_SERVICE_ACCOUNT_JSON=""
-AGENT_ENCRYPTION_KEY=""
-ROUTER_UPSTREAM="https://20128-agq2firibhstlf6sr7k3ydjoim.instabox.tech/v1"
-ALLOWED_ORIGINS="*"
 ```
 
-`GET /config` exposes Firebase client configuration only. `GET /health` and `GET /` are unauthenticated readiness endpoints.
+### Agent Integration
+Required for authenticated multi-user model key storage and agent runtime requests. `AGENT_RUNTIME_URL` must always be set explicitly; the localhost example is for local development only. In production, use the runtime's reachable published URL.
+```env
+AGENT_ENCRYPTION_KEY=""
+# Local development only; production must point to the deployed runtime.
+AGENT_RUNTIME_URL="http://127.0.0.1:8788"
+AGENT_INTERNAL_API_KEY=""
+AGENT_TIMEOUT="210"
+```
