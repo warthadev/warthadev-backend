@@ -71,54 +71,47 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
         images_patch.start()
         self.addCleanup(images_patch.stop)
 
-    async def test_models_returns_local_inventory_without_saved_router_key(self):
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=["mimo-v2.6:latest"]))
+    async def test_models_without_key_are_empty_and_never_read_local_inventory(self):
         key_patch = patch.object(agent, "_saved_key", return_value=None)
         catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
-        with patch.object(agent, "_claims", return_value=self.claims), local_patch, key_patch, catalog_patch as fetch_catalog:
+        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
+        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch as fetch_catalog, inventory_patch as inventory:
             response = await agent.agent_models("Bearer firebase-token")
 
         self.assertFalse(response["configured"])
-        self.assertEqual(response["models"], [{"id": "mimo-v2.6:latest", "capabilities": {"local": True}}])
+        self.assertEqual(response["models"], [])
         fetch_catalog.assert_not_awaited()
+        inventory.assert_not_awaited()
 
-    async def test_models_combines_account_catalog_and_local_inventory(self):
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=["mimo-v2.6:latest"]))
+    async def test_models_return_only_the_account_9router_catalog(self):
         key_patch = patch.object(agent, "_saved_key", return_value=("user-router-key", {}))
         catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-a"}]))
-        with patch.object(agent, "_claims", return_value=self.claims), local_patch, key_patch, catalog_patch:
+        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
+        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch, inventory_patch as inventory:
             response = await agent.agent_models("Bearer firebase-token")
 
         self.assertTrue(response["configured"])
-        self.assertEqual({model["id"] for model in response["models"]}, {"cloud/model-a", "mimo-v2.6:latest"})
+        self.assertEqual(response["models"], [{"id": "cloud/model-a"}])
+        inventory.assert_not_awaited()
 
-    async def test_registered_local_chat_needs_no_router_key(self):
-        await self._patch_runtime()
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=["mimo-v2.6:latest"]))
-        key_patch = patch.object(agent, "_saved_key", side_effect=AssertionError("local path must not load a router key"))
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(side_effect=AssertionError("local path must not query cloud catalog")))
-        with local_patch, key_patch, catalog_patch:
-            response = await agent.agent_chat(self._payload("mimo-v2.6:latest"), "Bearer firebase-token")
-
-        self.assertTrue(response["success"])
-        self.assertEqual(_RuntimeClient.requests[0]["json"]["provider_api_key"], "")
-        self.assertEqual(_RuntimeClient.requests[0]["json"]["user_uid"], self.claims["uid"])
-
-    async def test_unregistered_local_named_model_is_not_a_keyless_bypass(self):
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=[]))
+    async def test_legacy_local_model_without_router_key_is_rejected(self):
         key_patch = patch.object(agent, "_saved_key", return_value=None)
-        with patch.object(agent, "_claims", return_value=self.claims), local_patch, key_patch:
+        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
+        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
+        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch as fetch_catalog, inventory_patch as inventory:
             with self.assertRaises(HTTPException) as raised:
                 await agent.agent_chat(self._payload("mimo-v2.6:latest"), "Bearer firebase-token")
 
         self.assertEqual(raised.exception.status_code, 403)
+        fetch_catalog.assert_not_awaited()
+        inventory.assert_not_awaited()
+        self.assertEqual(_RuntimeClient.requests, [])
 
     async def test_cloud_chat_uses_this_users_key_and_requires_catalog_membership(self):
         await self._patch_runtime()
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=[]))
         key_patch = patch.object(agent, "_saved_key", return_value=("this-users-key", {"model": "cloud/model-a"}))
         catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-a"}]))
-        with local_patch, key_patch as load_key, catalog_patch as fetch_catalog:
+        with key_patch as load_key, catalog_patch as fetch_catalog:
             response = await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
 
         self.assertTrue(response["success"])
@@ -128,10 +121,9 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cloud_chat_without_key_or_outside_catalog_is_rejected(self):
         await self._patch_runtime()
-        local_patch = patch.object(agent, "_local_model_ids", new=AsyncMock(return_value=[]))
         key_patch = patch.object(agent, "_saved_key", return_value=None)
-        fetch_catalog = patch.object(agent, "_fetch_router_models", new=AsyncMock())
-        with local_patch, key_patch, fetch_catalog as fetch:
+        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
+        with key_patch, catalog_patch as fetch:
             with self.assertRaises(HTTPException) as raised:
                 await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
         self.assertEqual(raised.exception.status_code, 403)
@@ -139,7 +131,7 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
 
         key_patch = patch.object(agent, "_saved_key", return_value=("this-users-key", {}))
         catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-b"}]))
-        with local_patch, key_patch, catalog_patch:
+        with key_patch, catalog_patch:
             with self.assertRaises(HTTPException) as raised:
                 await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
         self.assertEqual(raised.exception.status_code, 403)

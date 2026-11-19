@@ -219,18 +219,6 @@ async def _fetch_router_models(api_key: str) -> list[dict[str, Any]]:
     return _extract_models(payload)
 
 
-async def _local_model_ids(claims: dict[str, Any]) -> list[str]:
-    """Return only model IDs registered in this user's supervisor inventory."""
-    try:
-        inventory = await runtime_request("/v1/workspace/models/local", claims)
-    except HTTPException:
-        return []
-    raw_models = inventory.get("models", [])
-    if not isinstance(raw_models, list):
-        return []
-    return list(dict.fromkeys(model.strip() for model in raw_models if isinstance(model, str) and model.strip()))
-
-
 def _agent_runtime_config() -> tuple[str, str]:
     runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip()
     if not runtime_url:
@@ -322,13 +310,7 @@ async def agent_models(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
     saved = _saved_key(user_id, "9router")
-    local_model_ids = await _local_model_ids(claims)
     models = await _fetch_router_models(saved[0]) if saved is not None else []
-    existing = {model.get("id") for model in models if isinstance(model, dict)}
-    for model_id in local_model_ids:
-        if model_id not in existing:
-            models.append({"id": model_id, "capabilities": {"local": True}})
-            existing.add(model_id)
     return {"configured": saved is not None, "models": models}
 
 
@@ -345,21 +327,16 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
 
-    local_model_ids = set(await _local_model_ids(claims))
-    if selected_model in local_model_ids:
-        api_key = ""
-    else:
-        saved = _saved_key(user_id, provider)
-        if saved is None:
-            raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
-        api_key, _ = saved
+    saved = _saved_key(user_id, provider)
+    if saved is None:
+        raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
+    api_key, _ = saved
 
     agent_url, internal_key = _agent_runtime_config()
-    if selected_model not in local_model_ids:
-        available_models = await _fetch_router_models(api_key)
-        available_model_ids = {model["id"] for model in available_models}
-        if selected_model not in available_model_ids:
-            raise HTTPException(status_code=403, detail="Model is not available for this account")
+    available_models = await _fetch_router_models(api_key)
+    available_model_ids = {model["id"] for model in available_models}
+    if selected_model not in available_model_ids:
+        raise HTTPException(status_code=403, detail="Model is not available for this account")
 
     body = {
         "prompt": payload.prompt,
@@ -368,6 +345,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         "search_query": payload.search_query.strip() if payload.web_search else "",
         "timezone": payload.timezone.strip() or "Asia/Jakarta",
         "provider_api_key": api_key,
+        # Older runtime versions still require this field during a rolling deploy.
         "user_email": str(claims.get("email") or user_id).strip().lower(),
         "user_uid": user_id,
         "history": payload.history,
