@@ -232,6 +232,15 @@ def _saved_openrouter_credentials(user_id: str) -> tuple[str, dict[str, Any]] | 
     return api_key, record
 
 
+async def _read_router_response(content: Any) -> bytes:
+    body = bytearray()
+    async for chunk in content.iter_chunked(64 * 1024):
+        body.extend(chunk)
+        if len(body) > MAX_ROUTER_RESPONSE_BYTES:
+            raise HTTPException(status_code=502, detail="OpenRouter response exceeded the size limit")
+    return bytes(body)
+
+
 async def _router_request(
     method: str,
     base_url: str,
@@ -257,9 +266,7 @@ async def _router_request(
             ) as response:
                 if 300 <= response.status < 400:
                     raise HTTPException(status_code=502, detail="OpenRouter redirects are not allowed")
-                body = await response.content.read(MAX_ROUTER_RESPONSE_BYTES + 1)
-                if len(body) > MAX_ROUTER_RESPONSE_BYTES:
-                    raise HTTPException(status_code=502, detail="OpenRouter response exceeded the size limit")
+                body = await _read_router_response(response.content)
                 return RouterHTTPResponse(status_code=response.status, body=body)
     except HTTPException:
         raise

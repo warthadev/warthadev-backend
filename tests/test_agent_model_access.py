@@ -146,6 +146,21 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("redirects are not allowed", raised.exception.detail)
 
+    async def test_response_reader_joins_stream_chunks_and_enforces_limit(self):
+        class Content:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            async def iter_chunked(self, _chunk_size):
+                for chunk in self.chunks:
+                    yield chunk
+
+        result = await agent._read_router_response(Content([b'{"da', b'ta":', b'[]}']))
+        self.assertEqual(json.loads(result), {"data": []})
+        with patch.object(agent, "MAX_ROUTER_RESPONSE_BYTES", 4), self.assertRaises(HTTPException) as raised:
+            await agent._read_router_response(Content([b"123", b"45"]))
+        self.assertEqual(raised.exception.status_code, 502)
+
     async def test_key_validation_uses_authenticated_endpoint_and_checks_response(self):
         with patch.object(agent, "_router_request", return_value=agent.RouterHTTPResponse(
             status_code=200, body=b'{"data":{"label":"valid"}}'
