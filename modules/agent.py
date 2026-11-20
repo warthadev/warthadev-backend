@@ -366,6 +366,19 @@ async def _fetch_openrouter_models(api_key: str) -> list[dict[str, Any]]:
     return _extract_free_openrouter_models(payload)
 
 
+async def _verify_openrouter_authentication(api_key: str) -> None:
+    # The public models endpoint returns 200 even for invalid keys, so it cannot
+    # authenticate a credential. /key requires an accepted API key.
+    response = await _router_request("GET", OPENROUTER_API_BASE_URL, "key", api_key)
+    _raise_router_http_error(response, "key verification")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="OpenRouter returned invalid key metadata") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise HTTPException(status_code=502, detail="OpenRouter returned invalid key metadata")
+
+
 def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | list[dict[str, Any]]:
     if not images:
         return prompt
@@ -471,8 +484,9 @@ async def verify_openrouter_key(authorization: str | None = Header(default=None)
     if saved is None:
         raise HTTPException(status_code=403, detail="Save this account's OpenRouter API key before verifying it")
     api_key, _ = saved
+    await _verify_openrouter_authentication(api_key)
     models = await _fetch_openrouter_models(api_key)
-    # Remove only this user's former 9Router data, and only after OpenRouter accepts the key.
+    # Remove only this user's former 9Router data after authenticated verification and catalog success.
     _delete_legacy_router_config(user_id)
     return {"success": True, "provider": OPENROUTER_PROVIDER, "freeModelCount": len(models)}
 

@@ -146,6 +146,23 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("redirects are not allowed", raised.exception.detail)
 
+    async def test_key_validation_uses_authenticated_endpoint_and_checks_response(self):
+        with patch.object(agent, "_router_request", return_value=agent.RouterHTTPResponse(
+            status_code=200, body=b'{"data":{"label":"valid"}}'
+        )) as request:
+            await agent._verify_openrouter_authentication("key-a")
+        request.assert_awaited_once_with("GET", agent.OPENROUTER_API_BASE_URL, "key", "key-a")
+
+        for response in (
+            agent.RouterHTTPResponse(status_code=401, body=b'{}'),
+            agent.RouterHTTPResponse(status_code=200, body=b'{}'),
+            agent.RouterHTTPResponse(status_code=200, body=b'not-json'),
+        ):
+            with self.subTest(status=response.status_code, body=response.body), patch.object(
+                agent, "_router_request", return_value=response
+            ), self.assertRaises(HTTPException):
+                await agent._verify_openrouter_authentication("invalid-key")
+
     async def test_only_openrouter_provider_is_supported(self):
         for provider in ("openai", "9router"):
             with self.subTest(provider=provider), self.assertRaises(HTTPException) as raised:

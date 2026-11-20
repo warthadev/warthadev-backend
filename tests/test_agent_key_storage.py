@@ -263,8 +263,17 @@ class AgentKeyUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(api_key, str(user_data))
 
         with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
-            agent, "_fetch_openrouter_models", side_effect=HTTPException(status_code=401, detail="invalid")
-        ):
+            agent, "_verify_openrouter_authentication", side_effect=HTTPException(status_code=401, detail="invalid")
+        ), patch.object(agent, "_fetch_openrouter_models") as fetch_models:
+            with self.assertRaises(HTTPException):
+                await agent.verify_openrouter_key("Bearer firebase-token")
+            fetch_models.assert_not_awaited()
+        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
+        self.assertEqual(self._user_data("user-a")["nineRouterApiKey"], old_router_key)
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", return_value=None
+        ), patch.object(agent, "_fetch_openrouter_models", side_effect=HTTPException(status_code=503, detail="unavailable")):
             with self.assertRaises(HTTPException):
                 await agent.verify_openrouter_key("Bearer firebase-token")
         self.assertIn("9router", self._user_data("user-a")["agentKeys"])
@@ -272,7 +281,7 @@ class AgentKeyUpdateTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
             agent, "_fetch_openrouter_models", return_value=[{"id": "free-model:free"}]
-        ):
+        ), patch.object(agent, "_verify_openrouter_authentication", return_value=None):
             verified = await agent.verify_openrouter_key("Bearer firebase-token")
         self.assertEqual(verified["freeModelCount"], 1)
         user_data = self._user_data("user-a")
