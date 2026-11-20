@@ -1,30 +1,36 @@
 # /warthadev-backend/modules/agent.py
+import asyncio
 import base64
 import binascii
 import hashlib
+import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
-import httpx
+import aiohttp
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Header, HTTPException
 from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
 from .agent_prompt import DEFAULT_SYSTEM_INSTRUCTION
+from .agent_ssrf import RouterTarget, make_pinned_connector, validate_router_base_url
 from .firestore_storage import init_firestore
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
 ROUTER_PROVIDER = "9router"
+MAX_ROUTER_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class AgentKeyPayload(BaseModel):
     provider: str = Field(min_length=1, max_length=80)
-    api_key: str = Field(min_length=1, max_length=500)
-    # Accepted for compatibility with older clients; model choice is now per chat.
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str | None = Field(default=None, max_length=500)
+    # Accepted for compatibility with older clients; model choice is per chat.
     model: str | None = Field(default=None, max_length=200)
 
 
@@ -43,6 +49,18 @@ class AgentChatPayload(BaseModel):
     timezone: str = Field(default="Asia/Jakarta", max_length=64)
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     images: list[AgentImagePayload] = Field(default_factory=list, max_length=12)
+
+
+@dataclass(frozen=True)
+class RouterHTTPResponse:
+    status_code: int
+    body: bytes
+
+    def json(self) -> Any:
+        try:
+            return json.loads(self.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid JSON") from exc
 
 
 def _validate_chat_images(images: list[AgentImagePayload]) -> list[dict[str, str]]:
@@ -100,7 +118,7 @@ def _normalize_provider(provider: str) -> str:
     if not re.fullmatch(r"[a-z0-9_-]{1,80}", normalized):
         raise HTTPException(status_code=400, detail="Invalid provider")
     if normalized != ROUTER_PROVIDER:
-        raise HTTPException(status_code=400, detail="Only per-account 9Router API keys are supported")
+        raise HTTPException(status_code=400, detail="Only per-account 9Router URLs and API keys are supported")
     return normalized
 
 
@@ -127,6 +145,7 @@ def _get_key_record(user_id: str, provider: str) -> dict[str, Any] | None:
     if isinstance(encrypted_key, str) and encrypted_key:
         record = {
             "encryptedKey": encrypted_key,
+            "baseUrl": str(legacy_data.get("baseUrl") or ""),
             "model": str(legacy_data.get("model") or ""),
             "fingerprint": str(legacy_data.get("fingerprint") or ""),
             "enabled": bool(legacy_data.get("enabled", True)),
@@ -150,6 +169,7 @@ def _get_key_record(user_id: str, provider: str) -> dict[str, Any] | None:
     model = legacy_model.strip() if isinstance(legacy_model, str) and legacy_model.strip() else ""
     record = {
         "encryptedKey": _fernet().encrypt(normalized_key.encode()).decode(),
+        "baseUrl": "",
         "model": model,
         "fingerprint": _fingerprint(normalized_key),
         "enabled": True,
@@ -178,7 +198,7 @@ def _delete_key_record(user_id: str, provider: str) -> None:
     _legacy_key_doc(user_id, provider).delete()
 
 
-def _saved_router_key(user_id: str) -> tuple[str, dict[str, Any]] | None:
+def _saved_router_credentials(user_id: str) -> tuple[str, str, dict[str, Any]] | None:
     record = _get_key_record(user_id, ROUTER_PROVIDER)
     if not isinstance(record, dict) or not record.get("enabled", True):
         return None
@@ -189,55 +209,61 @@ def _saved_router_key(user_id: str) -> tuple[str, dict[str, Any]] | None:
         api_key = _fernet().decrypt(encrypted_key.encode()).decode()
     except (InvalidToken, ValueError) as exc:
         raise HTTPException(status_code=500, detail="Stored 9Router key is invalid") from exc
-    return api_key, record
+    base_url = record.get("baseUrl")
+    return str(base_url or ""), api_key, record
 
 
-def _router_base_url() -> str:
-    """Require an explicitly approved HTTPS 9Router endpoint; never fall back to an old host."""
-    value = os.getenv("AGENT_9ROUTER_BASE_URL", "").strip()
-    if not value:
-        raise HTTPException(status_code=503, detail="No approved 9Router endpoint is configured for this deployment")
-    try:
-        parsed = httpx.URL(value)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="The configured 9Router endpoint is invalid") from exc
-    if parsed.scheme != "https" or not parsed.host or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise HTTPException(status_code=503, detail="The configured 9Router endpoint must be an HTTPS base URL")
-    return value.rstrip("/")
-
-
-def _router_url(endpoint: str) -> str:
-    return f"{_router_base_url()}/{endpoint.lstrip('/')}"
+def _require_router_base_url(base_url: str) -> str:
+    if not base_url.strip():
+        raise HTTPException(status_code=400, detail="Add this account's 9Router base URL in Settings")
+    return base_url
 
 
 async def _router_request(
     method: str,
+    base_url: str,
     endpoint: str,
     api_key: str,
     json_body: dict[str, Any] | None = None,
-) -> httpx.Response:
-    url = _router_url(endpoint)
+) -> RouterHTTPResponse:
+    target: RouterTarget = await validate_router_base_url(base_url)
+    url = f"{target.base_url}/{endpoint.lstrip('/')}"
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     if json_body is not None:
         headers["Content-Type"] = "application/json"
     try:
-        async with httpx.AsyncClient(
-            timeout=float(os.getenv("AGENT_TIMEOUT", "90")),
-            follow_redirects=False,
-        ) as client:
-            return await client.request(method, url, headers=headers, json=json_body)
-    except httpx.HTTPError as exc:
+        connector = make_pinned_connector(target)
+        timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "90")))
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as client:
+            async with client.request(
+                method,
+                url,
+                headers=headers,
+                json=json_body,
+                allow_redirects=False,
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise HTTPException(status_code=502, detail="9Router redirects are not allowed")
+                body = await response.content.read(MAX_ROUTER_RESPONSE_BYTES + 1)
+                if len(body) > MAX_ROUTER_RESPONSE_BYTES:
+                    raise HTTPException(status_code=502, detail="9Router response exceeded the size limit")
+                return RouterHTTPResponse(status_code=response.status, body=body)
+    except HTTPException:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         logger.warning("9Router request failed endpoint=%s error=%s", endpoint, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="9Router is unavailable") from exc
+        raise HTTPException(status_code=502, detail="This account's 9Router endpoint is unavailable") from exc
 
 
-def _raise_router_http_error(response: httpx.Response, action: str) -> None:
+def _raise_router_http_error(response: RouterHTTPResponse, action: str) -> None:
+    if 300 <= response.status_code < 400:
+        raise HTTPException(status_code=502, detail="9Router redirects are not allowed")
     if response.status_code in (401, 403):
-        raise HTTPException(status_code=401, detail="9Router rejected the saved API key or model access")
+        raise HTTPException(status_code=401, detail="9Router rejected this account's API key or model access")
     if response.status_code == 429:
         raise HTTPException(status_code=429, detail="9Router rate limit (429)")
     if response.status_code in (502, 503, 504):
-        raise HTTPException(status_code=503, detail="9Router is temporarily unavailable")
+        raise HTTPException(status_code=503, detail="This account's 9Router is temporarily unavailable")
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"9Router {action} request failed ({response.status_code})")
 
@@ -285,8 +311,8 @@ def _extract_models(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-async def _fetch_router_models(api_key: str) -> list[dict[str, Any]]:
-    response = await _router_request("GET", "models", api_key)
+async def _fetch_router_models(base_url: str, api_key: str) -> list[dict[str, Any]]:
+    response = await _router_request("GET", base_url, "models", api_key)
     _raise_router_http_error(response, "model catalog")
     try:
         payload = response.json()
@@ -341,21 +367,32 @@ def _completion_text(payload: Any) -> tuple[str, dict[str, Any]]:
 
 
 @router.put("/keys")
-def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
+async def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
     provider = _normalize_provider(payload.provider)
-    api_key = payload.api_key.strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="A 9Router API key is required")
+    target = await validate_router_base_url(payload.base_url)
+    previous_record = _get_key_record(user_id, provider)
+    normalized_key = payload.api_key.strip() if isinstance(payload.api_key, str) else ""
+
+    if normalized_key:
+        encrypted_key = _fernet().encrypt(normalized_key.encode()).decode()
+        fingerprint = _fingerprint(normalized_key)
+    elif isinstance(previous_record, dict) and isinstance(previous_record.get("encryptedKey"), str):
+        encrypted_key = previous_record["encryptedKey"]
+        fingerprint = str(previous_record.get("fingerprint") or "")
+    else:
+        raise HTTPException(status_code=400, detail="A 9Router API key is required for this account")
+
     record = {
-        "encryptedKey": _fernet().encrypt(api_key.encode()).decode(),
-        "model": payload.model.strip() if isinstance(payload.model, str) else "",
-        "fingerprint": _fingerprint(api_key),
+        "encryptedKey": encrypted_key,
+        "baseUrl": target.base_url,
+        "model": payload.model.strip() if isinstance(payload.model, str) else str((previous_record or {}).get("model") or ""),
+        "fingerprint": fingerprint,
         "enabled": True,
     }
     _set_key_record(user_id, provider, record)
-    return {"success": True, "provider": provider, "fingerprint": record["fingerprint"]}
+    return {"success": True, "provider": provider, "baseUrl": target.base_url, "fingerprint": fingerprint}
 
 
 @router.get("/keys")
@@ -369,6 +406,7 @@ def list_agent_keys(authorization: str | None = Header(default=None)):
         "configured": bool(record.get("enabled", True)),
         "keys": [{
             "provider": ROUTER_PROVIDER,
+            "baseUrl": str(record.get("baseUrl") or ""),
             "enabled": bool(record.get("enabled", True)),
             "fingerprint": str(record.get("fingerprint") or ""),
         }],
@@ -388,11 +426,11 @@ def delete_agent_key(provider: str, authorization: str | None = Header(default=N
 async def agent_models(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    saved = _saved_router_key(user_id)
+    saved = _saved_router_credentials(user_id)
     if saved is None:
         return {"configured": False, "provider": ROUTER_PROVIDER, "models": []}
-    api_key, _ = saved
-    models = await _fetch_router_models(api_key)
+    base_url, api_key, _ = saved
+    models = await _fetch_router_models(_require_router_base_url(base_url), api_key)
     return {"configured": True, "provider": ROUTER_PROVIDER, "models": models}
 
 
@@ -405,13 +443,14 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     selected_model = (payload.model or "").strip()
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
-    saved = _saved_router_key(user_id)
+    saved = _saved_router_credentials(user_id)
     if saved is None:
-        raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
-    api_key, _ = saved
-    available_models = await _fetch_router_models(api_key)
+        raise HTTPException(status_code=403, detail="A 9Router URL and API key are not configured for this account")
+    base_url, api_key, _ = saved
+    base_url = _require_router_base_url(base_url)
+    available_models = await _fetch_router_models(base_url, api_key)
     if selected_model not in {model["id"] for model in available_models}:
-        raise HTTPException(status_code=403, detail="Model is not available to this 9Router API key")
+        raise HTTPException(status_code=403, detail="Model is not available to this account's 9Router key")
 
     request_body = {
         "model": selected_model,
@@ -419,7 +458,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         "temperature": 0.2,
         "stream": False,
     }
-    response = await _router_request("POST", "chat/completions", api_key, request_body)
+    response = await _router_request("POST", base_url, "chat/completions", api_key, request_body)
     _raise_router_http_error(response, "chat")
     try:
         upstream_payload = response.json()
