@@ -142,21 +142,20 @@ class AgentKeyStorageTests(unittest.TestCase):
         self.assertEqual(agent._fernet().decrypt(stored_b["encryptedKey"].encode()).decode(), api_key_b)
         self.assertNotIn("agent_users", self.database.data)
 
-    def test_gateway_provider_key_is_encrypted_in_the_same_user_document(self):
-        api_key = "provider-secret-for-user-a"
-        agent._set_key_record("user-a", "gateway", {
-            "provider": "openai",
+    def test_router_key_is_encrypted_in_the_same_user_document(self):
+        api_key = "9router-secret-for-user-a"
+        agent._set_key_record("user-a", "9router", {
             "encryptedKey": agent._fernet().encrypt(api_key.encode()).decode(),
             "fingerprint": agent._fingerprint(api_key),
             "enabled": True,
         })
 
-        saved = agent._saved_gateway("user-a")
+        saved = agent._saved_router_key("user-a")
         data = self._user_data("user-a")
         self.assertEqual(saved[0], api_key)
-        self.assertEqual(saved[1], "openai")
         self.assertNotIn(api_key, str(data))
-        self.assertEqual(data["agentKeys"]["gateway"]["provider"], "openai")
+        self.assertIn("9router", data["agentKeys"])
+        self.assertNotIn("gateway", data["agentKeys"])
         self.assertNotIn("agent_users", self.database.data)
 
     def test_legacy_plaintext_field_is_encrypted_and_cleared_on_access(self):

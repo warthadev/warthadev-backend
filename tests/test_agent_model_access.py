@@ -1,13 +1,14 @@
+import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from modules import agent
 
 
-class _ProviderResponse:
+class _RouterResponse:
     status_code = 200
     headers = {}
 
@@ -18,7 +19,7 @@ class _ProviderResponse:
         return self.payload
 
 
-class _ProviderClient:
+class _RouterClient:
     requests: list[dict] = []
 
     def __init__(self, *args, **kwargs):
@@ -35,8 +36,8 @@ class _ProviderClient:
         key = headers["Authorization"].removeprefix("Bearer ")
         if method == "GET":
             model_id = {"key-a": "model-a", "key-b": "model-b"}.get(key, "model-default")
-            return _ProviderResponse({"data": [{"id": model_id}]})
-        return _ProviderResponse({
+            return _RouterResponse({"data": [{"id": model_id}]})
+        return _RouterResponse({
             "model": json["model"],
             "choices": [{"message": {"content": "Mock answer"}}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
@@ -47,9 +48,9 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
     claims = {"uid": "user-a", "email": "user@example.com", "email_verified": True}
 
     def setUp(self):
-        _ProviderClient.requests = []
+        _RouterClient.requests = []
 
-    def _payload(self, model: str, provider: str = "openai"):
+    def _payload(self, model: str, provider: str = "9router"):
         return SimpleNamespace(
             prompt="hello",
             provider=provider,
@@ -61,80 +62,87 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
             images=[],
         )
 
-    def _patch_provider(self):
-        stack = patch.object(agent.httpx, "AsyncClient", _ProviderClient)
+    def _patch_router(self):
+        stack = patch.object(agent.httpx, "AsyncClient", _RouterClient)
         stack.start()
         self.addCleanup(stack.stop)
 
-    async def test_models_without_key_are_empty_and_never_read_local_inventory(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=None):
+    def _router_env(self):
+        return patch.dict(os.environ, {"AGENT_9ROUTER_BASE_URL": "https://router.example/v1"})
+
+    async def test_models_without_key_are_empty_and_never_call_router(self):
+        self._patch_router()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_router_key", return_value=None):
             response = await agent.agent_models("Bearer firebase-token")
 
         self.assertFalse(response["configured"])
         self.assertEqual(response["models"], [])
-        self.assertEqual(_ProviderClient.requests, [])
+        self.assertEqual(_RouterClient.requests, [])
 
-    async def test_catalog_is_fetched_with_each_accounts_own_key(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
+    async def test_catalog_is_fetched_with_each_accounts_own_9router_key(self):
+        self._patch_router()
+        with self._router_env(), patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(agent, "_saved_router_key", return_value=("key-a", {})):
             response = await agent.agent_models("Bearer firebase-token")
         self.assertTrue(response["configured"])
-        self.assertEqual(response["provider"], "openai")
+        self.assertEqual(response["provider"], "9router")
         self.assertEqual(response["models"], [{"id": "model-a"}])
-        self.assertEqual(_ProviderClient.requests[-1]["headers"]["Authorization"], "Bearer key-a")
+        self.assertEqual(_RouterClient.requests[-1]["headers"]["Authorization"], "Bearer key-a")
 
-        with patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_gateway", return_value=("key-b", "deepseek", {})):
+        with self._router_env(), patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_router_key", return_value=("key-b", {})):
             other_response = await agent.agent_models("Bearer firebase-token")
-        self.assertEqual(other_response["provider"], "deepseek")
         self.assertEqual(other_response["models"], [{"id": "model-b"}])
-        self.assertEqual(_ProviderClient.requests[-1]["headers"]["Authorization"], "Bearer key-b")
+        self.assertEqual(_RouterClient.requests[-1]["headers"]["Authorization"], "Bearer key-b")
+
+    async def test_catalog_fails_closed_without_an_approved_endpoint(self):
+        self._patch_router()
+        with patch.dict(os.environ, {"AGENT_9ROUTER_BASE_URL": ""}), patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_router_key", return_value=("key-a", {})):
+            with self.assertRaises(HTTPException) as raised:
+                await agent.agent_models("Bearer firebase-token")
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("No approved 9Router endpoint", raised.exception.detail)
+        self.assertEqual(_RouterClient.requests, [])
 
     async def test_chat_without_key_is_rejected(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=None):
+        self._patch_router()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_router_key", return_value=None):
             with self.assertRaises(HTTPException) as raised:
                 await agent.agent_chat(self._payload("model-a"), "Bearer firebase-token")
 
         self.assertEqual(raised.exception.status_code, 403)
-        self.assertEqual(_ProviderClient.requests, [])
+        self.assertEqual(_RouterClient.requests, [])
 
-    async def test_chat_uses_account_key_only_in_provider_auth_header(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
+    async def test_chat_uses_account_key_and_only_chat_fields(self):
+        self._patch_router()
+        with self._router_env(), patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_router_key", return_value=("key-a", {})):
             response = await agent.agent_chat(self._payload("model-a"), "Bearer firebase-token")
 
         self.assertTrue(response["success"])
         self.assertEqual(response["userId"], "user-a")
+        self.assertEqual(response["provider"], "9router")
         self.assertEqual(response["data"]["result"]["content"], "Mock answer")
-        self.assertEqual(len(_ProviderClient.requests), 2)
-        chat_request = _ProviderClient.requests[-1]
+        self.assertEqual(len(_RouterClient.requests), 2)
+        chat_request = _RouterClient.requests[-1]
         self.assertEqual(chat_request["method"], "POST")
-        self.assertEqual(chat_request["url"], "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(chat_request["url"], "https://router.example/v1/chat/completions")
         self.assertEqual(chat_request["headers"]["Authorization"], "Bearer key-a")
         self.assertNotIn("key-a", str(chat_request["json"]))
         self.assertNotIn("tools", chat_request["json"])
+        self.assertNotIn("web_search", chat_request["json"])
 
-    async def test_chat_cannot_use_model_outside_this_accounts_catalog(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_gateway", return_value=("key-b", "deepseek", {})):
+    async def test_chat_cannot_use_model_outside_this_keys_catalog(self):
+        self._patch_router()
+        with self._router_env(), patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_router_key", return_value=("key-b", {})):
             with self.assertRaises(HTTPException) as raised:
-                await agent.agent_chat(self._payload("model-a", provider="deepseek"), "Bearer firebase-token")
-        self.assertEqual(raised.exception.status_code, 403)
-        self.assertEqual(len(_ProviderClient.requests), 1)
-        self.assertEqual(_ProviderClient.requests[0]["method"], "GET")
+                await agent.agent_chat(self._payload("model-a"), "Bearer firebase-token")
 
-    async def test_chat_rejects_a_different_provider_from_the_saved_connection(self):
-        self._patch_provider()
-        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
-            with self.assertRaises(HTTPException) as raised:
-                await agent.agent_chat(self._payload("model-a", provider="openrouter"), "Bearer firebase-token")
         self.assertEqual(raised.exception.status_code, 403)
-        self.assertEqual(_ProviderClient.requests, [])
+        self.assertEqual(len(_RouterClient.requests), 1)
+        self.assertEqual(_RouterClient.requests[0]["method"], "GET")
 
-    async def test_user_supplied_urls_are_not_valid_provider_ids(self):
+    async def test_direct_provider_is_not_supported(self):
         with self.assertRaises(HTTPException) as raised:
-            agent._normalize_provider("https://127.0.0.1:8000")
+            agent._normalize_provider("openai")
         self.assertEqual(raised.exception.status_code, 400)
 
 
