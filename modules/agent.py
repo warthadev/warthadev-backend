@@ -22,13 +22,15 @@ from .firestore_storage import init_firestore
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
-ROUTER_PROVIDER = "9router"
+OPENROUTER_PROVIDER = "openrouter"
+LEGACY_ROUTER_PROVIDER = "9router"
+OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
 MAX_ROUTER_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class AgentKeyPayload(BaseModel):
     provider: str = Field(min_length=1, max_length=80)
-    base_url: str = Field(min_length=1, max_length=2048)
+    base_url: str = Field(default="", max_length=2048)
     api_key: str | None = Field(default=None, max_length=500)
     # Accepted for compatibility with older clients; model choice is per chat.
     model: str | None = Field(default=None, max_length=200)
@@ -41,7 +43,7 @@ class AgentImagePayload(BaseModel):
 
 class AgentChatPayload(BaseModel):
     prompt: str = Field(min_length=1)
-    provider: str = Field(default=ROUTER_PROVIDER, min_length=1, max_length=80)
+    provider: str = Field(default=OPENROUTER_PROVIDER, min_length=1, max_length=80)
     model: str | None = Field(default=None, max_length=200)
     # Kept in the request schema for compatibility, but no search/tools are sent upstream.
     web_search: bool = False
@@ -117,8 +119,8 @@ def _normalize_provider(provider: str) -> str:
     normalized = provider.strip().lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,80}", normalized):
         raise HTTPException(status_code=400, detail="Invalid provider")
-    if normalized != ROUTER_PROVIDER:
-        raise HTTPException(status_code=400, detail="Only per-account 9Router URLs and API keys are supported")
+    if normalized != OPENROUTER_PROVIDER:
+        raise HTTPException(status_code=400, detail="Only per-account OpenRouter API keys are supported")
     return normalized
 
 
@@ -151,14 +153,14 @@ def _get_key_record(user_id: str, provider: str) -> dict[str, Any] | None:
             "enabled": bool(legacy_data.get("enabled", True)),
         }
         migration = {"agentKeys": {provider: record}}
-        if provider == ROUTER_PROVIDER:
+        if provider == LEGACY_ROUTER_PROVIDER:
             migration.update({"nineRouterApiKey": None, "nineRouterModel": None})
         user_reference.set(migration, merge=True)
         legacy_reference.delete()
         return record
 
     # Migrate original plaintext 9Router fields, encrypting before the write and clearing them.
-    if provider != ROUTER_PROVIDER:
+    if provider != LEGACY_ROUTER_PROVIDER:
         return None
     legacy_key = user_data.get("nineRouterApiKey")
     if not isinstance(legacy_key, str) or not legacy_key.strip():
@@ -193,30 +195,41 @@ def _delete_key_record(user_id: str, provider: str) -> None:
     key_map = (user_data or {}).get("agentKeys")
     if isinstance(key_map, dict) and provider in key_map:
         user_reference.update({f"agentKeys.{provider}": firestore.DELETE_FIELD})
-    if provider == ROUTER_PROVIDER:
+    if provider == LEGACY_ROUTER_PROVIDER:
         user_reference.set({"nineRouterApiKey": None, "nineRouterModel": None}, merge=True)
     _legacy_key_doc(user_id, provider).delete()
 
 
-def _saved_router_credentials(user_id: str) -> tuple[str, str, dict[str, Any]] | None:
-    record = _get_key_record(user_id, ROUTER_PROVIDER)
+def _delete_legacy_router_config(user_id: str) -> None:
+    """Remove only this user's former 9Router data after an OpenRouter key is saved."""
+    user_reference = _user_doc(user_id)
+    snapshot = user_reference.get()
+    user_data = snapshot.to_dict() if snapshot.exists else {}
+    user_data = user_data or {}
+    key_map = user_data.get("agentKeys")
+    updates: dict[str, Any] = {}
+    if isinstance(key_map, dict) and LEGACY_ROUTER_PROVIDER in key_map:
+        updates[f"agentKeys.{LEGACY_ROUTER_PROVIDER}"] = firestore.DELETE_FIELD
+    for field_name in ("nineRouterApiKey", "nineRouterModel"):
+        if field_name in user_data:
+            updates[field_name] = firestore.DELETE_FIELD
+    if updates:
+        user_reference.update(updates)
+    _legacy_key_doc(user_id, LEGACY_ROUTER_PROVIDER).delete()
+
+
+def _saved_openrouter_credentials(user_id: str) -> tuple[str, dict[str, Any]] | None:
+    record = _get_key_record(user_id, OPENROUTER_PROVIDER)
     if not isinstance(record, dict) or not record.get("enabled", True):
         return None
     encrypted_key = record.get("encryptedKey")
     if not isinstance(encrypted_key, str) or not encrypted_key:
-        raise HTTPException(status_code=500, detail="Stored 9Router key is invalid")
+        raise HTTPException(status_code=500, detail="Stored OpenRouter key is invalid")
     try:
         api_key = _fernet().decrypt(encrypted_key.encode()).decode()
     except (InvalidToken, ValueError) as exc:
-        raise HTTPException(status_code=500, detail="Stored 9Router key is invalid") from exc
-    base_url = record.get("baseUrl")
-    return str(base_url or ""), api_key, record
-
-
-def _require_router_base_url(base_url: str) -> str:
-    if not base_url.strip():
-        raise HTTPException(status_code=400, detail="Add this account's 9Router base URL in Settings")
-    return base_url
+        raise HTTPException(status_code=500, detail="Stored OpenRouter key is invalid") from exc
+    return api_key, record
 
 
 async def _router_request(
@@ -243,29 +256,29 @@ async def _router_request(
                 allow_redirects=False,
             ) as response:
                 if 300 <= response.status < 400:
-                    raise HTTPException(status_code=502, detail="9Router redirects are not allowed")
+                    raise HTTPException(status_code=502, detail="OpenRouter redirects are not allowed")
                 body = await response.content.read(MAX_ROUTER_RESPONSE_BYTES + 1)
                 if len(body) > MAX_ROUTER_RESPONSE_BYTES:
-                    raise HTTPException(status_code=502, detail="9Router response exceeded the size limit")
+                    raise HTTPException(status_code=502, detail="OpenRouter response exceeded the size limit")
                 return RouterHTTPResponse(status_code=response.status, body=body)
     except HTTPException:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-        logger.warning("9Router request failed endpoint=%s error=%s", endpoint, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="This account's 9Router endpoint is unavailable") from exc
+        logger.warning("OpenRouter request failed endpoint=%s error=%s", endpoint, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="OpenRouter is unavailable") from exc
 
 
 def _raise_router_http_error(response: RouterHTTPResponse, action: str) -> None:
     if 300 <= response.status_code < 400:
-        raise HTTPException(status_code=502, detail="9Router redirects are not allowed")
+        raise HTTPException(status_code=502, detail="OpenRouter redirects are not allowed")
     if response.status_code in (401, 403):
-        raise HTTPException(status_code=401, detail="9Router rejected this account's API key or model access")
+        raise HTTPException(status_code=401, detail="OpenRouter rejected this account's API key or model access")
     if response.status_code == 429:
-        raise HTTPException(status_code=429, detail="9Router rate limit (429)")
+        raise HTTPException(status_code=429, detail="OpenRouter rate limit (429)")
     if response.status_code in (502, 503, 504):
-        raise HTTPException(status_code=503, detail="This account's 9Router is temporarily unavailable")
+        raise HTTPException(status_code=503, detail="OpenRouter is temporarily unavailable")
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"9Router {action} request failed ({response.status_code})")
+        raise HTTPException(status_code=502, detail=f"OpenRouter {action} request failed ({response.status_code})")
 
 
 def _extract_models(payload: Any) -> list[dict[str, Any]]:
@@ -311,14 +324,46 @@ def _extract_models(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-async def _fetch_router_models(base_url: str, api_key: str) -> list[dict[str, Any]]:
-    response = await _router_request("GET", base_url, "models", api_key)
+def _is_free_openrouter_model(item: Any) -> bool:
+    if isinstance(item, str):
+        model_id = item.strip().lower()
+        return model_id == "openrouter/free" or model_id.endswith(":free")
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        return False
+    model_id = item["id"].strip().lower()
+    if model_id == "openrouter/free" or model_id.endswith(":free"):
+        return True
+    pricing = item.get("pricing")
+    if not isinstance(pricing, dict):
+        return False
+    try:
+        prompt_price = float(pricing.get("prompt"))
+        completion_price = float(pricing.get("completion"))
+    except (TypeError, ValueError):
+        return False
+    return prompt_price == 0 and completion_price == 0
+
+
+def _extract_free_openrouter_models(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in ("data", "models", "result"):
+            if isinstance(payload.get(key), (list, dict)):
+                return _extract_free_openrouter_models(payload[key])
+        return []
+    if not isinstance(payload, list):
+        return []
+    free_entries = [entry for entry in payload if _is_free_openrouter_model(entry)]
+    return _extract_models(free_entries)
+
+
+async def _fetch_openrouter_models(api_key: str) -> list[dict[str, Any]]:
+    response = await _router_request("GET", OPENROUTER_API_BASE_URL, "models", api_key)
     _raise_router_http_error(response, "model catalog")
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="9Router returned an invalid model catalog") from exc
-    return _extract_models(payload)
+        raise HTTPException(status_code=502, detail="OpenRouter returned an invalid model catalog") from exc
+    return _extract_free_openrouter_models(payload)
 
 
 def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | list[dict[str, Any]]:
@@ -346,7 +391,7 @@ def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> l
 
 def _completion_text(payload: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="9Router returned an invalid chat response")
+        raise HTTPException(status_code=502, detail="OpenRouter returned an invalid chat response")
     choices = payload.get("choices")
     choice = choices[0] if isinstance(choices, list) and choices else None
     message = choice.get("message") if isinstance(choice, dict) else None
@@ -361,7 +406,7 @@ def _completion_text(payload: Any) -> tuple[str, dict[str, Any]]:
     else:
         text = ""
     if not text:
-        raise HTTPException(status_code=502, detail="9Router returned an empty chat response")
+        raise HTTPException(status_code=502, detail="OpenRouter returned an empty chat response")
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     return text, usage
 
@@ -371,7 +416,6 @@ async def save_agent_key(payload: AgentKeyPayload, authorization: str | None = H
     claims = _claims(authorization)
     user_id = str(claims["uid"])
     provider = _normalize_provider(payload.provider)
-    target = await validate_router_base_url(payload.base_url)
     previous_record = _get_key_record(user_id, provider)
     normalized_key = payload.api_key.strip() if isinstance(payload.api_key, str) else ""
 
@@ -382,31 +426,28 @@ async def save_agent_key(payload: AgentKeyPayload, authorization: str | None = H
         encrypted_key = previous_record["encryptedKey"]
         fingerprint = str(previous_record.get("fingerprint") or "")
     else:
-        raise HTTPException(status_code=400, detail="A 9Router API key is required for this account")
+        raise HTTPException(status_code=400, detail="An OpenRouter API key is required for this account")
 
     record = {
         "encryptedKey": encrypted_key,
-        "baseUrl": target.base_url,
-        "model": payload.model.strip() if isinstance(payload.model, str) else str((previous_record or {}).get("model") or ""),
         "fingerprint": fingerprint,
         "enabled": True,
     }
     _set_key_record(user_id, provider, record)
-    return {"success": True, "provider": provider, "baseUrl": target.base_url, "fingerprint": fingerprint}
+    return {"success": True, "provider": provider, "fingerprint": fingerprint}
 
 
 @router.get("/keys")
 def list_agent_keys(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    record = _get_key_record(user_id, ROUTER_PROVIDER)
+    record = _get_key_record(user_id, OPENROUTER_PROVIDER)
     if not isinstance(record, dict):
         return {"configured": False, "keys": []}
     return {
         "configured": bool(record.get("enabled", True)),
         "keys": [{
-            "provider": ROUTER_PROVIDER,
-            "baseUrl": str(record.get("baseUrl") or ""),
+            "provider": OPENROUTER_PROVIDER,
             "enabled": bool(record.get("enabled", True)),
             "fingerprint": str(record.get("fingerprint") or ""),
         }],
@@ -422,16 +463,30 @@ def delete_agent_key(provider: str, authorization: str | None = Header(default=N
     return {"success": True, "provider": normalized_provider}
 
 
+@router.post("/keys/openrouter/verify")
+async def verify_openrouter_key(authorization: str | None = Header(default=None)):
+    claims = _claims(authorization)
+    user_id = str(claims["uid"])
+    saved = _saved_openrouter_credentials(user_id)
+    if saved is None:
+        raise HTTPException(status_code=403, detail="Save this account's OpenRouter API key before verifying it")
+    api_key, _ = saved
+    models = await _fetch_openrouter_models(api_key)
+    # Remove only this user's former 9Router data, and only after OpenRouter accepts the key.
+    _delete_legacy_router_config(user_id)
+    return {"success": True, "provider": OPENROUTER_PROVIDER, "freeModelCount": len(models)}
+
+
 @router.get("/models")
 async def agent_models(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    saved = _saved_router_credentials(user_id)
+    saved = _saved_openrouter_credentials(user_id)
     if saved is None:
-        return {"configured": False, "provider": ROUTER_PROVIDER, "models": []}
-    base_url, api_key, _ = saved
-    models = await _fetch_router_models(_require_router_base_url(base_url), api_key)
-    return {"configured": True, "provider": ROUTER_PROVIDER, "models": models}
+        return {"configured": False, "provider": OPENROUTER_PROVIDER, "models": []}
+    api_key, _ = saved
+    models = await _fetch_openrouter_models(api_key)
+    return {"configured": True, "provider": OPENROUTER_PROVIDER, "models": models}
 
 
 @router.post("/chat")
@@ -443,14 +498,13 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     selected_model = (payload.model or "").strip()
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
-    saved = _saved_router_credentials(user_id)
+    saved = _saved_openrouter_credentials(user_id)
     if saved is None:
-        raise HTTPException(status_code=403, detail="A 9Router URL and API key are not configured for this account")
-    base_url, api_key, _ = saved
-    base_url = _require_router_base_url(base_url)
-    available_models = await _fetch_router_models(base_url, api_key)
+        raise HTTPException(status_code=403, detail="An OpenRouter API key is not configured for this account")
+    api_key, _ = saved
+    available_models = await _fetch_openrouter_models(api_key)
     if selected_model not in {model["id"] for model in available_models}:
-        raise HTTPException(status_code=403, detail="Model is not available to this account's 9Router key")
+        raise HTTPException(status_code=403, detail="Model is not available as a free model to this account's OpenRouter key")
 
     request_body = {
         "model": selected_model,
@@ -458,12 +512,12 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
         "temperature": 0.2,
         "stream": False,
     }
-    response = await _router_request("POST", base_url, "chat/completions", api_key, request_body)
+    response = await _router_request("POST", OPENROUTER_API_BASE_URL, "chat/completions", api_key, request_body)
     _raise_router_http_error(response, "chat")
     try:
         upstream_payload = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="9Router returned an invalid chat response") from exc
+        raise HTTPException(status_code=502, detail="OpenRouter returned an invalid chat response") from exc
     content, usage = _completion_text(upstream_payload)
     result_model = upstream_payload.get("model") if isinstance(upstream_payload, dict) else None
     return {
