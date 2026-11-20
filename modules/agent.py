@@ -4,32 +4,40 @@ import binascii
 import hashlib
 import logging
 import os
-import time
+import re
 from typing import Any
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Header, HTTPException
-from firebase_admin import auth
+from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
 from .firestore_storage import init_firestore
-from .router import UPSTREAM as ROUTER_UPSTREAM
-from .workspace import _verified_owner_uid, is_owner_claims, runtime_request
+from .agent_prompt import DEFAULT_SYSTEM_INSTRUCTION
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
+
+# Fixed HTTPS endpoints prevent user-controlled URLs and SSRF. Add a provider only
+# after its official API compatibility has been reviewed and covered by tests.
+AGENT_PROVIDERS: dict[str, dict[str, str]] = {
+    "openai": {"name": "OpenAI", "base_url": "https://api.openai.com/v1"},
+    "openrouter": {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1"},
+    "deepseek": {"name": "DeepSeek", "base_url": "https://api.deepseek.com"},
+}
+GATEWAY_KEY_FIELD = "gateway"
+LEGACY_ROUTER_PROVIDER = "9router"
 
 
 class AgentKeyPayload(BaseModel):
     provider: str = Field(min_length=1, max_length=80)
     api_key: str = Field(min_length=1, max_length=500)
-    model: str = Field(min_length=1, max_length=200)
 
 
 class AgentImagePayload(BaseModel):
     mime_type: str = Field(min_length=1, max_length=32)
-    data: str = Field(min_length=1)
+    data: str = Field(min_length=1, max_length=12_000_000)
 
 
 class AgentChatPayload(BaseModel):
@@ -40,7 +48,7 @@ class AgentChatPayload(BaseModel):
     search_query: str = Field(default="", max_length=500)
     timezone: str = Field(default="Asia/Jakarta", max_length=64)
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
-    images: list[AgentImagePayload] = Field(default_factory=list)
+    images: list[AgentImagePayload] = Field(default_factory=list, max_length=12)
 
 
 def _validate_chat_images(images: list[AgentImagePayload]) -> list[dict[str, str]]:
@@ -85,86 +93,183 @@ def _claims(authorization: str | None) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid authentication") from exc
 
 
-def _key_doc(user_id: str, provider: str):
+def _user_doc(user_id: str):
+    return init_firestore().collection("users").document(user_id)
+
+
+def _legacy_key_doc(user_id: str, provider: str):
     return init_firestore().collection("agent_users").document(user_id).collection("keys").document(provider)
+
+
+def _normalize_provider(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,80}", normalized):
+        raise HTTPException(status_code=400, detail="Invalid provider")
+    if normalized not in AGENT_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    return normalized
 
 
 def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
-def _get_key_snapshot(user_id: str, provider: str):
-    """Load a saved key, migrating legacy plaintext 9Router keys server-side once."""
-    key_reference = _key_doc(user_id, provider)
-    snapshot = key_reference.get()
-    if snapshot.exists or provider != "9router":
-        return snapshot
+def _get_key_record(user_id: str, provider: str) -> dict[str, Any] | None:
+    """Load a key from users/{uid}, migrating older per-user formats without exposing it."""
+    user_reference = _user_doc(user_id)
+    user_snapshot = user_reference.get()
+    user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
+    user_data = user_data or {}
+    key_map = user_data.get("agentKeys")
+    record = key_map.get(provider) if isinstance(key_map, dict) else None
+    if isinstance(record, dict):
+        return record
 
-    database = init_firestore()
-    legacy_reference = database.collection("users").document(user_id)
+    # Migrate the previous encrypted subcollection format on access, preserving account scope.
+    legacy_reference = _legacy_key_doc(user_id, provider)
     legacy_snapshot = legacy_reference.get()
     legacy_data = legacy_snapshot.to_dict() if legacy_snapshot.exists else {}
-    legacy_key = legacy_data.get("nineRouterApiKey")
+    encrypted_key = legacy_data.get("encryptedKey") if isinstance(legacy_data, dict) else None
+    if isinstance(encrypted_key, str) and encrypted_key:
+        record = {
+            "encryptedKey": encrypted_key,
+            "model": str(legacy_data.get("model") or ""),
+            "fingerprint": str(legacy_data.get("fingerprint") or ""),
+            "enabled": bool(legacy_data.get("enabled", True)),
+        }
+        migration = {"agentKeys": {provider: record}}
+        if provider == LEGACY_ROUTER_PROVIDER:
+            migration.update({"nineRouterApiKey": None, "nineRouterModel": None})
+        user_reference.set(migration, merge=True)
+        legacy_reference.delete()
+        return record
+
+    # Migrate the original plaintext 9Router fields, encrypting before the write and clearing them.
+    if provider != LEGACY_ROUTER_PROVIDER:
+        return None
+    legacy_key = user_data.get("nineRouterApiKey")
     if not isinstance(legacy_key, str) or not legacy_key.strip():
-        return snapshot
+        return None
 
     normalized_key = legacy_key.strip()
-    legacy_model = legacy_data.get("nineRouterModel")
+    legacy_model = user_data.get("nineRouterModel")
     model = legacy_model.strip() if isinstance(legacy_model, str) and legacy_model.strip() else "openrouter/openrouter/free"
-    key_reference.set({
+    record = {
         "encryptedKey": _fernet().encrypt(normalized_key.encode()).decode(),
         "model": model,
         "fingerprint": _fingerprint(normalized_key),
         "enabled": True,
+    }
+    user_reference.set({
+        "agentKeys": {provider: record},
+        "nineRouterApiKey": None,
+        "nineRouterModel": None,
     }, merge=True)
-    legacy_reference.set({"nineRouterApiKey": None, "nineRouterModel": None}, merge=True)
-    return key_reference.get()
+    return record
 
 
-def _saved_key(user_id: str, provider: str) -> tuple[str, dict[str, Any]] | None:
-    snapshot = _get_key_snapshot(user_id, provider)
-    if not snapshot.exists:
+def _set_key_record(user_id: str, provider: str, record: dict[str, Any]) -> None:
+    _user_doc(user_id).set({"agentKeys": {provider: record}}, merge=True)
+
+
+def _delete_key_record(user_id: str, provider: str) -> None:
+    user_reference = _user_doc(user_id)
+    user_snapshot = user_reference.get()
+    user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
+    key_map = (user_data or {}).get("agentKeys")
+    if isinstance(key_map, dict) and provider in key_map:
+        user_reference.update({f"agentKeys.{provider}": firestore.DELETE_FIELD})
+    if provider == LEGACY_ROUTER_PROVIDER:
+        user_reference.set({"nineRouterApiKey": None, "nineRouterModel": None}, merge=True)
+    _legacy_key_doc(user_id, provider).delete()
+
+
+def _gateway_record(user_id: str) -> dict[str, Any] | None:
+    record = _get_key_record(user_id, GATEWAY_KEY_FIELD)
+    if not isinstance(record, dict) or not record.get("enabled", True):
         return None
-    data = snapshot.to_dict() or {}
-    if not data.get("enabled", True):
+    provider = record.get("provider")
+    encrypted_key = record.get("encryptedKey")
+    if provider not in AGENT_PROVIDERS or not isinstance(encrypted_key, str) or not encrypted_key:
+        raise HTTPException(status_code=500, detail="Stored provider configuration is invalid")
+    return record
+
+
+def _saved_gateway(user_id: str) -> tuple[str, str, dict[str, Any]] | None:
+    record = _gateway_record(user_id)
+    if record is None:
         return None
-    encrypted_key = data.get("encryptedKey")
-    if not isinstance(encrypted_key, str) or not encrypted_key:
-        raise HTTPException(status_code=500, detail="Stored provider key is invalid")
     try:
-        api_key = _fernet().decrypt(encrypted_key.encode()).decode()
+        api_key = _fernet().decrypt(record["encryptedKey"].encode()).decode()
     except (InvalidToken, ValueError) as exc:
         raise HTTPException(status_code=500, detail="Stored provider key is invalid") from exc
-    return api_key, data
+    return api_key, str(record["provider"]), record
+
+
+def _provider_url(provider: str, endpoint: str) -> str:
+    config = AGENT_PROVIDERS.get(provider)
+    if not config:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+    return f"{config['base_url'].rstrip('/')}/{endpoint.lstrip('/')}"
+
+
+async def _provider_request(
+    method: str,
+    provider: str,
+    endpoint: str,
+    api_key: str,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    try:
+        async with httpx.AsyncClient(
+            timeout=float(os.getenv("AGENT_TIMEOUT", "210")),
+            follow_redirects=False,
+        ) as client:
+            return await client.request(
+                method,
+                _provider_url(provider, endpoint),
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                json=json_body,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("Agent provider request failed provider=%s endpoint=%s error=%s", provider, endpoint, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Provider API is unavailable") from exc
+
+
+def _raise_provider_http_error(response: httpx.Response, action: str) -> None:
+    status = response.status_code
+    if status in (401, 403):
+        raise HTTPException(status_code=401, detail="Provider rejected the saved API key")
+    if status == 429:
+        raise HTTPException(status_code=429, detail="Provider rate limit (429)")
+    if status >= 400:
+        raise HTTPException(status_code=502, detail=f"Provider {action} request failed ({status})")
 
 
 def _extract_models(payload: Any) -> list[dict[str, Any]]:
-    """Extract model IDs and supported capability metadata from catalog responses."""
+    """Extract model IDs and documented capability metadata from OpenAI-compatible catalogs."""
     if isinstance(payload, list):
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in payload:
             if isinstance(item, str) and item.strip():
                 model_id = item.strip()
-                model = {"id": model_id}
+                model: dict[str, Any] = {"id": model_id}
             elif isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
                 model_id = item["id"].strip()
                 model = {"id": model_id}
-                sources = [
-                    source for source in (item.get("capabilities"), item, item.get("limits"))
-                    if isinstance(source, dict)
-                ]
+                sources = [source for source in (item.get("capabilities"), item, item.get("limits")) if isinstance(source, dict)]
                 safe_capabilities: dict[str, Any] = {}
                 for name in ("reasoning", "thinkingCanDisable", "vision", "tools"):
                     value = next((source[name] for source in sources if name in source), None)
                     if isinstance(value, bool):
                         safe_capabilities[name] = value
-                limit_aliases = {
+                aliases = {
                     "contextLength": ("contextLength", "context_length", "contextWindow", "context_window"),
                     "maxOutputTokens": ("maxOutputTokens", "max_output_tokens", "maxCompletionTokens", "max_completion_tokens"),
                 }
-                for normalized_name, aliases in limit_aliases.items():
-                    value = next((source[key] for source in sources for key in aliases if key in source), None)
+                for normalized_name, names in aliases.items():
+                    value = next((source[name] for source in sources for name in names if name in source), None)
                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         safe_capabilities[normalized_name] = value
                 if safe_capabilities:
@@ -184,134 +289,123 @@ def _extract_models(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _router_models_url() -> str:
-    upstream = os.getenv("AGENT_ROUTER_BASE_URL", ROUTER_UPSTREAM).rstrip("/")
-    return f"{upstream}/models"
-
-
-async def _fetch_router_models(api_key: str) -> list[dict[str, Any]]:
-    try:
-        async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "45"))) as client:
-            response = await client.get(
-                _router_models_url(),
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="9Router model catalog is unavailable") from exc
-
-    if response.status_code in (401, 403):
-        raise HTTPException(status_code=401, detail="9Router rejected the saved API key")
-    if response.status_code == 409:
-        try:
-            error_payload = response.json()
-        except ValueError:
-            error_payload = {}
-        upstream_error = error_payload.get("error") if isinstance(error_payload, dict) else None
-        error_code = upstream_error.get("code") if isinstance(upstream_error, dict) else None
-        if error_code == "machine_cooldown":
-            raise HTTPException(status_code=503, detail="Server 9Router sedang cooldown. Katalog model akan tersedia lagi setelah server aktif.")
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="9Router model catalog request failed")
+async def _fetch_provider_models(provider: str, api_key: str) -> list[dict[str, Any]]:
+    response = await _provider_request("GET", provider, "models", api_key)
+    _raise_provider_http_error(response, "model catalog")
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="9Router returned an invalid model catalog") from exc
+        raise HTTPException(status_code=502, detail="Provider returned an invalid model catalog") from exc
     return _extract_models(payload)
 
 
-def _agent_runtime_config() -> tuple[str, str]:
-    runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip()
-    if not runtime_url:
-        raise HTTPException(status_code=500, detail="Agent runtime URL is not configured")
-    try:
-        parsed_url = httpx.URL(runtime_url)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Agent runtime URL is invalid") from exc
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.host:
-        raise HTTPException(status_code=500, detail="Agent runtime URL is invalid")
-
-    internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "").strip()
-    if not internal_key:
-        raise HTTPException(status_code=500, detail="Agent runtime internal API key is not configured")
-    return runtime_url.rstrip("/"), internal_key
+def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | list[dict[str, Any]]:
+    if not images:
+        return prompt
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image['mime_type']};base64,{image['data']}"},
+        })
+    return content
 
 
-def _log_runtime_http_error(response: httpx.Response, elapsed_ms: int) -> None:
-    """Log bounded response metadata only; never log runtime request/response bodies."""
-    headers = response.headers
-    content_type = " ".join(str(headers.get("content-type", "")).split())[:120] or "unknown"
-    identifiers = {}
-    for name in ("x-request-id", "cf-ray", "via", "server"):
-        value = " ".join(str(headers.get(name, "")).split())[:200]
-        if value:
-            identifiers[name] = value
-    logger.warning(
-        "Agent runtime HTTP error status=%d elapsed_ms=%d content_type=%r identifiers=%r",
-        response.status_code,
-        elapsed_ms,
-        content_type,
-        identifiers,
-    )
+def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION}]
+    for item in payload.history:
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": _chat_message_content(payload.prompt, images)})
+    return messages
+
+
+def _completion_text(payload: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Provider returned an invalid chat response")
+    choices = payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        text = "\n".join(
+            part["text"] for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ).strip()
+    else:
+        text = ""
+    if not text:
+        raise HTTPException(status_code=502, detail="Provider returned an empty chat response")
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    return text, usage
 
 
 @router.put("/keys")
 def save_agent_key(payload: AgentKeyPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    provider = payload.provider.strip().lower()
+    provider = _normalize_provider(payload.provider)
     api_key = payload.api_key.strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="Provider API key is required")
-    encrypted = _fernet().encrypt(api_key.encode()).decode()
-    fingerprint = _fingerprint(api_key)
-    if provider == "9router":
-        _get_key_snapshot(user_id, provider)
-    _key_doc(user_id, provider).set({
-        "encryptedKey": encrypted,
-        "model": payload.model.strip(),
-        "fingerprint": fingerprint,
+    record = {
+        "provider": provider,
+        "encryptedKey": _fernet().encrypt(api_key.encode()).decode(),
+        "fingerprint": _fingerprint(api_key),
         "enabled": True,
-    }, merge=True)
-    return {"success": True, "provider": provider, "model": payload.model.strip(), "fingerprint": fingerprint}
+    }
+    _set_key_record(user_id, GATEWAY_KEY_FIELD, record)
+    return {"success": True, "provider": provider, "name": AGENT_PROVIDERS[provider]["name"], "fingerprint": record["fingerprint"]}
 
 
 @router.get("/keys")
 def list_agent_keys(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    _get_key_snapshot(user_id, "9router")
-    docs = _key_doc(user_id, "__index__").parent.stream()
-    return {
-        "keys": [
-            {
-                "provider": doc.id,
-                "model": (doc.to_dict() or {}).get("model", ""),
-                "enabled": (doc.to_dict() or {}).get("enabled", True),
-                "fingerprint": (doc.to_dict() or {}).get("fingerprint", ""),
-            }
-            for doc in docs
-        ]
-    }
+    # Preserve the old migration path, but never treat a 9Router gateway key as a provider key.
+    _get_key_record(user_id, LEGACY_ROUTER_PROVIDER)
+    record = _gateway_record(user_id)
+    keys = []
+    if record:
+        provider = str(record["provider"])
+        keys.append({
+            "provider": provider,
+            "name": AGENT_PROVIDERS[provider]["name"],
+            "enabled": True,
+            "fingerprint": str(record.get("fingerprint") or ""),
+            "gateway": True,
+        })
+    return {"configured": bool(record), "keys": keys}
 
 
 @router.delete("/keys/{provider}")
 def delete_agent_key(provider: str, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    normalized_provider = provider.strip().lower()
-    if normalized_provider == "9router":
-        _get_key_snapshot(user_id, normalized_provider)
-    _key_doc(user_id, normalized_provider).delete()
-    return {"success": True, "provider": normalized_provider}
+    normalized = provider.strip().lower()
+    if normalized in {"gateway", *AGENT_PROVIDERS.keys()}:
+        _delete_key_record(user_id, GATEWAY_KEY_FIELD)
+        return {"success": True, "provider": normalized}
+    if normalized == LEGACY_ROUTER_PROVIDER:
+        _delete_key_record(user_id, LEGACY_ROUTER_PROVIDER)
+        return {"success": True, "provider": LEGACY_ROUTER_PROVIDER}
+    raise HTTPException(status_code=400, detail="Unsupported provider")
 
 
 @router.get("/models")
 async def agent_models(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    saved = _saved_key(user_id, "9router")
-    models = await _fetch_router_models(saved[0]) if saved is not None else []
-    return {"configured": saved is not None, "models": models}
+    saved = _saved_gateway(user_id)
+    if saved is None:
+        return {"configured": False, "provider": None, "models": []}
+    api_key, provider, _ = saved
+    models = await _fetch_provider_models(provider, api_key)
+    return {"configured": True, "provider": provider, "models": models}
 
 
 @router.post("/chat")
@@ -319,72 +413,46 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     claims = _claims(authorization)
     images = _validate_chat_images(payload.images)
     user_id = str(claims["uid"])
-    provider = payload.provider.strip().lower()
-    if provider != "9router":
-        raise HTTPException(status_code=400, detail="Unsupported agent provider")
-
+    requested_provider = _normalize_provider(payload.provider)
     selected_model = (payload.model or "").strip()
     if not selected_model:
         raise HTTPException(status_code=400, detail="Select an available model")
 
-    saved = _saved_key(user_id, provider)
+    saved = _saved_gateway(user_id)
     if saved is None:
-        raise HTTPException(status_code=403, detail="A 9Router API key is not configured for this account")
-    api_key, _ = saved
+        raise HTTPException(status_code=403, detail="Connect a provider API key for this account")
+    api_key, provider, _ = saved
+    if requested_provider != provider:
+        raise HTTPException(status_code=403, detail="Provider is not connected to this account")
 
-    agent_url, internal_key = _agent_runtime_config()
-    available_models = await _fetch_router_models(api_key)
-    available_model_ids = {model["id"] for model in available_models}
-    if selected_model not in available_model_ids:
+    available_models = await _fetch_provider_models(provider, api_key)
+    if selected_model not in {model["id"] for model in available_models}:
         raise HTTPException(status_code=403, detail="Model is not available for this account")
 
-    body = {
-        "prompt": payload.prompt,
+    request_body = {
         "model": selected_model,
-        "web_search": payload.web_search,
-        "search_query": payload.search_query.strip() if payload.web_search else "",
-        "timezone": payload.timezone.strip() or "Asia/Jakarta",
-        "provider_api_key": api_key,
-        # Older runtime versions still require this field during a rolling deploy.
-        "user_email": str(claims.get("email") or user_id).strip().lower(),
-        "user_uid": user_id,
-        "history": payload.history,
-        "images": images,
+        "messages": _chat_messages(payload, images),
+        "temperature": 0.2,
+        "stream": False,
     }
-    owner_uid = _verified_owner_uid()
-    runtime_headers = {
-        "X-Agent-Internal-Key": internal_key,
-        "X-Agent-User-UID": user_id,
-        "X-Agent-User-Role": "owner" if is_owner_claims(claims) else "user",
-        "X-Agent-Owner-UID": owner_uid,
-    }
+    response = await _provider_request("POST", provider, "chat/completions", api_key, request_body)
+    _raise_provider_http_error(response, "chat")
     try:
-        async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT", "210"))) as client:
-            request_started = time.perf_counter()
-            response = await client.post(
-                f"{agent_url}/v1/agent/run",
-                headers=runtime_headers,
-                json=body,
-            )
-            elapsed_ms = int((time.perf_counter() - request_started) * 1000)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Agent runtime unavailable") from exc
-    if response.status_code >= 400:
-        _log_runtime_http_error(response, elapsed_ms)
-        try:
-            error_payload = response.json()
-        except ValueError:
-            error_payload = None
-        detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
-        if isinstance(detail, dict) and detail.get("code") == "vision_unsupported":
-            message = detail.get("message")
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "vision_unsupported", "message": message if isinstance(message, str) else "This model does not support image input"},
-            )
-        if response.status_code == 429:
-            raise HTTPException(status_code=429, detail="Agent runtime rate limit (429)")
-        if response.status_code == 503:
-            raise HTTPException(status_code=503, detail="Agent runtime temporarily unavailable (503)")
-        raise HTTPException(status_code=502, detail="Agent runtime request failed")
-    return {"success": True, "userId": user_id, "provider": provider, "data": response.json()}
+        upstream_payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Provider returned an invalid chat response") from exc
+    content, usage = _completion_text(upstream_payload)
+    result_model = upstream_payload.get("model") if isinstance(upstream_payload, dict) else None
+    return {
+        "success": True,
+        "userId": user_id,
+        "provider": provider,
+        "data": {
+            "result": {
+                "content": content,
+                "model": result_model if isinstance(result_model, str) and result_model else selected_model,
+                "usage": usage,
+                "sources": [],
+            }
+        },
+    }

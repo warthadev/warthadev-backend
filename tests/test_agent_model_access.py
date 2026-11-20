@@ -7,16 +7,18 @@ from fastapi import HTTPException
 from modules import agent
 
 
-class _RuntimeResponse:
+class _ProviderResponse:
     status_code = 200
     headers = {}
 
-    @staticmethod
-    def json():
-        return {"answer": "ok"}
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
 
 
-class _RuntimeClient:
+class _ProviderClient:
     requests: list[dict] = []
 
     def __init__(self, *args, **kwargs):
@@ -28,21 +30,29 @@ class _RuntimeClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return False
 
-    async def post(self, url, *, headers, json):
-        self.requests.append({"url": url, "headers": headers, "json": json})
-        return _RuntimeResponse()
+    async def request(self, method, url, *, headers, json=None):
+        self.requests.append({"method": method, "url": url, "headers": headers, "json": json})
+        key = headers["Authorization"].removeprefix("Bearer ")
+        if method == "GET":
+            model_id = {"key-a": "model-a", "key-b": "model-b"}.get(key, "model-default")
+            return _ProviderResponse({"data": [{"id": model_id}]})
+        return _ProviderResponse({
+            "model": json["model"],
+            "choices": [{"message": {"content": "Mock answer"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        })
 
 
 class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
-    claims = {"uid": "firebase-user-123", "email": "user@example.com", "email_verified": True}
+    claims = {"uid": "user-a", "email": "user@example.com", "email_verified": True}
 
     def setUp(self):
-        _RuntimeClient.requests = []
+        _ProviderClient.requests = []
 
-    def _payload(self, model: str):
+    def _payload(self, model: str, provider: str = "openai"):
         return SimpleNamespace(
             prompt="hello",
-            provider="9router",
+            provider=provider,
             model=model,
             web_search=False,
             search_query="",
@@ -51,91 +61,81 @@ class AgentModelAccessTests(unittest.IsolatedAsyncioTestCase):
             images=[],
         )
 
-    async def _patch_runtime(self):
-        stack = patch.object(agent.httpx, "AsyncClient", _RuntimeClient)
+    def _patch_provider(self):
+        stack = patch.object(agent.httpx, "AsyncClient", _ProviderClient)
         stack.start()
         self.addCleanup(stack.stop)
-        config_patch = patch.object(agent, "_agent_runtime_config", return_value=("https://runtime.example", "internal-test-key"))
-        config_patch.start()
-        self.addCleanup(config_patch.stop)
-        owner_patch = patch.object(agent, "_verified_owner_uid", return_value="verified-owner-uid")
-        owner_patch.start()
-        self.addCleanup(owner_patch.stop)
-        claims_patch = patch.object(agent, "is_owner_claims", return_value=False)
-        claims_patch.start()
-        self.addCleanup(claims_patch.stop)
-        auth_patch = patch.object(agent, "_claims", return_value=self.claims)
-        auth_patch.start()
-        self.addCleanup(auth_patch.stop)
-        images_patch = patch.object(agent, "_validate_chat_images", return_value=[])
-        images_patch.start()
-        self.addCleanup(images_patch.stop)
 
     async def test_models_without_key_are_empty_and_never_read_local_inventory(self):
-        key_patch = patch.object(agent, "_saved_key", return_value=None)
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
-        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
-        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch as fetch_catalog, inventory_patch as inventory:
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=None):
             response = await agent.agent_models("Bearer firebase-token")
 
         self.assertFalse(response["configured"])
         self.assertEqual(response["models"], [])
-        fetch_catalog.assert_not_awaited()
-        inventory.assert_not_awaited()
+        self.assertEqual(_ProviderClient.requests, [])
 
-    async def test_models_return_only_the_account_9router_catalog(self):
-        key_patch = patch.object(agent, "_saved_key", return_value=("user-router-key", {}))
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-a"}]))
-        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
-        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch, inventory_patch as inventory:
+    async def test_catalog_is_fetched_with_each_accounts_own_key(self):
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
             response = await agent.agent_models("Bearer firebase-token")
-
         self.assertTrue(response["configured"])
-        self.assertEqual(response["models"], [{"id": "cloud/model-a"}])
-        inventory.assert_not_awaited()
+        self.assertEqual(response["provider"], "openai")
+        self.assertEqual(response["models"], [{"id": "model-a"}])
+        self.assertEqual(_ProviderClient.requests[-1]["headers"]["Authorization"], "Bearer key-a")
 
-    async def test_legacy_local_model_without_router_key_is_rejected(self):
-        key_patch = patch.object(agent, "_saved_key", return_value=None)
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
-        inventory_patch = patch.object(agent, "runtime_request", new=AsyncMock())
-        with patch.object(agent, "_claims", return_value=self.claims), key_patch, catalog_patch as fetch_catalog, inventory_patch as inventory:
+        with patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_gateway", return_value=("key-b", "deepseek", {})):
+            other_response = await agent.agent_models("Bearer firebase-token")
+        self.assertEqual(other_response["provider"], "deepseek")
+        self.assertEqual(other_response["models"], [{"id": "model-b"}])
+        self.assertEqual(_ProviderClient.requests[-1]["headers"]["Authorization"], "Bearer key-b")
+
+    async def test_chat_without_key_is_rejected(self):
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=None):
             with self.assertRaises(HTTPException) as raised:
-                await agent.agent_chat(self._payload("mimo-v2.6:latest"), "Bearer firebase-token")
+                await agent.agent_chat(self._payload("model-a"), "Bearer firebase-token")
 
         self.assertEqual(raised.exception.status_code, 403)
-        fetch_catalog.assert_not_awaited()
-        inventory.assert_not_awaited()
-        self.assertEqual(_RuntimeClient.requests, [])
+        self.assertEqual(_ProviderClient.requests, [])
 
-    async def test_cloud_chat_uses_this_users_key_and_requires_catalog_membership(self):
-        await self._patch_runtime()
-        key_patch = patch.object(agent, "_saved_key", return_value=("this-users-key", {"model": "cloud/model-a"}))
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-a"}]))
-        with key_patch as load_key, catalog_patch as fetch_catalog:
-            response = await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
+    async def test_chat_uses_account_key_only_in_provider_auth_header(self):
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
+            response = await agent.agent_chat(self._payload("model-a"), "Bearer firebase-token")
 
         self.assertTrue(response["success"])
-        load_key.assert_called_once_with(self.claims["uid"], "9router")
-        fetch_catalog.assert_awaited_once_with("this-users-key")
-        self.assertEqual(_RuntimeClient.requests[0]["json"]["provider_api_key"], "this-users-key")
+        self.assertEqual(response["userId"], "user-a")
+        self.assertEqual(response["data"]["result"]["content"], "Mock answer")
+        self.assertEqual(len(_ProviderClient.requests), 2)
+        chat_request = _ProviderClient.requests[-1]
+        self.assertEqual(chat_request["method"], "POST")
+        self.assertEqual(chat_request["url"], "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(chat_request["headers"]["Authorization"], "Bearer key-a")
+        self.assertNotIn("key-a", str(chat_request["json"]))
+        self.assertNotIn("tools", chat_request["json"])
 
-    async def test_cloud_chat_without_key_or_outside_catalog_is_rejected(self):
-        await self._patch_runtime()
-        key_patch = patch.object(agent, "_saved_key", return_value=None)
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock())
-        with key_patch, catalog_patch as fetch:
+    async def test_chat_cannot_use_model_outside_this_accounts_catalog(self):
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value={"uid": "user-b"}), patch.object(agent, "_saved_gateway", return_value=("key-b", "deepseek", {})):
             with self.assertRaises(HTTPException) as raised:
-                await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
+                await agent.agent_chat(self._payload("model-a", provider="deepseek"), "Bearer firebase-token")
         self.assertEqual(raised.exception.status_code, 403)
-        fetch.assert_not_awaited()
+        self.assertEqual(len(_ProviderClient.requests), 1)
+        self.assertEqual(_ProviderClient.requests[0]["method"], "GET")
 
-        key_patch = patch.object(agent, "_saved_key", return_value=("this-users-key", {}))
-        catalog_patch = patch.object(agent, "_fetch_router_models", new=AsyncMock(return_value=[{"id": "cloud/model-b"}]))
-        with key_patch, catalog_patch:
+    async def test_chat_rejects_a_different_provider_from_the_saved_connection(self):
+        self._patch_provider()
+        with patch.object(agent, "_claims", return_value=self.claims), patch.object(agent, "_saved_gateway", return_value=("key-a", "openai", {})):
             with self.assertRaises(HTTPException) as raised:
-                await agent.agent_chat(self._payload("cloud/model-a"), "Bearer firebase-token")
+                await agent.agent_chat(self._payload("model-a", provider="openrouter"), "Bearer firebase-token")
         self.assertEqual(raised.exception.status_code, 403)
-        self.assertEqual(_RuntimeClient.requests, [])
+        self.assertEqual(_ProviderClient.requests, [])
+
+    async def test_user_supplied_urls_are_not_valid_provider_ids(self):
+        with self.assertRaises(HTTPException) as raised:
+            agent._normalize_provider("https://127.0.0.1:8000")
+        self.assertEqual(raised.exception.status_code, 400)
 
 
 if __name__ == "__main__":
