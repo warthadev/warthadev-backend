@@ -223,13 +223,75 @@ def _saved_openrouter_credentials(user_id: str) -> tuple[str, dict[str, Any]] | 
     if not isinstance(record, dict) or not record.get("enabled", True):
         return None
     encrypted_key = record.get("encryptedKey")
-    if not isinstance(encrypted_key, str) or not encrypted_key:
-        raise HTTPException(status_code=500, detail="Stored OpenRouter key is invalid")
-    try:
-        api_key = _fernet().decrypt(encrypted_key.encode()).decode()
-    except (InvalidToken, ValueError) as exc:
-        raise HTTPException(status_code=500, detail="Stored OpenRouter key is invalid") from exc
+    if isinstance(encrypted_key, str) and encrypted_key:
+        try:
+            api_key = _fernet().decrypt(encrypted_key.encode()).decode()
+        except (InvalidToken, ValueError) as exc:
+            raise HTTPException(status_code=500, detail="Stored OpenRouter key is invalid") from exc
+        return api_key, record
+
+    # During replacement, keep using the previous value until the new plaintext
+    # value has been written and read back successfully.
+    previous_key = record.get("previousApiKey")
+    if isinstance(previous_key, str) and previous_key:
+        return previous_key, record
+    api_key = record.get("apiKey")
+    if not isinstance(api_key, str) or not api_key:
+        return None
     return api_key, record
+
+
+def _persist_openrouter_plaintext_key(user_id: str, api_key: str, previous_record: dict[str, Any] | None) -> None:
+    """Stage, read back, activate, read back, then remove legacy ciphertext."""
+    user_reference = _user_doc(user_id)
+    path = f"agentKeys.{OPENROUTER_PROVIDER}"
+    record = previous_record if isinstance(previous_record, dict) else {}
+
+    # The candidate is written separately so a failed write/readback leaves the
+    # currently active encrypted or plaintext key untouched.
+    user_reference.set({"agentKeys": {OPENROUTER_PROVIDER: {"pendingApiKey": api_key}}}, merge=True)
+    staged_snapshot = user_reference.get()
+    staged_data = staged_snapshot.to_dict() if staged_snapshot.exists else {}
+    staged_record = ((staged_data or {}).get("agentKeys") or {}).get(OPENROUTER_PROVIDER, {})
+    if not isinstance(staged_record, dict) or staged_record.get("pendingApiKey") != api_key:
+        raise HTTPException(status_code=500, detail="OpenRouter key write could not be verified; the previous key was retained")
+
+    updates: dict[str, Any] = {
+        f"{path}.apiKey": api_key,
+        f"{path}.pendingApiKey": firestore.DELETE_FIELD,
+    }
+    if not record.get("encryptedKey"):
+        prior_plaintext = record.get("previousApiKey") or record.get("apiKey")
+        if isinstance(prior_plaintext, str) and prior_plaintext:
+            updates[f"{path}.previousApiKey"] = prior_plaintext
+    user_reference.update(updates)
+
+    active_snapshot = user_reference.get()
+    active_data = active_snapshot.to_dict() if active_snapshot.exists else {}
+    active_record = ((active_data or {}).get("agentKeys") or {}).get(OPENROUTER_PROVIDER, {})
+    if not isinstance(active_record, dict) or active_record.get("apiKey") != api_key:
+        raise HTTPException(status_code=500, detail="OpenRouter key readback failed; the previous key was retained")
+
+    # Only now is the new value confirmed in the active field. Remove the old
+    # encrypted/backup fields without touching any other account data.
+    user_reference.update({
+        f"{path}.encryptedKey": firestore.DELETE_FIELD,
+        f"{path}.previousApiKey": firestore.DELETE_FIELD,
+        f"{path}.pendingApiKey": firestore.DELETE_FIELD,
+        f"{path}.fingerprint": firestore.DELETE_FIELD,
+        f"{path}.enabled": True,
+    })
+    final_snapshot = user_reference.get()
+    final_data = final_snapshot.to_dict() if final_snapshot.exists else {}
+    final_record = ((final_data or {}).get("agentKeys") or {}).get(OPENROUTER_PROVIDER, {})
+    if (
+        not isinstance(final_record, dict)
+        or final_record.get("apiKey") != api_key
+        or "encryptedKey" in final_record
+        or "previousApiKey" in final_record
+        or "pendingApiKey" in final_record
+    ):
+        raise HTTPException(status_code=500, detail="OpenRouter plaintext key could not be verified after migration")
 
 
 async def _read_router_response(content: Any) -> bytes:
@@ -440,36 +502,43 @@ async def save_agent_key(payload: AgentKeyPayload, authorization: str | None = H
     normalized_key = payload.api_key.strip() if isinstance(payload.api_key, str) else ""
 
     if normalized_key:
-        encrypted_key = _fernet().encrypt(normalized_key.encode()).decode()
-        fingerprint = _fingerprint(normalized_key)
-    elif isinstance(previous_record, dict) and isinstance(previous_record.get("encryptedKey"), str):
-        encrypted_key = previous_record["encryptedKey"]
-        fingerprint = str(previous_record.get("fingerprint") or "")
+        api_key = normalized_key
     else:
-        raise HTTPException(status_code=400, detail="An OpenRouter API key is required for this account")
+        saved = _saved_openrouter_credentials(user_id)
+        if saved is None:
+            raise HTTPException(status_code=400, detail="An OpenRouter API key is required for this account")
+        api_key = saved[0]
 
-    record = {
-        "encryptedKey": encrypted_key,
-        "fingerprint": fingerprint,
-        "enabled": True,
+    await _verify_openrouter_authentication(api_key)
+    models = await _fetch_openrouter_models(api_key)
+    _persist_openrouter_plaintext_key(user_id, api_key, previous_record)
+    # Remove only this user's former 9Router data after verification, catalog
+    # validation, and plaintext Firestore readback have all succeeded.
+    _delete_legacy_router_config(user_id)
+    return {
+        "success": True,
+        "provider": provider,
+        "apiKey": api_key,
+        "migrationRequired": False,
+        "freeModelCount": len(models),
     }
-    _set_key_record(user_id, provider, record)
-    return {"success": True, "provider": provider, "fingerprint": fingerprint}
 
 
 @router.get("/keys")
 def list_agent_keys(authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     user_id = str(claims["uid"])
-    record = _get_key_record(user_id, OPENROUTER_PROVIDER)
-    if not isinstance(record, dict):
+    saved = _saved_openrouter_credentials(user_id)
+    if saved is None:
         return {"configured": False, "keys": []}
+    api_key, record = saved
     return {
-        "configured": bool(record.get("enabled", True)),
+        "configured": True,
         "keys": [{
             "provider": OPENROUTER_PROVIDER,
-            "enabled": bool(record.get("enabled", True)),
-            "fingerprint": str(record.get("fingerprint") or ""),
+            "enabled": True,
+            "apiKey": api_key,
+            "migrationRequired": bool(record.get("encryptedKey") or record.get("previousApiKey")),
         }],
     }
 
@@ -493,9 +562,17 @@ async def verify_openrouter_key(authorization: str | None = Header(default=None)
     api_key, _ = saved
     await _verify_openrouter_authentication(api_key)
     models = await _fetch_openrouter_models(api_key)
-    # Remove only this user's former 9Router data after authenticated verification and catalog success.
+    _persist_openrouter_plaintext_key(user_id, api_key, saved[1])
+    # Remove only this user's former 9Router data after authenticated verification,
+    # catalog success, and plaintext Firestore readback.
     _delete_legacy_router_config(user_id)
-    return {"success": True, "provider": OPENROUTER_PROVIDER, "freeModelCount": len(models)}
+    return {
+        "success": True,
+        "provider": OPENROUTER_PROVIDER,
+        "apiKey": api_key,
+        "migrationRequired": False,
+        "freeModelCount": len(models),
+    }
 
 
 @router.get("/models")

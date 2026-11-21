@@ -41,7 +41,12 @@ class FakeDocument:
         return parent.get(self.path[-1]) if isinstance(parent, dict) else None
 
     def get(self):
-        return FakeSnapshot(self._value())
+        value = self._value()
+        if self.database.corrupt_pending_readback and self.path == ("users", "user-a"):
+            self.database.corrupt_pending_readback = False
+            value = copy.deepcopy(value)
+            value["agentKeys"]["openrouter"]["pendingApiKey"] = "readback-mismatch"
+        return FakeSnapshot(value)
 
     def set(self, value, merge=False):
         parent = self._parent(create=True)
@@ -49,8 +54,16 @@ class FakeDocument:
         existing = parent.get(document_id)
         if not merge or not isinstance(existing, dict):
             parent[document_id] = copy.deepcopy(value)
-            return
-        self._merge(existing, value)
+        else:
+            self._merge(existing, value)
+        openrouter = ((value.get("agentKeys") or {}).get("openrouter") or {})
+        if (
+            self.database.corrupt_pending_on_stage
+            and isinstance(openrouter, dict)
+            and "pendingApiKey" in openrouter
+        ):
+            self.database.corrupt_pending_on_stage = False
+            self.database.corrupt_pending_readback = True
 
     @classmethod
     def _merge(cls, destination, source):
@@ -98,6 +111,8 @@ class FakeCollection:
 class FakeFirestore:
     def __init__(self):
         self.data = {}
+        self.corrupt_pending_readback = False
+        self.corrupt_pending_on_stage = False
 
     def collection(self, name):
         return FakeCollection(self, (name,))
@@ -227,9 +242,18 @@ class AgentKeyUpdateTests(unittest.IsolatedAsyncioTestCase):
     def _user_data(self, user_id):
         return self.database.data.get("users", {}).get(user_id, {})
 
-    async def test_openrouter_key_is_encrypted_and_keeps_legacy_settings_until_verified(self):
-        api_key = "key-that-must-stay-encrypted"
+    def _set_old_openrouter_key(self, user_id, api_key):
+        agent._set_key_record(user_id, "openrouter", {
+            "encryptedKey": agent._fernet().encrypt(api_key.encode()).decode(),
+            "fingerprint": agent._fingerprint(api_key),
+            "enabled": True,
+        })
+
+    async def test_new_key_is_plaintext_only_after_auth_catalog_and_readback_and_scope_is_per_uid(self):
+        api_key = "verified-openrouter-key-for-user-a"
+        other_user_key = "other-user-router-test-key"
         old_router_key = "legacy-router-test-key"
+        self._set_old_openrouter_key("user-a", "old-encrypted-openrouter-key")
         agent._set_key_record("user-a", "9router", {
             "encryptedKey": agent._fernet().encrypt(old_router_key.encode()).decode(),
             "baseUrl": "https://old-router.example/v1",
@@ -242,55 +266,140 @@ class AgentKeyUpdateTests(unittest.IsolatedAsyncioTestCase):
             "displayName": "kept",
         }, merge=True)
         agent._legacy_key_doc("user-a", "9router").set({"encryptedKey": "legacy-cipher"})
-        other_user_key = "other-user-router-test-key"
         agent._set_key_record("user-b", "9router", {
             "encryptedKey": agent._fernet().encrypt(other_user_key.encode()).decode(),
             "baseUrl": "https://other-router.example/v1",
             "enabled": True,
         })
-        payload = agent.AgentKeyPayload(provider="openrouter", api_key=api_key)
+        order = []
 
-        with patch.object(agent, "_claims", return_value={"uid": "user-a"}):
+        async def verify(_api_key):
+            order.append("auth")
+
+        async def fetch(_api_key):
+            order.append("catalog")
+            return [{"id": "free-model:free"}]
+
+        payload = agent.AgentKeyPayload(provider="openrouter", api_key=api_key)
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", side_effect=verify
+        ), patch.object(agent, "_fetch_openrouter_models", side_effect=fetch):
             response = await agent.save_agent_key(payload, "Bearer firebase-token")
 
         user_data = self._user_data("user-a")
         saved = user_data["agentKeys"]["openrouter"]
+        self.assertEqual(order, ["auth", "catalog"])
         self.assertEqual(response["provider"], "openrouter")
-        self.assertEqual(saved["fingerprint"], agent._fingerprint(api_key))
-        self.assertEqual(agent._fernet().decrypt(saved["encryptedKey"].encode()).decode(), api_key)
-        self.assertIn("9router", user_data["agentKeys"])
-        self.assertEqual(user_data["nineRouterApiKey"], old_router_key)
-        self.assertNotIn(api_key, str(user_data))
-
-        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
-            agent, "_verify_openrouter_authentication", side_effect=HTTPException(status_code=401, detail="invalid")
-        ), patch.object(agent, "_fetch_openrouter_models") as fetch_models:
-            with self.assertRaises(HTTPException):
-                await agent.verify_openrouter_key("Bearer firebase-token")
-            fetch_models.assert_not_awaited()
-        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
-        self.assertEqual(self._user_data("user-a")["nineRouterApiKey"], old_router_key)
-
-        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
-            agent, "_verify_openrouter_authentication", return_value=None
-        ), patch.object(agent, "_fetch_openrouter_models", side_effect=HTTPException(status_code=503, detail="unavailable")):
-            with self.assertRaises(HTTPException):
-                await agent.verify_openrouter_key("Bearer firebase-token")
-        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
-        self.assertEqual(self._user_data("user-a")["nineRouterApiKey"], old_router_key)
-
-        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
-            agent, "_fetch_openrouter_models", return_value=[{"id": "free-model:free"}]
-        ), patch.object(agent, "_verify_openrouter_authentication", return_value=None):
-            verified = await agent.verify_openrouter_key("Bearer firebase-token")
-        self.assertEqual(verified["freeModelCount"], 1)
-        user_data = self._user_data("user-a")
+        self.assertEqual(response["apiKey"], api_key)
+        self.assertEqual(response["freeModelCount"], 1)
+        self.assertEqual(saved["apiKey"], api_key)
+        self.assertNotIn("encryptedKey", saved)
+        self.assertNotIn("pendingApiKey", saved)
+        self.assertNotIn("fingerprint", saved)
         self.assertNotIn("9router", user_data["agentKeys"])
         self.assertNotIn("nineRouterApiKey", user_data)
         self.assertNotIn("nineRouterModel", user_data)
         self.assertEqual(user_data["displayName"], "kept")
         self.assertFalse(agent._legacy_key_doc("user-a", "9router").get().exists)
         self.assertIn("9router", self._user_data("user-b")["agentKeys"])
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}):
+            owner_response = agent.list_agent_keys("Bearer owner-token")
+        self.assertEqual(owner_response["keys"][0]["apiKey"], api_key)
+        self.assertNotIn(other_user_key, str(owner_response))
+        with patch.object(agent, "_claims", return_value={"uid": "user-b"}):
+            other_response = agent.list_agent_keys("Bearer other-token")
+        self.assertNotIn(api_key, str(other_response))
+        self.assertTrue(all(item["provider"] != "openrouter" for item in other_response["keys"]))
+
+    async def test_invalid_key_retains_ciphertext_and_legacy_settings(self):
+        self._set_old_openrouter_key("user-a", "old-encrypted-key")
+        old_ciphertext = self._user_data("user-a")["agentKeys"]["openrouter"]["encryptedKey"]
+        agent._set_key_record("user-a", "9router", {"encryptedKey": "legacy-cipher", "enabled": True})
+        payload = agent.AgentKeyPayload(provider="openrouter", api_key="invalid-key")
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", side_effect=HTTPException(status_code=401, detail="invalid")
+        ), patch.object(agent, "_fetch_openrouter_models") as fetch_models:
+            with self.assertRaises(HTTPException):
+                await agent.save_agent_key(payload, "Bearer firebase-token")
+            fetch_models.assert_not_awaited()
+
+        saved = self._user_data("user-a")["agentKeys"]["openrouter"]
+        self.assertEqual(saved["encryptedKey"], old_ciphertext)
+        self.assertNotIn("apiKey", saved)
+        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
+
+    async def test_key_return_rejects_unauthenticated_request(self):
+        with patch.object(agent, "_claims", side_effect=HTTPException(status_code=401, detail="Authentication required")):
+            with self.assertRaises(HTTPException) as raised:
+                agent.list_agent_keys(None)
+        self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_catalog_failure_retains_ciphertext_and_legacy_settings(self):
+        self._set_old_openrouter_key("user-a", "old-encrypted-key")
+        old_ciphertext = self._user_data("user-a")["agentKeys"]["openrouter"]["encryptedKey"]
+        agent._set_key_record("user-a", "9router", {"encryptedKey": "legacy-cipher", "enabled": True})
+        payload = agent.AgentKeyPayload(provider="openrouter", api_key="verified-but-catalog-failed")
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", return_value=None
+        ), patch.object(agent, "_fetch_openrouter_models", side_effect=HTTPException(status_code=503, detail="unavailable")):
+            with self.assertRaises(HTTPException):
+                await agent.save_agent_key(payload, "Bearer firebase-token")
+
+        saved = self._user_data("user-a")["agentKeys"]["openrouter"]
+        self.assertEqual(saved["encryptedKey"], old_ciphertext)
+        self.assertNotIn("apiKey", saved)
+        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
+
+    async def test_failed_plaintext_readback_retains_ciphertext_and_old_key_remains_active(self):
+        self._set_old_openrouter_key("user-a", "old-encrypted-key")
+        self.database.corrupt_pending_on_stage = True
+        old_ciphertext = self._user_data("user-a")["agentKeys"]["openrouter"]["encryptedKey"]
+        agent._set_key_record("user-a", "9router", {"encryptedKey": "legacy-cipher", "enabled": True})
+        payload = agent.AgentKeyPayload(provider="openrouter", api_key="candidate-key")
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", return_value=None
+        ), patch.object(agent, "_fetch_openrouter_models", return_value=[{"id": "free-model:free"}]):
+            with self.assertRaises(HTTPException) as raised:
+                await agent.save_agent_key(payload, "Bearer firebase-token")
+
+        self.assertEqual(raised.exception.status_code, 500)
+        saved = self._user_data("user-a")["agentKeys"]["openrouter"]
+        self.assertEqual(saved["encryptedKey"], old_ciphertext)
+        self.assertNotIn("apiKey", saved)
+        self.assertEqual(saved["pendingApiKey"], "candidate-key")
+        self.assertIn("9router", self._user_data("user-a")["agentKeys"])
+        active_key, _ = agent._saved_openrouter_credentials("user-a")
+        self.assertEqual(active_key, "old-encrypted-key")
+
+    async def test_verifying_existing_ciphertext_migrates_to_plaintext_after_catalog_success(self):
+        old_key = "owner-encrypted-openrouter-key"
+        self._set_old_openrouter_key("user-a", old_key)
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}):
+            before = agent.list_agent_keys("Bearer firebase-token")
+        self.assertEqual(before["keys"][0]["apiKey"], old_key)
+        self.assertTrue(before["keys"][0]["migrationRequired"])
+
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}), patch.object(
+            agent, "_verify_openrouter_authentication", return_value=None
+        ), patch.object(agent, "_fetch_openrouter_models", return_value=[{"id": "free-model:free"}]):
+            response = await agent.save_agent_key(
+                agent.AgentKeyPayload(provider="openrouter", api_key=""),
+                "Bearer firebase-token",
+            )
+
+        saved = self._user_data("user-a")["agentKeys"]["openrouter"]
+        self.assertEqual(response["apiKey"], old_key)
+        self.assertEqual(response["freeModelCount"], 1)
+        self.assertEqual(saved["apiKey"], old_key)
+        self.assertNotIn("encryptedKey", saved)
+        with patch.object(agent, "_claims", return_value={"uid": "user-a"}):
+            after = agent.list_agent_keys("Bearer firebase-token")
+        self.assertEqual(after["keys"][0]["apiKey"], old_key)
+        self.assertFalse(after["keys"][0]["migrationRequired"])
 
 
 if __name__ == "__main__":
