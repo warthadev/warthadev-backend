@@ -1,4 +1,4 @@
-# universal_worker.py
+# Kaggle universal + torrent downloader worker
 import os
 import re
 import sys
@@ -9,7 +9,6 @@ import tempfile
 import threading
 import importlib
 import importlib.util
-from html import escape as _esc
 from urllib.parse import urlparse, unquote
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -18,12 +17,13 @@ os.environ["TQDM_DISABLE"] = "1"
 WORKER_VERSION = "2026-11-22-universal+torrent-kaggle"
 
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
-BASE_DIR = "/kaggle/working" if IS_KAGGLE else "/content"
+BASE_DIR = "/kaggle/working"
 
 
-def run_colab_worker(session_id=None, backend_url=None):
-    """Jalankan worker. Colab: tampil widget. Kaggle / dengan session_id: headless, selesai sendiri."""
-    HEADLESS = IS_KAGGLE or bool(session_id and backend_url)
+def run_kaggle_worker(session_id=None, backend_url=None):
+    """Jalankan satu sesi downloader dari kernel Kaggle secara headless."""
+    if not IS_KAGGLE:
+        raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
     print(f"[universal] worker version: {WORKER_VERSION}")
     UPGRADE_YTDLP = True
     _PIP_PKGS = {
@@ -73,20 +73,8 @@ def run_colab_worker(session_id=None, backend_url=None):
         return pkgs
 
     def _ensure_deps():
-        try:
-            from IPython.display import display, HTML
-        except Exception:
-            display = lambda *a, **k: None
-            HTML = lambda x: x
-        if HEADLESS:
-            display = lambda *a, **k: None
-        prebuilt = _load_prebuilt_env() if IS_KAGGLE else None
-        print("[setup] env siap pakai dari Dataset" if prebuilt else "[setup] memeriksa dependencies...")
-        display(HTML("""
-        <div style="font-family:monospace; padding: 15px; background: #1e1e1e; border-radius: 8px; border-left: 4px solid #2196F3; color: #e0e0e0; margin-bottom: 10px;">
-            <b style="color: #2196F3;">[SETUP]</b> Memeriksa dan menginstal dependencies...
-        </div>
-        """))
+        prebuilt = _load_prebuilt_env()
+        print("[setup] env siap pakai dari Dataset" if prebuilt else "[setup] memeriksa dependencies...", flush=True)
 
         need_apt = [pkg for b, pkg in _APT_PKGS.items() if not shutil.which(b)]
         if need_apt:
@@ -102,35 +90,16 @@ def run_colab_worker(session_id=None, backend_url=None):
             _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", *_tgt, "yt-dlp", "gallery-dl"])
 
         importlib.invalidate_caches()
-
         missing = [b for b in _APT_PKGS if not shutil.which(b)]
         missing += [mod for mod in _PIP_PKGS if importlib.util.find_spec(mod) is None]
-        
         if missing:
             err_msg = f"MASIH KURANG: {', '.join(missing)} (cek koneksi runtime)"
-            display(HTML(f"""
-            <div style="font-family:monospace; padding: 15px; background: #2a1a1a; border-radius: 8px; border-left: 4px solid #F44336; color: #F44336; margin-bottom: 10px;">
-                <b>[ERROR]</b> {err_msg}
-            </div>
-            """))
+            print(f"[setup] ERROR: {err_msg}", flush=True)
             raise RuntimeError(err_msg)
-        else:
-            display(HTML("""
-            <div style="font-family:monospace; padding: 15px; background: #1a2e1a; border-radius: 8px; border-left: 4px solid #4CAF50; color: #4CAF50; margin-bottom: 10px;">
-                <b>[SETUP]</b> Semua dependency siap.
-            </div>
-            """))
+        print("[setup] Semua dependency siap.", flush=True)
 
     _ensure_deps()
 
-    try:
-        from IPython.display import display, HTML, JSON
-    except Exception:
-        display = lambda *a, **k: None
-        HTML = lambda x: x
-        JSON = lambda x: x
-
-    COLAB_SAVE = f"{BASE_DIR}/Universal"
     TEMP_PATH = f"{BASE_DIR}/Temp"
     COOKIES_FILE = f"{BASE_DIR}/cookies.txt"
     if IS_KAGGLE and not os.path.exists(COOKIES_FILE):
@@ -175,7 +144,6 @@ def run_colab_worker(session_id=None, backend_url=None):
     }
     _stop = threading.Event()
     _mode = {"v": "universal"}
-    _runner = None
     _image_urls = {}
 
     def _reset_state():
@@ -187,7 +155,7 @@ def run_colab_worker(session_id=None, backend_url=None):
         })
 
     def _ensure_dirs():
-        for p in (COLAB_SAVE, TEMP_PATH): os.makedirs(p, exist_ok=True)
+        os.makedirs(TEMP_PATH, exist_ok=True)
 
     def _format_size(num):
         try: n = float(num)
@@ -210,107 +178,11 @@ def run_colab_worker(session_id=None, backend_url=None):
 
     def _cookie_opts(): return {"cookiefile": COOKIES_FILE} if os.path.exists(COOKIES_FILE) else {}
 
-    _PHASE_STYLE = {
-        "idle": ("#888", "WAITING FOR INPUT"), "fetching": ("#2196F3", "FETCHING CONFIG"),
-        "waiting": ("#FF9800", "WAITING FOR USER"), "downloading": ("#4CAF50", "DOWNLOADING"),
-        "uploading": ("#FF9800", "UPLOADING TO HUGGING FACE"), "done": ("#00BCD4", "ALL DONE"),
-        "error": ("#F44336", "ERROR"),
-    }
-    _BADGES = {
-        "done": ("#4CAF50", "DONE"), "uploading": ("#FF9800", "UPLOAD"),
-        "downloading": ("#2196F3", "DOWNLOAD"), "downloaded": ("#00BCD4", "READY"),
-        "error": ("#F44336", "FAILED"), "pending": ("#555", "PENDING"),
-    }
-
-    def _render_ui():
-        s = dict(_state)
-        files = list(s["files"])
-        phase = s["phase"]
-        color, label = _PHASE_STYLE.get(phase, ("#888", phase.upper()))
-        total, completed, failed = s["total_files"], s["completed_files"], s["failed_files"]
-        overall = int(((completed + failed) / total) * 100) if total > 0 else 0
-
-        eta = s["eta_seconds"]
-        eta_str = "--"
-        if isinstance(eta, (int, float)) and eta >= 0:
-            secs = int(eta)
-            eta_str = f"{secs}s" if secs < 60 else (f"{secs / 60:.1f}m" if secs < 3600 else f"{secs / 3600:.1f}h")
-
-        rows = ""
-        for idx, f in enumerate(files, start=1):
-            badge_bg, badge_text = _BADGES.get(f.get("_status", "pending"), _BADGES["pending"])
-            row_color = "#888" if badge_text == "PENDING" else badge_bg
-            size_str = _format_size(f.get("size", 0)) if f.get("size") else ""
-            rows += f"""
-            <div style="display:grid;grid-template-columns:34px 1fr 90px 80px;padding:8px 10px;
-                        border-bottom:1px solid #2a2a2a;color:{row_color};font-family:monospace;
-                        font-size:12px;align-items:center;gap:8px;">
-                <span style="color:#888;font-size:11px;">#{idx}</span>
-                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{_esc(str(f.get("name", "")))}</span>
-                <span style="text-align:right;color:#aaa;font-size:11px;">{size_str}</span>
-                <span style="text-align:center;background:{badge_bg};color:#fff;border-radius:4px;
-                             font-size:10px;padding:2px 6px;font-weight:bold;">{badge_text}</span>
-            </div>"""
-        if not rows:
-            rows = '<div style="padding:16px;text-align:center;color:#666;font-family:monospace;font-size:12px;">No files loaded yet</div>'
-
-        err_html = ""
-        if s["error"]:
-            err_html = f"""<div style="margin-top:10px;padding:10px 14px;background:#2a1a1a;border-left:4px solid #F44336;
-                        border-radius:6px;color:#F44336;font-family:monospace;font-size:12px;word-break:break-all;">{_esc(str(s["error"]))}</div>"""
-        msg_html = ""
-        if s["message"]:
-            msg_html = f"""<div style="margin-top:10px;padding:10px 14px;background:#1a1a2e;border-left:4px solid {color};
-                        border-radius:6px;color:#e0e0e0;font-family:monospace;font-size:12px;word-break:break-all;">{_esc(str(s["message"]))}</div>"""
-
-        prog_html = ""
-        if phase in ("downloading", "uploading"):
-            prog_html = f"""
-            <div style="margin-top:12px;padding:12px 14px;background:#141420;border-radius:8px;border:1px solid #2a2a4a;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <span style="color:#e0e0e0;font-family:monospace;font-size:12px;overflow:hidden;
-                                 text-overflow:ellipsis;white-space:nowrap;max-width:60%;">{_esc(str(s["current_file"]))}</span>
-                    <span style="color:{color};font-family:monospace;font-size:11px;font-weight:bold;">
-                        [{s["current_index"]}/{total}] {label}</span>
-                </div>
-                <div style="background:#2a2a2a;border-radius:6px;height:18px;overflow:hidden;">
-                    <div style="background:linear-gradient(90deg,{color},{color}cc);height:100%;width:{s["percent"]}%;
-                                transition:width .3s linear;border-radius:6px;display:flex;align-items:center;
-                                justify-content:center;color:#fff;font-size:10px;font-weight:bold;">{s["percent"]}%</div>
-                </div>
-                <div style="display:flex;justify-content:space-between;margin-top:6px;color:#888;font-family:monospace;font-size:11px;">
-                    <span>{s["current_human"]} / {s["total_human"]}</span>
-                    <span>{s["speed_human"]} · ETA {eta_str}</span>
-                </div>
-            </div>"""
-
-        return f"""
-        <div style="font-family:monospace;margin:10px 0;background:linear-gradient(135deg,#0f0f1e,#1a1a2e,#16213e);
-                    border-radius:12px;border:1px solid #2a2a4a;padding:16px;color:#e0e0e0;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                <div style="color:#4CAF50;font-size:16px;font-weight:bold;letter-spacing:1px;">{_mode["v"].upper()} COLAB</div>
-                <div style="color:{color};font-size:11px;font-weight:bold;background:rgba(255,255,255,0.05);
-                            padding:4px 10px;border-radius:20px;border:1px solid {color};">{label}</div>
-            </div>
-            <div style="display:flex;gap:16px;margin-bottom:12px;font-size:11px;color:#888;">
-                <span>Total: <b style="color:#e0e0e0;">{total}</b></span>
-                <span>Done: <b style="color:#4CAF50;">{completed}</b></span>
-                <span>Failed: <b style="color:#F44336;">{failed}</b></span>
-                <span>Overall: <b style="color:#00BCD4;">{overall}%</b></span>
-            </div>
-            <div style="background:#141420;border-radius:8px;border:1px solid #2a2a4a;max-height:320px;overflow-y:auto;">{rows}</div>
-            {prog_html}{msg_html}{err_html}
-        </div>"""
-
     def _set_state(**kw): _state.update(kw)
-
-    def _poll():
-        try: return JSON({"html": _render_ui()})
-        except Exception as e: return JSON({"html": f"<pre style='color:#F44336'>UI error: {_esc(_clean_err(e))}</pre>"})
 
     def _post_update(payload, retries=POST_RETRY_COUNT):
         if not SESSION_ID or not BACKEND_URL: return False
-        url = f"{BACKEND_URL.rstrip('/')}/{_mode["v"]}/colab-update"
+        url = f"{BACKEND_URL.rstrip('/')}/{_mode["v"]}/kaggle-update"
         import requests
         for attempt in range(retries):
             try:
@@ -322,7 +194,7 @@ def run_colab_worker(session_id=None, backend_url=None):
 
     def _fetch_config(session_id, backend_url):
         import requests
-        url = f"{backend_url.rstrip('/')}/{_mode["v"]}/colab-config"
+        url = f"{backend_url.rstrip('/')}/{_mode["v"]}/kaggle-config"
         for attempt in range(POST_RETRY_COUNT):
             try:
                 r = requests.get(url, params={"session_id": session_id}, timeout=30)
@@ -334,7 +206,7 @@ def run_colab_worker(session_id=None, backend_url=None):
     def _check_status(session_id, backend_url):
         import requests
         try:
-            r = requests.get(f"{backend_url.rstrip('/')}/{_mode["v"]}/colab-check",
+            r = requests.get(f"{backend_url.rstrip('/')}/{_mode["v"]}/kaggle-check",
                              params={"session_id": session_id}, timeout=15)
             if r.ok: return r.json().get("status")
         except Exception: pass
@@ -1505,7 +1377,7 @@ def run_colab_worker(session_id=None, backend_url=None):
         for mode in ("universal", "torrent"):
             for attempt in range(POST_RETRY_COUNT):
                 try:
-                    r = requests.get(f"{base}/{mode}/colab-config", params={"session_id": session_id}, timeout=30)
+                    r = requests.get(f"{base}/{mode}/kaggle-config", params={"session_id": session_id}, timeout=30)
                     if r.ok:
                         j = r.json()
                         if j.get("ok"): return mode, j, None
@@ -1542,124 +1414,26 @@ def run_colab_worker(session_id=None, backend_url=None):
             _start_universal(session_id, backend_url)
 
     def _on_stopped():
-        _set_state(phase="error", message="", error="Dihentikan. Tekan START DOWNLOAD lagi (Session ID sama).")
-        _post_update({"status": "error", "phase": "resolve", "error": "Dihentikan dari Colab", "finished": True})
+        _set_state(phase="error", message="", error="Proses dihentikan.")
+        _post_update({"status": "error", "phase": "resolve", "error": "Dihentikan dari Kaggle worker", "finished": True})
 
-    def _on_start_click(session_id, backend_url):
-        nonlocal _runner
-        if _runner is not None and _runner.is_alive():
-            _set_state(message="Masih berjalan. Tekan STOP dulu kalau mau mulai ulang.")
-            return
-
-        _stop.clear()
-        _reset_state()
-
-        def run():
-            try: _start_session(session_id, backend_url)
-            except KeyboardInterrupt: _on_stopped()
-            except Exception as e:
-                _set_state(phase="error", message="", error=f"Unexpected: {_clean_err(e)[:300]}")
-                _post_update({"status": "error", "phase": "resolve", "error": _clean_err(e)[:300], "finished": True})
-
-        _runner = threading.Thread(target=run, daemon=True)
-        _runner.start()
-
-    def _on_stop_click():
-        if _runner is None or not _runner.is_alive():
-            _set_state(message="Tidak ada proses yang berjalan.")
-            return
-        _stop.set()
-        _set_state(message="Menghentikan... (upload yang sedang berjalan selesai dulu)")
-
-    def _run_headless(sid, backend):
+    def _run_kaggle_job(sid, backend):
         sid = sid or os.environ.get("WORKER_SESSION_ID", "")
         backend = backend or os.environ.get("WORKER_BACKEND_URL", "")
         if not sid or not backend:
-            raise RuntimeError("Mode headless butuh session_id dan backend_url")
-        _on_start_click(sid, backend)
-        last = ""
-        while _runner is not None and _runner.is_alive():
-            line = f"[{_state.get('phase')}] {_state.get('percent')}% {_state.get('message', '')}"
-            if line != last:
-                print(line, flush=True)
-                last = line
-            time.sleep(5)
+            raise RuntimeError("Mode Kaggle memerlukan session_id dan backend_url")
+        _stop.clear()
+        _reset_state()
+        try:
+            _start_session(sid, backend)
+        except KeyboardInterrupt:
+            _on_stopped()
+        except Exception as e:
+            err = _clean_err(e)[:300]
+            _set_state(phase="error", message="", error=f"Unexpected: {err}")
+            _post_update({"status": "error", "phase": "resolve", "error": err, "finished": True})
+        finally:
+            shutil.rmtree(TEMP_PATH, ignore_errors=True)
         print(f"[selesai] phase={_state.get('phase')} {_state.get('error', '')}", flush=True)
 
-    try:
-        from google.colab import output as _colab_output
-        _colab_output.register_callback("universal_start", _on_start_click)
-        _colab_output.register_callback("universal_stop", _on_stop_click)
-        _colab_output.register_callback("universal_poll", _poll)
-    except Exception: pass
-
-    def _bootstrap():
-        _ensure_dirs()
-        display(HTML("""
-        <div style="font-family:monospace;margin:10px 0;padding:18px;background:linear-gradient(135deg,#0f0f1e,#1a1a2e,#16213e);
-                    border-radius:12px;border:1px solid #2a2a4a;color:#e0e0e0;">
-            <div style="color:#4CAF50;font-size:18px;font-weight:bold;letter-spacing:2px;text-align:center;">UNIVERSAL + TORRENT COLAB</div>
-            <div style="color:#888;font-size:12px;margin-top:4px;text-align:center;">
-                Download media universal &amp; torrent di Colab · Upload otomatis ke Hugging Face</div>
-            <div style="margin-top:18px;">
-                <label style="font-size:11px;color:#888;letter-spacing:1px;">SESSION ID</label>
-                <input id="uvd-session-id" type="text" placeholder="paste dari kernel log"
-                       style="width:100%;margin-top:6px;padding:10px 12px;background:#0a0a14;border:1px solid #2a2a4a;
-                              border-radius:6px;color:#e0e0e0;font-family:monospace;font-size:13px;outline:none;box-sizing:border-box;" />
-            </div>
-            <div style="margin-top:12px;">
-                <label style="font-size:11px;color:#888;letter-spacing:1px;">BACKEND URL</label>
-                <input id="uvd-backend-url" type="text" value="https://warthadev-backend.onrender.com"
-                       style="width:100%;margin-top:6px;padding:10px 12px;background:#0a0a14;border:1px solid #2a2a4a;
-                              border-radius:6px;color:#e0e0e0;font-family:monospace;font-size:13px;outline:none;box-sizing:border-box;" />
-            </div>
-            <button id="uvd-start-btn"
-                    style="margin-top:16px;width:100%;padding:12px 20px;background:linear-gradient(90deg,#4CAF50,#00BCD4);
-                           border:none;border-radius:8px;color:white;font-family:monospace;font-size:14px;font-weight:bold;
-                           cursor:pointer;letter-spacing:1px;">START DOWNLOAD</button>
-            <button id="uvd-stop-btn"
-                    style="margin-top:10px;width:100%;padding:12px 20px;background:linear-gradient(90deg,#F44336,#FF9800);
-                           border:none;border-radius:8px;color:white;font-family:monospace;font-size:14px;font-weight:bold;
-                           cursor:pointer;letter-spacing:1px;">STOP</button>
-            <div id="uvd-ui" style="margin-top:6px;"></div>
-        </div>
-        <script>
-        (function() {
-            var btn = document.getElementById('uvd-start-btn');
-            if (!btn) return;
-            btn.addEventListener('click', function() {
-                var sid = (document.getElementById('uvd-session-id').value || '').trim();
-                var backend = (document.getElementById('uvd-backend-url').value || '').trim();
-                if (!sid) { alert('Isi Session ID dulu'); return; }
-                google.colab.kernel.invokeFunction('universal_start', [sid, backend], {});
-            });
-            var stop = document.getElementById('uvd-stop-btn');
-            if (stop) stop.addEventListener('click', function() {
-                google.colab.kernel.invokeFunction('universal_stop', [], {});
-            });
-            if (window.__uvdPoll) { clearInterval(window.__uvdPoll); }
-            var busy = false;
-            async function tick() {
-                if (busy) return;
-                var box = document.getElementById('uvd-ui');
-                if (!box) { clearInterval(window.__uvdPoll); return; }
-                busy = true;
-                try {
-                    var r = await google.colab.kernel.invokeFunction('universal_poll', [], {});
-                    var html = r.data['application/json'].html;
-                    if (box.__last !== html) { box.innerHTML = html; box.__last = html; }
-                } catch (e) {}
-                busy = false;
-            }
-            window.__uvdPoll = setInterval(tick, 1000);
-            tick();
-        })();
-        </script>"""))
-
-    if HEADLESS:
-        _run_headless(session_id, backend_url)
-        return
-    _bootstrap()
-
-
-run_worker = run_colab_worker
+    _run_kaggle_job(session_id, backend_url)

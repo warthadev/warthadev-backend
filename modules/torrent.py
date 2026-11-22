@@ -98,11 +98,11 @@ def _persist_sessions() -> None:
                     "created_at": sess.get("created_at"),
                     "started_at": sess.get("started_at"),
                     "expires_at": sess.get("expires_at"),
-                    "colab_files": sess.get("colab_files", []),
-                    "colab_token": sess.get("colab_token"),
-                    "colab_repo_id": sess.get("colab_repo_id"),
-                    "colab_repo_type": sess.get("colab_repo_type"),
-                    "colab_folder": sess.get("colab_folder"),
+                    "kaggle_files": sess.get("kaggle_files", []),
+                    "hf_token": sess.get("hf_token"),
+                    "hf_repo_id": sess.get("hf_repo_id"),
+                    "hf_repo_type": sess.get("hf_repo_type"),
+                    "hf_folder": sess.get("hf_folder"),
                     "save_status": sess.get("save_status"),
                     "save_error": sess.get("save_error"),
                     "save_url": sess.get("save_url"),
@@ -412,8 +412,8 @@ async def torrent_progress(sid: str):
     }
 
 
-@router.post("/colab-start")
-async def torrent_colab_start(request: Request):
+@router.post("/kaggle-start")
+async def torrent_kaggle_start(request: Request):
     body = await request.json()
     magnet = str(body.get("magnet") or "").strip()
     token = str(body.get("token") or "").strip()
@@ -431,38 +431,38 @@ async def torrent_colab_start(request: Request):
         raise HTTPException(400, "repo_id not valid")
     if repo_type not in HF_REPO_TYPES:
         raise HTTPException(400, "repo_type not valid")
-    if not files:
+    if not isinstance(files, list) or not files:
         raise HTTPException(400, "files is required")
 
     _cleanup_stale_sessions()
-
     now = time.time()
     appended = False
-
     if existing_sid:
         with _sessions_lock:
             sess = _sessions.get(existing_sid)
             if sess:
                 appended = True
-                merged = list(sess.get("colab_files") or [])
+                merged = list(sess.get("kaggle_files") or [])
                 seen = {(int(f.get("index", 0)), str(f.get("name", ""))) for f in merged}
-                for f in files:
-                    key = (int(f.get("index", 0)), str(f.get("name", "")))
+                for item in files:
+                    if not isinstance(item, dict):
+                        continue
+                    key = (int(item.get("index", 0)), str(item.get("name", "")))
                     if key not in seen:
                         merged.append({
-                            "index": int(f.get("index", 0)),
-                            "name": str(f.get("name", "")),
-                            "size": int(f.get("size", 0)),
+                            "index": key[0],
+                            "name": key[1],
+                            "size": int(item.get("size", 0)),
                         })
                         seen.add(key)
-                sess["colab_files"] = merged
+                sess["kaggle_files"] = merged
                 sess["magnet"] = magnet
-                sess["colab_token"] = token
-                sess["colab_repo_id"] = repo_id
-                sess["colab_repo_type"] = repo_type
-                sess["colab_folder"] = folder
+                sess["hf_token"] = token
+                sess["hf_repo_id"] = repo_id
+                sess["hf_repo_type"] = repo_type
+                sess["hf_folder"] = folder
                 sess["expires_at"] = now + SESSION_TTL_SECONDS
-                sess["status"] = "colab"
+                sess["status"] = "kaggle"
                 sess["phase"] = "download"
                 sess["percent"] = 0
                 sess["current_human"] = "0 B"
@@ -485,25 +485,7 @@ async def torrent_colab_start(request: Request):
                 total_files = len(merged)
         _persist_sessions()
         if appended:
-            requested_runner = str(body.get("runner") or "kaggle").lower()
-            runner = "colab" if requested_runner == "colab" else None
-            runner_error = None
-            if requested_runner != "colab":
-                if not kaggle_runner.kaggle_enabled():
-                    runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
-                else:
-                    res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
-                    if res.get("ok"):
-                        runner = "kaggle"
-                    else:
-                        runner_error = res.get("error")
-                if runner == "kaggle":
-                    with _sessions_lock:
-                        if sid in _sessions:
-                            _sessions[sid]["runner"] = "kaggle"
-                    _persist_sessions()
-                else:
-                    runner = "unavailable"
+            runner, runner_error = await _launch_kaggle_worker(sid, request)
             return {
                 "ok": True,
                 "session_id": sid,
@@ -514,14 +496,13 @@ async def torrent_colab_start(request: Request):
             }
 
     sid = uuid.uuid4().hex[:16]
-
     with _sessions_lock:
         _sessions[sid] = {
             "session_id": sid,
             "magnet": magnet,
             "file_name": "",
             "dir": _session_dir(sid),
-            "status": "colab",
+            "status": "kaggle",
             "phase": "download",
             "percent": 0,
             "current_human": "0 B",
@@ -537,45 +518,24 @@ async def torrent_colab_start(request: Request):
             "created_at": now,
             "started_at": now,
             "expires_at": now + SESSION_TTL_SECONDS,
-            "colab_files": [
+            "kaggle_files": [
                 {
-                    "index": int(f.get("index", 0)),
-                    "name": str(f.get("name", "")),
-                    "size": int(f.get("size", 0)),
+                    "index": int(item.get("index", 0)),
+                    "name": str(item.get("name", "")),
+                    "size": int(item.get("size", 0)),
                 }
-                for f in files
+                for item in files if isinstance(item, dict)
             ],
-            "colab_token": token,
-            "colab_repo_id": repo_id,
-            "colab_repo_type": repo_type,
-            "colab_folder": folder,
+            "hf_token": token,
+            "hf_repo_id": repo_id,
+            "hf_repo_type": repo_type,
+            "hf_folder": folder,
             "total_size_bytes": 0,
             "total_speed_bps": 0,
             "total_elapsed_seconds": 0,
         }
-
     _persist_sessions()
-
-    requested_runner = str(body.get("runner") or "kaggle").lower()
-    runner = "colab" if requested_runner == "colab" else None
-    runner_error = None
-    if requested_runner != "colab":
-        if not kaggle_runner.kaggle_enabled():
-            runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
-        else:
-            res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
-            if res.get("ok"):
-                runner = "kaggle"
-            else:
-                runner_error = res.get("error")
-        if runner == "kaggle":
-            with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["runner"] = "kaggle"
-            _persist_sessions()
-        else:
-            runner = "unavailable"
-
+    runner, runner_error = await _launch_kaggle_worker(sid, request)
     return {
         "ok": True,
         "session_id": sid,
@@ -586,22 +546,33 @@ async def torrent_colab_start(request: Request):
     }
 
 
-@router.get("/colab-config")
-async def torrent_colab_config(session_id: str = Query(...)):
+async def _launch_kaggle_worker(session_id: str, request: Request):
+    if not kaggle_runner.kaggle_enabled():
+        return "unavailable", "Kaggle runner tidak siap: periksa token, username, dan worker backend."
+    result = await kaggle_runner.start_worker(
+        session_id,
+        kaggle_runner.resolve_backend_url(str(request.base_url)),
+    )
+    if not result.get("ok"):
+        return "unavailable", result.get("error")
+    return "kaggle", None
+
+
+@router.get("/kaggle-config")
+async def torrent_kaggle_config(session_id: str = Query(...)):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
-        files = list(sess.get("colab_files") or [])
+        files = list(sess.get("kaggle_files") or [])
         magnet = sess.get("magnet")
-        token = sess.get("colab_token")
-        repo_id = sess.get("colab_repo_id")
-        repo_type = sess.get("colab_repo_type") or "dataset"
-        folder = sess.get("colab_folder") or ""
+        token = sess.get("hf_token")
+        repo_id = sess.get("hf_repo_id")
+        repo_type = sess.get("hf_repo_type") or "dataset"
+        folder = sess.get("hf_folder") or ""
 
     if not files:
         raise HTTPException(404, "no files in session")
-
     return {
         "ok": True,
         "session_id": session_id,
@@ -614,14 +585,13 @@ async def torrent_colab_config(session_id: str = Query(...)):
     }
 
 
-@router.post("/colab-update")
-async def torrent_colab_update(request: Request, session_id: str = Query(...)):
+@router.post("/kaggle-update")
+async def torrent_kaggle_update(request: Request, session_id: str = Query(...)):
     body = await request.json()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
-
         for key in (
             "status", "phase", "percent", "current_human", "total_human",
             "speed_human", "eta_seconds", "file_name", "current_file_index",
@@ -631,25 +601,20 @@ async def torrent_colab_update(request: Request, session_id: str = Query(...)):
         ):
             if key in body:
                 sess[key] = body[key]
-
         sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
-
         if body.get("save_status") == "done":
             done_name = str(body.get("file_name") or "").strip()
             if done_name:
-                remaining = [
-                    f for f in (sess.get("colab_files") or [])
-                    if str(f.get("name", "")) != done_name
+                sess["kaggle_files"] = [
+                    item for item in (sess.get("kaggle_files") or [])
+                    if str(item.get("name", "")) != done_name
                 ]
-                sess["colab_files"] = remaining
-
     _persist_sessions()
-
     return {"ok": True}
 
 
-@router.get("/colab-session")
-async def torrent_colab_session(session_id: str = Query(...)):
+@router.get("/kaggle-session")
+async def torrent_kaggle_session(session_id: str = Query(...)):
     now = time.time()
     with _sessions_lock:
         sess = _sessions.get(session_id)
@@ -657,11 +622,11 @@ async def torrent_colab_session(session_id: str = Query(...)):
             raise HTTPException(410, "session not found or expired")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         seconds_left = max(0, int(expires_at - now))
-        colab_files = list(sess.get("colab_files") or [])
+        files = list(sess.get("kaggle_files") or [])
         file_indexes = sorted({
-            int(f.get("index", 0))
-            for f in colab_files
-            if int(f.get("index", 0)) > 0
+            int(item.get("index", 0))
+            for item in files
+            if int(item.get("index", 0)) > 0
         })
         return {
             "ok": True,
@@ -671,7 +636,7 @@ async def torrent_colab_session(session_id: str = Query(...)):
             "ttl_seconds": SESSION_TTL_SECONDS,
             "status": sess.get("status"),
             "file_indexes": file_indexes,
-            "files_count": len(colab_files),
+            "files_count": len(files),
         }
 
 

@@ -45,6 +45,7 @@ AGENT_TIMEOUT="210"
 
 ### Kaggle downloader worker
 Set these on the backend deployment. The backend pushes and runs a private Kaggle kernel through the Kaggle CLI; the frontend only polls Render for progress, so no manual notebook launch is needed.
+The worker keeps downloads temporarily in `/kaggle/working/Temp`, uploads each completed file to Hugging Face, removes each per-download folder, and removes the `Temp` directory when the worker session ends. It is not a permanent archive.
 ```env
 KAGGLE_API_TOKEN="KGAT_..."
 KAGGLE_USERNAME="your-kaggle-username"

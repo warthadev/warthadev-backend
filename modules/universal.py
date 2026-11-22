@@ -247,7 +247,7 @@ def _resolve_sync(url: str) -> Dict[str, Any]:
         }
 
     if _skip_on_server(url):
-        return {"ok": False, "reason": "resolved via Colab"}
+        return {"ok": False, "reason": "requires Kaggle worker"}
     if not _is_public_url(url):
         return {"ok": False, "reason": "url not allowed"}
     if not _resolve_lock.acquire(blocking=False):
@@ -355,8 +355,8 @@ async def universal_resolve(request: Request):
     return result
 
 
-@router.post("/colab-start")
-async def universal_colab_start(request: Request):
+@router.post("/kaggle-start")
+async def universal_kaggle_start(request: Request):
     body = await request.json()
     url = str(body.get("url") or "").strip()
     token = str(body.get("token") or "").strip()
@@ -368,7 +368,6 @@ async def universal_colab_start(request: Request):
         formats = []
     formats = [f for f in formats if isinstance(f, dict)][:50]
     preselected = bool(body.get("preselected")) and len(formats) > 0
-
     if not url:
         raise HTTPException(400, "url is required")
     if not token:
@@ -379,26 +378,20 @@ async def universal_colab_start(request: Request):
         raise HTTPException(400, "repo_type not valid")
 
     existing_sid = str(body.get("session_id") or "").strip().lower()
-
     _cleanup_stale_sessions()
     now = time.time()
     reused = False
     existing_runner = None
-
-    if existing_sid and SID_RE.match(existing_sid):
-        sid = existing_sid
-    else:
-        sid = uuid.uuid4().hex[:16]
-
+    sid = existing_sid if existing_sid and SID_RE.match(existing_sid) else uuid.uuid4().hex[:16]
     fresh = {
         "url": url,
         "formats": formats if preselected else [],
         "preselected": preselected,
         "meta": None,
-        "colab_token": token,
-        "colab_repo_id": repo_id,
-        "colab_repo_type": repo_type,
-        "colab_folder": folder,
+        "hf_token": token,
+        "hf_repo_id": repo_id,
+        "hf_repo_type": repo_type,
+        "hf_folder": folder,
         "status": "waiting",
         "phase": "resolve",
         "percent": 0,
@@ -414,7 +407,6 @@ async def universal_colab_start(request: Request):
         "save_url": None,
         "expires_at": now + SESSION_TTL_SECONDS,
     }
-
     with _sessions_lock:
         sess = _sessions.get(sid)
         if sess:
@@ -424,21 +416,20 @@ async def universal_colab_start(request: Request):
             sess.update(fresh)
         else:
             _sessions[sid] = {"session_id": sid, "created_at": now, "started_at": now, **fresh}
-
     _persist_sessions()
-    logger.info(f"universal colab-start sid={sid} reused={reused} pid={os.getpid()} sessions={len(_sessions)}")
-    requested_runner = str(body.get("runner") or "kaggle").lower()
-    runner = "colab" if requested_runner == "colab" else ("kaggle" if reused and existing_runner == "kaggle" else None)
+
+    logger.info(f"universal kaggle-start sid={sid} reused={reused} pid={os.getpid()} sessions={len(_sessions)}")
+    runner = "kaggle" if reused and existing_runner == "kaggle" else None
     runner_error = None
-    if requested_runner != "colab" and runner != "kaggle":
+    if runner is None:
         if not kaggle_runner.kaggle_enabled():
             runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
         else:
-            res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
-            if res.get("ok"):
+            result = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+            if result.get("ok"):
                 runner = "kaggle"
             else:
-                runner_error = res.get("error")
+                runner_error = result.get("error")
         if runner == "kaggle":
             with _sessions_lock:
                 if sid in _sessions:
@@ -449,8 +440,8 @@ async def universal_colab_start(request: Request):
     return {"ok": True, "session_id": sid, "reused": reused, "runner": runner, "runner_error": runner_error}
 
 
-@router.get("/colab-config")
-async def universal_colab_config(session_id: str = Query(...)):
+@router.get("/kaggle-config")
+async def universal_kaggle_config(session_id: str = Query(...)):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
@@ -461,28 +452,25 @@ async def universal_colab_config(session_id: str = Query(...)):
             "url": sess.get("url"),
             "formats": sess.get("formats"),
             "preselected": bool(sess.get("preselected")),
-            "token": sess.get("colab_token"),
-            "repo_id": sess.get("colab_repo_id"),
-            "repo_type": sess.get("colab_repo_type") or "dataset",
-            "folder": sess.get("colab_folder") or "",
+            "token": sess.get("hf_token"),
+            "repo_id": sess.get("hf_repo_id"),
+            "repo_type": sess.get("hf_repo_type") or "dataset",
+            "folder": sess.get("hf_folder") or "",
         }
 
 
-@router.get("/colab-check")
-async def universal_colab_check(session_id: str = Query(...)):
+@router.get("/kaggle-check")
+async def universal_kaggle_check(session_id: str = Query(...)):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
         sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
-        return {
-            "ok": True,
-            "status": sess.get("status"),
-        }
+        return {"ok": True, "status": sess.get("status")}
 
 
-@router.post("/colab-update")
-async def universal_colab_update(request: Request, session_id: str = Query(...)):
+@router.post("/kaggle-update")
+async def universal_kaggle_update(request: Request, session_id: str = Query(...)):
     body = await request.json()
     with _sessions_lock:
         sess = _sessions.get(session_id)
@@ -503,13 +491,13 @@ async def universal_colab_update(request: Request, session_id: str = Query(...))
     return {"ok": True}
 
 
-@router.get("/colab-session")
-async def universal_colab_session(session_id: str = Query(...)):
+@router.get("/kaggle-session")
+async def universal_kaggle_session(session_id: str = Query(...)):
     now = time.time()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
-            logger.warning(f"universal colab-session MISS sid={session_id} pid={os.getpid()} known={len(_sessions)}")
+            logger.warning(f"universal kaggle-session MISS sid={session_id} pid={os.getpid()} known={len(_sessions)}")
             raise HTTPException(410, "session not found or expired")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         return {

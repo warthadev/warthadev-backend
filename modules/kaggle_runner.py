@@ -44,7 +44,7 @@ def _push_sync(session_id: str, backend_url: str) -> Dict[str, Any]:
         code = (
             worker_code
             + "\n\nif __name__ == '__main__':\n"
-            + f"    run_colab_worker(session_id={json.dumps(session_id)}, "
+            + f"    run_kaggle_worker(session_id={json.dumps(session_id)}, "
             + f"backend_url={json.dumps(backend_url.rstrip('/'))})\n"
         )
         with open(os.path.join(work, "worker_loader.py"), "w", encoding="utf-8") as f:
