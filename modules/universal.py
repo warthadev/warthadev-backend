@@ -9,11 +9,14 @@ import socket
 import ipaddress
 import threading
 import logging
+import hmac
+import secrets
 from typing import Dict, Any
 from urllib.parse import urlparse, unquote
 from cachetools import TTLCache
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Header
 from . import kaggle_runner
+from .kaggle_settings import authenticate_user, get_user_credentials
 import requests
 from bs4 import BeautifulSoup
 import gdown
@@ -330,6 +333,12 @@ def _safe_folder(folder: str) -> str:
     return "/".join(parts)
 
 
+def _require_worker_token(session: Dict[str, Any], supplied: str | None) -> None:
+    expected = str(session.get("worker_token") or "")
+    if not expected or not supplied or not hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8")):
+        raise HTTPException(401, "Worker authentication required")
+
+
 @router.post("/resolve")
 async def universal_resolve(request: Request):
     body = await request.json()
@@ -356,7 +365,11 @@ async def universal_resolve(request: Request):
 
 
 @router.post("/kaggle-start")
-async def universal_kaggle_start(request: Request):
+async def universal_kaggle_start(request: Request, authorization: str | None = Header(default=None)):
+    uid = authenticate_user(authorization)
+    credentials = get_user_credentials(uid)
+    if not credentials:
+        raise HTTPException(403, "Save this account's Kaggle username and API token before using the Downloader")
     body = await request.json()
     url = str(body.get("url") or "").strip()
     token = str(body.get("token") or "").strip()
@@ -378,12 +391,21 @@ async def universal_kaggle_start(request: Request):
         raise HTTPException(400, "repo_type not valid")
 
     existing_sid = str(body.get("session_id") or "").strip().lower()
+    worker_token = secrets.token_urlsafe(32)
     _cleanup_stale_sessions()
     now = time.time()
     reused = False
     existing_runner = None
     sid = existing_sid if existing_sid and SID_RE.match(existing_sid) else uuid.uuid4().hex[:16]
+    with _sessions_lock:
+        previous = _sessions.get(sid)
+        if previous and str(previous.get("owner_uid") or "") != uid:
+            raise HTTPException(403, "This Kaggle session belongs to another account")
+        if previous:
+            worker_token = str(previous.get("worker_token") or worker_token)
     fresh = {
+        "owner_uid": uid,
+        "worker_token": worker_token,
         "url": url,
         "formats": formats if preselected else [],
         "preselected": preselected,
@@ -423,9 +445,11 @@ async def universal_kaggle_start(request: Request):
     runner_error = None
     if runner is None:
         if not kaggle_runner.kaggle_enabled():
-            runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
+            runner_error = "Kaggle CLI atau worker backend tidak tersedia."
         else:
-            result = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+            result = await kaggle_runner.start_worker(
+                sid, kaggle_runner.resolve_backend_url(str(request.base_url)), uid, worker_token, credentials
+            )
             if result.get("ok"):
                 runner = "kaggle"
             else:
@@ -441,11 +465,15 @@ async def universal_kaggle_start(request: Request):
 
 
 @router.get("/kaggle-config")
-async def universal_kaggle_config(session_id: str = Query(...)):
+async def universal_kaggle_config(
+    session_id: str = Query(...),
+    worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token"),
+):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        _require_worker_token(sess, worker_token)
         return {
             "ok": True,
             "session_id": session_id,
@@ -460,22 +488,37 @@ async def universal_kaggle_config(session_id: str = Query(...)):
 
 
 @router.get("/kaggle-check")
-async def universal_kaggle_check(session_id: str = Query(...)):
+async def universal_kaggle_check(
+    session_id: str = Query(...),
+    worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token"),
+):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        _require_worker_token(sess, worker_token)
         sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
         return {"ok": True, "status": sess.get("status")}
 
 
 @router.post("/kaggle-update")
-async def universal_kaggle_update(request: Request, session_id: str = Query(...)):
+async def universal_kaggle_update(
+    request: Request,
+    session_id: str = Query(...),
+    worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token"),
+    authorization: str | None = Header(default=None),
+):
     body = await request.json()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        if worker_token:
+            _require_worker_token(sess, worker_token)
+        else:
+            uid = authenticate_user(authorization)
+            if str(sess.get("owner_uid") or "") != uid:
+                raise HTTPException(403, "This Kaggle session belongs to another account")
         for key in (
             "status", "phase", "percent", "current_human", "total_human",
             "speed_human", "eta_seconds", "file_name", "finished",
@@ -492,13 +535,19 @@ async def universal_kaggle_update(request: Request, session_id: str = Query(...)
 
 
 @router.get("/kaggle-session")
-async def universal_kaggle_session(session_id: str = Query(...)):
+async def universal_kaggle_session(
+    session_id: str = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    uid = authenticate_user(authorization)
     now = time.time()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             logger.warning(f"universal kaggle-session MISS sid={session_id} pid={os.getpid()} known={len(_sessions)}")
             raise HTTPException(410, "session not found or expired")
+        if str(sess.get("owner_uid") or "") != uid:
+            raise HTTPException(403, "This Kaggle session belongs to another account")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         return {
             "ok": True,

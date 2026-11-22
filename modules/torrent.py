@@ -10,11 +10,14 @@ import logging
 import tempfile
 import subprocess
 import threading
+import hmac
+import secrets
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Header
 
 from . import diskcache as dc
 from . import kaggle_runner
+from .kaggle_settings import authenticate_user, get_user_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,8 @@ def _persist_sessions() -> None:
                     "expires_at": sess.get("expires_at"),
                     "kaggle_files": sess.get("kaggle_files", []),
                     "hf_token": sess.get("hf_token"),
+                    "owner_uid": sess.get("owner_uid"),
+                    "worker_token": sess.get("worker_token"),
                     "hf_repo_id": sess.get("hf_repo_id"),
                     "hf_repo_type": sess.get("hf_repo_type"),
                     "hf_folder": sess.get("hf_folder"),
@@ -134,6 +139,12 @@ def _load_sessions() -> None:
         logger.info(f"Loaded {len(_sessions)} session(s) from disk")
     except Exception as e:
         logger.warning(f"load_sessions failed: {e}")
+
+
+def _require_worker_token(session: Dict[str, Any], supplied: str | None) -> None:
+    expected = str(session.get("worker_token") or "")
+    if not expected or not supplied or not hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8")):
+        raise HTTPException(401, "Worker authentication required")
 
 
 def _write_magnet_input_file(magnet: str, dir_path: str) -> str:
@@ -413,7 +424,11 @@ async def torrent_progress(sid: str):
 
 
 @router.post("/kaggle-start")
-async def torrent_kaggle_start(request: Request):
+async def torrent_kaggle_start(request: Request, authorization: str | None = Header(default=None)):
+    uid = authenticate_user(authorization)
+    credentials = get_user_credentials(uid)
+    if not credentials:
+        raise HTTPException(403, "Save this account's Kaggle username and API token before using the Downloader")
     body = await request.json()
     magnet = str(body.get("magnet") or "").strip()
     token = str(body.get("token") or "").strip()
@@ -422,6 +437,7 @@ async def torrent_kaggle_start(request: Request):
     folder = _safe_folder(str(body.get("folder") or ""))
     files = body.get("files") or []
     existing_sid = str(body.get("session_id") or "").strip()
+    worker_token = secrets.token_urlsafe(32)
 
     if not magnet or not MAGNET_RE.match(magnet):
         raise HTTPException(400, "magnet is required")
@@ -441,6 +457,9 @@ async def torrent_kaggle_start(request: Request):
         with _sessions_lock:
             sess = _sessions.get(existing_sid)
             if sess:
+                if str(sess.get("owner_uid") or "") != uid:
+                    raise HTTPException(403, "This Kaggle session belongs to another account")
+                worker_token = str(sess.get("worker_token") or worker_token)
                 appended = True
                 merged = list(sess.get("kaggle_files") or [])
                 seen = {(int(f.get("index", 0)), str(f.get("name", ""))) for f in merged}
@@ -485,7 +504,7 @@ async def torrent_kaggle_start(request: Request):
                 total_files = len(merged)
         _persist_sessions()
         if appended:
-            runner, runner_error = await _launch_kaggle_worker(sid, request)
+            runner, runner_error = await _launch_kaggle_worker(sid, request, uid, worker_token, credentials)
             return {
                 "ok": True,
                 "session_id": sid,
@@ -499,6 +518,8 @@ async def torrent_kaggle_start(request: Request):
     with _sessions_lock:
         _sessions[sid] = {
             "session_id": sid,
+            "owner_uid": uid,
+            "worker_token": worker_token,
             "magnet": magnet,
             "file_name": "",
             "dir": _session_dir(sid),
@@ -535,7 +556,7 @@ async def torrent_kaggle_start(request: Request):
             "total_elapsed_seconds": 0,
         }
     _persist_sessions()
-    runner, runner_error = await _launch_kaggle_worker(sid, request)
+    runner, runner_error = await _launch_kaggle_worker(sid, request, uid, worker_token, credentials)
     return {
         "ok": True,
         "session_id": sid,
@@ -546,12 +567,17 @@ async def torrent_kaggle_start(request: Request):
     }
 
 
-async def _launch_kaggle_worker(session_id: str, request: Request):
+async def _launch_kaggle_worker(
+    session_id: str, request: Request, owner_uid: str, worker_token: str, credentials: Dict[str, str]
+):
     if not kaggle_runner.kaggle_enabled():
-        return "unavailable", "Kaggle runner tidak siap: periksa token, username, dan worker backend."
+        return "unavailable", "Kaggle CLI atau worker backend tidak tersedia."
     result = await kaggle_runner.start_worker(
         session_id,
         kaggle_runner.resolve_backend_url(str(request.base_url)),
+        owner_uid,
+        worker_token,
+        credentials,
     )
     if not result.get("ok"):
         return "unavailable", result.get("error")
@@ -559,11 +585,15 @@ async def _launch_kaggle_worker(session_id: str, request: Request):
 
 
 @router.get("/kaggle-config")
-async def torrent_kaggle_config(session_id: str = Query(...)):
+async def torrent_kaggle_config(
+    session_id: str = Query(...),
+    worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token"),
+):
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        _require_worker_token(sess, worker_token)
         files = list(sess.get("kaggle_files") or [])
         magnet = sess.get("magnet")
         token = sess.get("hf_token")
@@ -586,12 +616,17 @@ async def torrent_kaggle_config(session_id: str = Query(...)):
 
 
 @router.post("/kaggle-update")
-async def torrent_kaggle_update(request: Request, session_id: str = Query(...)):
+async def torrent_kaggle_update(
+    request: Request,
+    session_id: str = Query(...),
+    worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token"),
+):
     body = await request.json()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        _require_worker_token(sess, worker_token)
         for key in (
             "status", "phase", "percent", "current_human", "total_human",
             "speed_human", "eta_seconds", "file_name", "current_file_index",
@@ -614,12 +649,18 @@ async def torrent_kaggle_update(request: Request, session_id: str = Query(...)):
 
 
 @router.get("/kaggle-session")
-async def torrent_kaggle_session(session_id: str = Query(...)):
+async def torrent_kaggle_session(
+    session_id: str = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    uid = authenticate_user(authorization)
     now = time.time()
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
             raise HTTPException(410, "session not found or expired")
+        if str(sess.get("owner_uid") or "") != uid:
+            raise HTTPException(403, "This Kaggle session belongs to another account")
         expires_at = sess.get("expires_at") or (sess.get("created_at", now) + SESSION_TTL_SECONDS)
         seconds_left = max(0, int(expires_at - now))
         files = list(sess.get("kaggle_files") or [])
@@ -641,8 +682,12 @@ async def torrent_kaggle_session(session_id: str = Query(...)):
 
 
 @router.delete("/session/{sid}")
-async def torrent_session_delete(sid: str):
+async def torrent_session_delete(sid: str, authorization: str | None = Header(default=None)):
+    uid = authenticate_user(authorization)
     with _sessions_lock:
+        sess = _sessions.get(sid)
+        if sess and str(sess.get("owner_uid") or "") != uid:
+            raise HTTPException(403, "This session belongs to another account")
         sess = _sessions.pop(sid, None)
     if not sess:
         raise HTTPException(404, "session not found")

@@ -40,7 +40,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["telegram", "proxy", "hf", "torrent", "universal", "agent", "workspace", "router"]
+    modules_to_load = ["telegram", "proxy", "hf", "torrent", "universal", "agent", "workspace", "kaggle_settings", "router"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:
@@ -111,7 +111,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type", "Range", "X-Telegram-Session"],
+    allow_headers=["Authorization", "Content-Type", "Range", "X-Telegram-Session", "X-Kaggle-Worker-Token"],
     expose_headers=[
         "Content-Range",
         "Accept-Ranges",
@@ -138,7 +138,7 @@ async def ensure_cors_headers(request: Request, call_next):
         if "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
             response.headers["Access-Control-Allow-Origin"] = origin if "*" not in ALLOWED_ORIGINS else "*"
             response.headers["Access-Control-Allow-Methods"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Range, X-Telegram-Session"
+            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Range, X-Telegram-Session, X-Kaggle-Worker-Token"
 
     return response
 

@@ -20,7 +20,7 @@ IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 
 
-def run_kaggle_worker(session_id=None, backend_url=None):
+def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
     """Jalankan satu sesi downloader dari kernel Kaggle secara headless."""
     if not IS_KAGGLE:
         raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
@@ -34,6 +34,51 @@ def run_kaggle_worker(session_id=None, backend_url=None):
 
     def _run_quiet(cmd):
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def _module_is_from_prebuilt(module, prebuilt):
+        if not prebuilt:
+            return False
+        spec = importlib.util.find_spec(module)
+        if spec is None:
+            return False
+        paths = [spec.origin] if spec.origin else []
+        paths.extend(list(spec.submodule_search_locations or []))
+        root = os.path.realpath(prebuilt)
+        for path in paths:
+            try:
+                if os.path.commonpath((root, os.path.realpath(path))) == root:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _latest_pypi_version(package):
+        """Return the published PyPI version, or None when online lookup fails."""
+        import json
+        from urllib.request import Request, urlopen
+        try:
+            request = Request(
+                f"https://pypi.org/pypi/{package}/json",
+                headers={"User-Agent": "warthasensei-kaggle-worker"},
+            )
+            with urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return str(payload.get("info", {}).get("version") or "") or None
+        except Exception as exc:
+            print(f"[setup] PyPI version check skipped for {package}: {type(exc).__name__}", flush=True)
+            return None
+
+    def _installed_version(module, distribution):
+        try:
+            from importlib import metadata
+            return metadata.version(distribution)
+        except Exception:
+            try:
+                loaded = importlib.import_module(module)
+                version = getattr(loaded, "__version__", None)
+                return str(version) if version else None
+            except Exception:
+                return None
 
     def _load_prebuilt_env():
         """Kaggle: pakai paket siap pakai dari Dataset (env.tgz ATAU wheels/ + deb/) tanpa unduh ulang."""
@@ -81,17 +126,70 @@ def run_kaggle_worker(session_id=None, backend_url=None):
             _run_quiet(["apt-get", "update", "-qq"])
             _run_quiet(["apt-get", "install", "-y", "-qq", *need_apt])
 
-        need_pip = [pkg for mod, pkg in _PIP_PKGS.items() if importlib.util.find_spec(mod) is None]
+        # Prefer the public dataset packages. If an expected package is absent
+        # from that baseline, install only that missing package as a fallback.
+        need_pip = [
+            pkg for mod, pkg in _PIP_PKGS.items()
+            if importlib.util.find_spec(mod) is None or (prebuilt and not _module_is_from_prebuilt(mod, prebuilt))
+        ]
         if need_pip:
-            _run_quiet([sys.executable, "-m", "pip", "install", "-q", *need_pip])
+            fallback_cmd = [sys.executable, "-m", "pip", "install", "-q"]
+            if prebuilt:
+                fallback_cmd.extend(["--target", prebuilt])
+            fallback_cmd.extend(need_pip)
+            fallback_result = _run_quiet(fallback_cmd)
+            if fallback_result.returncode != 0:
+                print(f"[setup] fallback pip install failed: {(fallback_result.stdout or '')[-500:]}", flush=True)
+            if prebuilt not in sys.path and prebuilt:
+                sys.path.insert(0, prebuilt)
+            importlib.invalidate_caches()
 
         if UPGRADE_YTDLP:
-            _tgt = ["--target", prebuilt] if prebuilt else []
-            _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", *_tgt, "yt-dlp", "gallery-dl"])
+            try:
+                from packaging.version import Version
+            except ImportError:
+                try:
+                    from pip._vendor.packaging.version import Version
+                except ImportError:
+                    Version = None
+
+            if Version is None:
+                print("[setup] packaging.version unavailable; keeping baseline yt-dlp/gallery-dl versions", flush=True)
+            else:
+                upgrades = []
+                for module, package in (("yt_dlp", "yt-dlp"), ("gallery_dl", "gallery-dl")):
+                    installed = _installed_version(module, package)
+                    if not installed:
+                        print(f"[setup] {package} version unavailable; baseline/fallback left unchanged", flush=True)
+                        continue
+                    latest = _latest_pypi_version(package)
+                    if not latest:
+                        continue
+                    try:
+                        if Version(latest) > Version(installed):
+                            upgrades.append(f"{package}=={latest}")
+                            print(f"[setup] {package} update available: {installed} -> {latest}", flush=True)
+                        else:
+                            print(f"[setup] {package} is current ({installed}); skipping pip install", flush=True)
+                    except Exception:
+                        print(f"[setup] could not compare {package} versions; keeping {installed}", flush=True)
+
+                if upgrades:
+                    upgrade_cmd = [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--no-deps"]
+                    if prebuilt:
+                        upgrade_cmd.extend(["--target", prebuilt])
+                    upgrade_cmd.extend(upgrades)
+                    upgrade_result = _run_quiet(upgrade_cmd)
+                    if upgrade_result.returncode != 0:
+                        print(f"[setup] package upgrade failed; continuing with baseline: {(upgrade_result.stdout or '')[-500:]}", flush=True)
+                    importlib.invalidate_caches()
 
         importlib.invalidate_caches()
         missing = [b for b in _APT_PKGS if not shutil.which(b)]
-        missing += [mod for mod in _PIP_PKGS if importlib.util.find_spec(mod) is None]
+        missing += [
+            mod for mod in _PIP_PKGS
+            if importlib.util.find_spec(mod) is None or (prebuilt and not _module_is_from_prebuilt(mod, prebuilt))
+        ]
         if missing:
             err_msg = f"MASIH KURANG: {', '.join(missing)} (cek koneksi runtime)"
             print(f"[setup] ERROR: {err_msg}", flush=True)
@@ -111,6 +209,7 @@ def run_kaggle_worker(session_id=None, backend_url=None):
 
     SESSION_ID = None
     BACKEND_URL = None
+    WORKER_TOKEN = (worker_token or "").strip()
 
     POST_RETRY_COUNT = 3
     POST_RETRY_DELAY = 2
@@ -186,7 +285,8 @@ def run_kaggle_worker(session_id=None, backend_url=None):
         import requests
         for attempt in range(retries):
             try:
-                r = requests.post(url, params={"session_id": SESSION_ID}, json=payload, timeout=10)
+                r = requests.post(url, params={"session_id": SESSION_ID}, json=payload,
+                                  headers={"X-Kaggle-Worker-Token": WORKER_TOKEN}, timeout=10)
                 if r.ok: return True
             except Exception: pass
             if attempt < retries - 1: time.sleep(POST_RETRY_DELAY * (attempt + 1))
@@ -197,7 +297,8 @@ def run_kaggle_worker(session_id=None, backend_url=None):
         url = f"{backend_url.rstrip('/')}/{_mode["v"]}/kaggle-config"
         for attempt in range(POST_RETRY_COUNT):
             try:
-                r = requests.get(url, params={"session_id": session_id}, timeout=30)
+                r = requests.get(url, params={"session_id": session_id},
+                                 headers={"X-Kaggle-Worker-Token": WORKER_TOKEN}, timeout=30)
                 if r.ok: return r.json()
             except Exception: pass
             if attempt < POST_RETRY_COUNT - 1: time.sleep(POST_RETRY_DELAY * (attempt + 1))
@@ -207,7 +308,8 @@ def run_kaggle_worker(session_id=None, backend_url=None):
         import requests
         try:
             r = requests.get(f"{backend_url.rstrip('/')}/{_mode["v"]}/kaggle-check",
-                             params={"session_id": session_id}, timeout=15)
+                             params={"session_id": session_id},
+                             headers={"X-Kaggle-Worker-Token": WORKER_TOKEN}, timeout=15)
             if r.ok: return r.json().get("status")
         except Exception: pass
         return None
@@ -1377,7 +1479,8 @@ def run_kaggle_worker(session_id=None, backend_url=None):
         for mode in ("universal", "torrent"):
             for attempt in range(POST_RETRY_COUNT):
                 try:
-                    r = requests.get(f"{base}/{mode}/kaggle-config", params={"session_id": session_id}, timeout=30)
+                    r = requests.get(f"{base}/{mode}/kaggle-config", params={"session_id": session_id},
+                                     headers={"X-Kaggle-Worker-Token": WORKER_TOKEN}, timeout=30)
                     if r.ok:
                         j = r.json()
                         if j.get("ok"): return mode, j, None
@@ -1420,8 +1523,8 @@ def run_kaggle_worker(session_id=None, backend_url=None):
     def _run_kaggle_job(sid, backend):
         sid = sid or os.environ.get("WORKER_SESSION_ID", "")
         backend = backend or os.environ.get("WORKER_BACKEND_URL", "")
-        if not sid or not backend:
-            raise RuntimeError("Mode Kaggle memerlukan session_id dan backend_url")
+        if not sid or not backend or not WORKER_TOKEN:
+            raise RuntimeError("Mode Kaggle memerlukan session_id, backend_url, dan worker_token")
         _stop.clear()
         _reset_state()
         try:
