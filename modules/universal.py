@@ -13,6 +13,7 @@ from typing import Dict, Any
 from urllib.parse import urlparse, unquote
 from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, Query
+from . import kaggle_runner
 import requests
 from bs4 import BeautifulSoup
 import gdown
@@ -424,7 +425,15 @@ async def universal_colab_start(request: Request):
 
     _persist_sessions()
     logger.info(f"universal colab-start sid={sid} reused={reused} pid={os.getpid()} sessions={len(_sessions)}")
-    return {"ok": True, "session_id": sid, "reused": reused}
+    runner = "colab"
+    runner_error = None
+    if not reused and str(body.get("runner") or "kaggle").lower() != "colab" and kaggle_runner.kaggle_enabled():
+        res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+        if res.get("ok"):
+            runner = "kaggle"
+        else:
+            runner_error = res.get("error")
+    return {"ok": True, "session_id": sid, "reused": reused, "runner": runner, "runner_error": runner_error}
 
 
 @router.get("/colab-config")

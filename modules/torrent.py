@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, Request, Query
 
 from . import diskcache as dc
+from . import kaggle_runner
 
 logger = logging.getLogger(__name__)
 
@@ -532,9 +533,20 @@ async def torrent_colab_start(request: Request):
 
     _persist_sessions()
 
+    runner = "colab"
+    runner_error = None
+    if str(body.get("runner") or "kaggle").lower() != "colab" and kaggle_runner.kaggle_enabled():
+        res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+        if res.get("ok"):
+            runner = "kaggle"
+        else:
+            runner_error = res.get("error")
+
     return {
         "ok": True,
         "session_id": sid,
+        "runner": runner,
+        "runner_error": runner_error,
         "files_count": len(files),
         "appended": False,
         "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
