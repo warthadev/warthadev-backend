@@ -15,9 +15,15 @@ from urllib.parse import urlparse, unquote
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 
-WORKER_VERSION = "2026-10-31-universal+torrent-sorted-keepdash"
+WORKER_VERSION = "2026-11-22-universal+torrent-kaggle"
 
-def run_colab_worker():
+IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
+BASE_DIR = "/kaggle/working" if IS_KAGGLE else "/content"
+
+
+def run_colab_worker(session_id=None, backend_url=None):
+    """Jalankan worker. Colab: tampil widget. Kaggle / dengan session_id: headless, selesai sendiri."""
+    HEADLESS = IS_KAGGLE or bool(session_id and backend_url)
     print(f"[universal] worker version: {WORKER_VERSION}")
     UPGRADE_YTDLP = True
     _PIP_PKGS = {
@@ -29,8 +35,53 @@ def run_colab_worker():
     def _run_quiet(cmd):
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+    def _load_prebuilt_env():
+        """Kaggle: pakai paket siap pakai dari Dataset (env.tgz ATAU wheels/ + deb/) tanpa unduh ulang."""
+        import glob, tarfile
+        dest = "/tmp/env"
+        pkgs = os.path.join(dest, "pkgs")
+        debs = []
+        found = glob.glob("/kaggle/input/**/env.tgz", recursive=True)
+        wheels = next(iter(glob.glob("/kaggle/input/**/wheels", recursive=True)), None)
+        if found:
+            if not os.path.isdir(pkgs):
+                os.makedirs(dest, exist_ok=True)
+                with tarfile.open(found[0]) as t: t.extractall(dest)
+            bindir = os.path.join(dest, "bin")
+            if os.path.isdir(bindir):
+                for f in os.listdir(bindir):
+                    try: os.chmod(os.path.join(bindir, f), 0o755)
+                    except Exception: pass
+                os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+            debs = sorted(glob.glob(os.path.join(dest, "debs", "*.deb")))
+        elif wheels:
+            if not os.path.isdir(pkgs):
+                os.makedirs(pkgs, exist_ok=True)
+                files = [f for pat in ("yt_dlp*.whl", "gallery_dl*.whl", "mutagen*.whl")
+                         for f in glob.glob(os.path.join(wheels, pat))]
+                if files:
+                    _run_quiet([sys.executable, "-m", "pip", "install", "-q", "--no-index",
+                                "--no-deps", "--target", pkgs, *files])
+            debs = sorted(glob.glob(os.path.join(os.path.dirname(wheels), "deb", "*.deb")))
+        else:
+            return None
+        if pkgs not in sys.path: sys.path.insert(0, pkgs)
+        os.environ["PYTHONPATH"] = pkgs + os.pathsep + os.environ.get("PYTHONPATH", "")
+        if debs and any(not shutil.which(b) for b in ("aria2c", "megadl")):
+            _run_quiet(["dpkg", "-i", *debs])
+        importlib.invalidate_caches()
+        return pkgs
+
     def _ensure_deps():
-        from IPython.display import display, HTML
+        try:
+            from IPython.display import display, HTML
+        except Exception:
+            display = lambda *a, **k: None
+            HTML = lambda x: x
+        if HEADLESS:
+            display = lambda *a, **k: None
+        prebuilt = _load_prebuilt_env() if IS_KAGGLE else None
+        print("[setup] env siap pakai dari Dataset" if prebuilt else "[setup] memeriksa dependencies...")
         display(HTML("""
         <div style="font-family:monospace; padding: 15px; background: #1e1e1e; border-radius: 8px; border-left: 4px solid #2196F3; color: #e0e0e0; margin-bottom: 10px;">
             <b style="color: #2196F3;">[SETUP]</b> Memeriksa dan menginstal dependencies...
@@ -47,7 +98,8 @@ def run_colab_worker():
             _run_quiet([sys.executable, "-m", "pip", "install", "-q", *need_pip])
 
         if UPGRADE_YTDLP:
-            _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp", "gallery-dl"])
+            _tgt = ["--target", prebuilt] if prebuilt else []
+            _run_quiet([sys.executable, "-m", "pip", "install", "-q", "-U", *_tgt, "yt-dlp", "gallery-dl"])
 
         importlib.invalidate_caches()
 
@@ -71,11 +123,22 @@ def run_colab_worker():
 
     _ensure_deps()
 
-    from IPython.display import display, HTML, JSON
+    try:
+        from IPython.display import display, HTML, JSON
+    except Exception:
+        display = lambda *a, **k: None
+        HTML = lambda x: x
+        JSON = lambda x: x
 
-    COLAB_SAVE = "/content/Universal"
-    TEMP_PATH = "/content/Temp"
-    COOKIES_FILE = "/content/cookies.txt"
+    COLAB_SAVE = f"{BASE_DIR}/Universal"
+    TEMP_PATH = f"{BASE_DIR}/Temp"
+    COOKIES_FILE = f"{BASE_DIR}/cookies.txt"
+    if IS_KAGGLE and not os.path.exists(COOKIES_FILE):
+        import glob as _glob
+        _ck = _glob.glob("/kaggle/input/**/cookies.txt", recursive=True)
+        if _ck:
+            try: shutil.copy(_ck[0], COOKIES_FILE)
+            except Exception: pass
 
     SESSION_ID = None
     BACKEND_URL = None
@@ -1165,7 +1228,7 @@ def run_colab_worker():
                 _set_state(message="Bukan video? Coba ambil sebagai gambar (gallery-dl)...")
                 formats, ierr = _probe_images(url)
                 if not formats:
-                    hint = "" if os.path.exists(COOKIES_FILE) else " Kalau postingan butuh login, taruh cookies Netscape di /content/cookies.txt."
+                    hint = "" if os.path.exists(COOKIES_FILE) else " Kalau postingan butuh login, taruh cookies Netscape di " + COOKIES_FILE + "."
                     _fail(f"Instagram: bukan video & gambar gagal diambil ({ierr}).{hint}"[:400])
                     return None
             elif not _is_youtube(url) and _looks_like_file(url):
@@ -1508,6 +1571,21 @@ def run_colab_worker():
         _stop.set()
         _set_state(message="Menghentikan... (upload yang sedang berjalan selesai dulu)")
 
+    def _run_headless(sid, backend):
+        sid = sid or os.environ.get("WORKER_SESSION_ID", "")
+        backend = backend or os.environ.get("WORKER_BACKEND_URL", "")
+        if not sid or not backend:
+            raise RuntimeError("Mode headless butuh session_id dan backend_url")
+        _on_start_click(sid, backend)
+        last = ""
+        while _runner is not None and _runner.is_alive():
+            line = f"[{_state.get('phase')}] {_state.get('percent')}% {_state.get('message', '')}"
+            if line != last:
+                print(line, flush=True)
+                last = line
+            time.sleep(5)
+        print(f"[selesai] phase={_state.get('phase')} {_state.get('error', '')}", flush=True)
+
     try:
         from google.colab import output as _colab_output
         _colab_output.register_callback("universal_start", _on_start_click)
@@ -1578,4 +1656,10 @@ def run_colab_worker():
         })();
         </script>"""))
 
+    if HEADLESS:
+        _run_headless(session_id, backend_url)
+        return
     _bootstrap()
+
+
+run_worker = run_colab_worker
