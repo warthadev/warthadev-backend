@@ -8,8 +8,8 @@ The backend is structured into distinct, independent routers to ensure high main
 
 | Module | Endpoint Prefix | Capabilities |
 | :--- | :--- | :--- |
-| Torrent | `/torrent` | Metadata extraction via aria2c, Google Colab session orchestration, real time progress tracking, and data synchronization. |
-| Universal | `/universal` | Orchestration of universal media downloads via Google Colab. Supports extraction from YouTube, Instagram, TikTok, Twitter, Facebook, direct media URLs, and HLS/DASH streams. |
+| Torrent | `/torrent` | Metadata extraction via aria2c, Kaggle worker orchestration through the Kaggle API, real time progress tracking, and data synchronization. |
+| Universal | `/universal` | Orchestration of Kaggle-backed media downloads. Supports extraction from YouTube, Instagram, TikTok, Twitter, Facebook, direct media URLs, and HLS/DASH streams. |
 | Telegram | `/telegram` | Telethon client wrapper, session validation, secure file streaming with HTTP Range requests, and Firestore metadata synchronization. |
 | Hugging Face | `/hf` | Comprehensive repository management including creation, deletion, renaming, file and folder movement/copying, cross account transfers, and history squashing. |
 | Proxy | `/proxy` | Media streaming proxy, direct file downloads, and Fernet based signed URL generation for integration with external media players. |
@@ -41,4 +41,15 @@ AGENT_ENCRYPTION_KEY=""
 AGENT_RUNTIME_URL="http://127.0.0.1:8788"
 AGENT_INTERNAL_API_KEY=""
 AGENT_TIMEOUT="210"
+```
+
+### Kaggle downloader worker
+Set these on the backend deployment. The backend pushes and runs a private Kaggle kernel through the Kaggle CLI; the frontend only polls Render for progress, so no manual notebook launch is needed.
+```env
+KAGGLE_API_TOKEN="KGAT_..."
+KAGGLE_USERNAME="your-kaggle-username"
+KAGGLE_DATASET="your-kaggle-username/media-offline-pkgs"
+PUBLIC_BACKEND_URL="https://your-backend.onrender.com"
+# Optional kernel slug; defaults to wartha-worker
+KAGGLE_KERNEL_SLUG="wartha-worker"
 ```

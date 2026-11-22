@@ -383,6 +383,7 @@ async def universal_colab_start(request: Request):
     _cleanup_stale_sessions()
     now = time.time()
     reused = False
+    existing_runner = None
 
     if existing_sid and SID_RE.match(existing_sid):
         sid = existing_sid
@@ -418,6 +419,7 @@ async def universal_colab_start(request: Request):
         sess = _sessions.get(sid)
         if sess:
             reused = True
+            existing_runner = sess.get("runner")
             fresh["status"] = "newurl"
             sess.update(fresh)
         else:
@@ -425,14 +427,25 @@ async def universal_colab_start(request: Request):
 
     _persist_sessions()
     logger.info(f"universal colab-start sid={sid} reused={reused} pid={os.getpid()} sessions={len(_sessions)}")
-    runner = "colab"
+    requested_runner = str(body.get("runner") or "kaggle").lower()
+    runner = "colab" if requested_runner == "colab" else ("kaggle" if reused and existing_runner == "kaggle" else None)
     runner_error = None
-    if not reused and str(body.get("runner") or "kaggle").lower() != "colab" and kaggle_runner.kaggle_enabled():
-        res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
-        if res.get("ok"):
-            runner = "kaggle"
+    if requested_runner != "colab" and runner != "kaggle":
+        if not kaggle_runner.kaggle_enabled():
+            runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
         else:
-            runner_error = res.get("error")
+            res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+            if res.get("ok"):
+                runner = "kaggle"
+            else:
+                runner_error = res.get("error")
+        if runner == "kaggle":
+            with _sessions_lock:
+                if sid in _sessions:
+                    _sessions[sid]["runner"] = "kaggle"
+            _persist_sessions()
+        else:
+            runner = "unavailable"
     return {"ok": True, "session_id": sid, "reused": reused, "runner": runner, "runner_error": runner_error}
 
 

@@ -1253,7 +1253,7 @@ def run_colab_worker(session_id=None, backend_url=None):
     def _publish_formats(formats, info=None):
         _state["files"] = [{"name": _display_name(f), "size": f.get("size", 0), "_status": "pending", "_index": f["index"]} for f in formats]
         _set_state(phase="waiting", total_files=len(formats), completed_files=0, failed_files=0, error="",
-                   message="Pilih format di web, Colab akan otomatis lanjut.")
+                   message="Pilih format di aplikasi; Kaggle worker akan lanjut otomatis.")
         _post_update({"status": "waiting", "phase": "resolve", "finished": False, "formats": formats,
                       "meta": _meta_from_info(info)})
 

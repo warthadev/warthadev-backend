@@ -17,7 +17,7 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger("kaggle_runner")
 
-_LOADER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kaggle", "worker_loader.py")
+_WORKER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workerdl.py")
 _push_lock = threading.Lock()
 
 
@@ -32,15 +32,21 @@ def _cfg() -> Dict[str, str]:
 
 def kaggle_enabled() -> bool:
     has_auth = bool(os.environ.get("KAGGLE_API_TOKEN") or os.environ.get("KAGGLE_KEY"))
-    return has_auth and bool(os.environ.get("KAGGLE_USERNAME")) and os.path.isfile(_LOADER_PATH)
+    return has_auth and bool(os.environ.get("KAGGLE_USERNAME")) and os.path.isfile(_WORKER_PATH)
 
 
 def _push_sync(session_id: str, backend_url: str) -> Dict[str, Any]:
     cfg = _cfg()
     work = tempfile.mkdtemp(prefix="kaggle_push_")
     try:
-        with open(_LOADER_PATH, "r", encoding="utf-8") as f:
-            code = f.read().replace("__SESSION_ID__", session_id).replace("__BACKEND_URL__", backend_url.rstrip("/"))
+        with open(_WORKER_PATH, "r", encoding="utf-8") as f:
+            worker_code = f.read()
+        code = (
+            worker_code
+            + "\n\nif __name__ == '__main__':\n"
+            + f"    run_colab_worker(session_id={json.dumps(session_id)}, "
+            + f"backend_url={json.dumps(backend_url.rstrip('/'))})\n"
+        )
         with open(os.path.join(work, "worker_loader.py"), "w", encoding="utf-8") as f:
             f.write(code)
         meta = {

@@ -437,11 +437,13 @@ async def torrent_colab_start(request: Request):
     _cleanup_stale_sessions()
 
     now = time.time()
+    appended = False
 
     if existing_sid:
         with _sessions_lock:
             sess = _sessions.get(existing_sid)
             if sess:
+                appended = True
                 merged = list(sess.get("colab_files") or [])
                 seen = {(int(f.get("index", 0)), str(f.get("name", ""))) for f in merged}
                 for f in files:
@@ -482,13 +484,34 @@ async def torrent_colab_start(request: Request):
                 sid = existing_sid
                 total_files = len(merged)
         _persist_sessions()
-        return {
-            "ok": True,
-            "session_id": sid,
-            "files_count": total_files,
-            "appended": True,
-            "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
-        }
+        if appended:
+            requested_runner = str(body.get("runner") or "kaggle").lower()
+            runner = "colab" if requested_runner == "colab" else None
+            runner_error = None
+            if requested_runner != "colab":
+                if not kaggle_runner.kaggle_enabled():
+                    runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
+                else:
+                    res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+                    if res.get("ok"):
+                        runner = "kaggle"
+                    else:
+                        runner_error = res.get("error")
+                if runner == "kaggle":
+                    with _sessions_lock:
+                        if sid in _sessions:
+                            _sessions[sid]["runner"] = "kaggle"
+                    _persist_sessions()
+                else:
+                    runner = "unavailable"
+            return {
+                "ok": True,
+                "session_id": sid,
+                "runner": runner,
+                "runner_error": runner_error,
+                "files_count": total_files,
+                "appended": True,
+            }
 
     sid = uuid.uuid4().hex[:16]
 
@@ -533,14 +556,25 @@ async def torrent_colab_start(request: Request):
 
     _persist_sessions()
 
-    runner = "colab"
+    requested_runner = str(body.get("runner") or "kaggle").lower()
+    runner = "colab" if requested_runner == "colab" else None
     runner_error = None
-    if str(body.get("runner") or "kaggle").lower() != "colab" and kaggle_runner.kaggle_enabled():
-        res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
-        if res.get("ok"):
-            runner = "kaggle"
+    if requested_runner != "colab":
+        if not kaggle_runner.kaggle_enabled():
+            runner_error = "Kaggle runner tidak siap: periksa token, username, dan worker backend."
         else:
-            runner_error = res.get("error")
+            res = await kaggle_runner.start_worker(sid, kaggle_runner.resolve_backend_url(str(request.base_url)))
+            if res.get("ok"):
+                runner = "kaggle"
+            else:
+                runner_error = res.get("error")
+        if runner == "kaggle":
+            with _sessions_lock:
+                if sid in _sessions:
+                    _sessions[sid]["runner"] = "kaggle"
+            _persist_sessions()
+        else:
+            runner = "unavailable"
 
     return {
         "ok": True,
@@ -549,7 +583,6 @@ async def torrent_colab_start(request: Request):
         "runner_error": runner_error,
         "files_count": len(files),
         "appended": False,
-        "colab_url": body.get("colab_url") or "https://colab.research.google.com/",
     }
 
 
