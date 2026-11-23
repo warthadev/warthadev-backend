@@ -541,6 +541,7 @@ async def universal_kaggle_update(
     with _sessions_lock:
         sess = _sessions.get(session_id)
         if not sess:
+            logger.warning(f"universal kaggle-update 410 sid={session_id} pid={os.getpid()} known_sessions={len(_sessions)}")
             raise HTTPException(410, "session not found or expired")
         if worker_token:
             _require_worker_token(sess, worker_token)
