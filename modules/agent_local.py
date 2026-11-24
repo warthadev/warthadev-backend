@@ -4,21 +4,10 @@
 # job the worker polls for and reports back -- same idea as the Downloader's
 # session polling in modules/universal.py, but modelling a long-lived chat
 # connection (one session per user) instead of one-off download jobs.
-#
-# Revision notes (AI Local backend fixes):
-# - Bug #1: pending_job is now a FIFO queue (job_queue) instead of a single
-#   slot, so concurrent chat + workspace jobs can no longer overwrite each
-#   other (the second chat no longer strands the first waiter until 504).
-# - Bug #2: sessions are keyed by owner_uid and persisted to disk, so a
-#   backend restart (Hugging Face Spaces restart) reattaches to the still
-#   alive Kaggle worker instead of pushing a second GPU kernel.
-# - Bug #3: chat wait timeout default raised to 480s, matching the
-#   workerlocal.py LLM timeout budget (WORKER_LLM_TIMEOUT default 420s).
 from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import logging
 import os
 import time
@@ -39,66 +28,11 @@ router = APIRouter(prefix="/agent/local", tags=["agent-local"])
 LOCAL_MODEL_DATASET = os.environ.get("KAGGLE_LOCAL_MODEL_DATASET", "herbanuwarthakusuma/media-ai-local")
 
 SESSION_TTL_SECONDS = int(os.environ.get("AGENT_LOCAL_SESSION_TTL", str(6 * 60 * 60)))
-CHAT_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_CHAT_TIMEOUT", "480"))
+CHAT_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_CHAT_TIMEOUT", "240"))
 WORKSPACE_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_WORKSPACE_TIMEOUT", "60"))
 
-# Session identities survive a backend restart; job queues/results are
-# intentionally in-memory only (a lost job just resolves as a 504 waiter).
-_SESSIONS_FILE = os.environ.get("AGENT_LOCAL_SESSIONS_FILE", "/tmp/wartha-agent-local-sessions.json")
-
-# owner_uid -> session dict. The job_queue/job_results fields are in-memory only.
 _sessions: dict[str, dict[str, Any]] = {}
 _sessions_lock = asyncio.Lock()
-
-
-def _persist_sessions() -> None:
-    # Snapshot without the asyncio lock: callers invoke this right after
-    # mutating session state, and identity fields are plain values.
-    try:
-        snapshot = {}
-        for uid, sess in _sessions.items():
-            snapshot[uid] = {
-                key: sess.get(key)
-                for key in ("session_id", "owner_uid", "worker_token", "created_at", "expires_at")
-            }
-        tmp = _SESSIONS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        os.replace(tmp, _SESSIONS_FILE)
-    except Exception as exc:
-        logger.warning("Failed to persist agent local sessions: %s", exc)
-
-
-def _load_sessions() -> None:
-    if not os.path.exists(_SESSIONS_FILE):
-        return
-    try:
-        with open(_SESSIONS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as exc:
-        logger.warning("Failed to load agent local sessions: %s", exc)
-        return
-    if not isinstance(data, dict):
-        return
-    now = time.time()
-    loaded = 0
-    for uid, sess in data.items():
-        if not isinstance(sess, dict) or not isinstance(uid, str):
-            continue
-        if not sess.get("session_id") or not sess.get("worker_token"):
-            continue
-        if float(sess.get("expires_at") or 0) <= now:
-            continue
-        sess.setdefault("owner_uid", uid)
-        sess["job_queue"] = []          # never restored across restarts
-        sess["job_results"] = {}
-        _sessions[uid] = sess
-        loaded += 1
-    if loaded:
-        logger.info("Restored %d agent local session(s) after restart", loaded)
-
-
-_load_sessions()
 
 
 class ChatImagePayload(BaseModel):
@@ -142,25 +76,24 @@ def _require_worker_token(session: dict[str, Any], supplied: str | None) -> None
 
 async def _get_session_for_uid(uid: str) -> dict[str, Any] | None:
     async with _sessions_lock:
-        sess = _sessions.get(uid)
-        if sess and sess.get("expires_at", 0) > time.time():
-            return sess
+        for sess in _sessions.values():
+            if sess.get("owner_uid") == uid and sess.get("expires_at", 0) > time.time():
+                return sess
     return None
 
 
 async def _get_session(session_id: str) -> dict[str, Any] | None:
     async with _sessions_lock:
-        for sess in _sessions.values():
-            if sess.get("session_id") == session_id and sess.get("expires_at", 0) > time.time():
-                return sess
+        sess = _sessions.get(session_id)
+        if sess and sess.get("expires_at", 0) > time.time():
+            return sess
     return None
 
 
 @router.post("/connect")
 async def connect(request: Request, authorization: str | None = Header(default=None)):
     """Called when the user opens the 'Local' tab / taps connect. Reuses an
-    already-booted worker for this account if one is still alive -- including
-    after a backend restart (sessions are persisted by owner_uid)."""
+    already-booted worker for this account if one is still alive."""
     uid = authenticate_user(authorization)
     credentials = get_user_credentials(uid)
     if not credentials:
@@ -169,9 +102,6 @@ async def connect(request: Request, authorization: str | None = Header(default=N
     existing = await _get_session_for_uid(uid)
     snapshot = kaggle_local_runner.worker_snapshot(uid)
     if existing and snapshot.get("alive"):
-        async with _sessions_lock:
-            existing["expires_at"] = time.time() + SESSION_TTL_SECONDS
-        _persist_sessions()
         return {"ok": True, "session_id": existing["session_id"], "status": snapshot.get("status"),
                 "model_id": snapshot.get("model_id"), "reused": True}
 
@@ -181,16 +111,12 @@ async def connect(request: Request, authorization: str | None = Header(default=N
     sess = {
         "session_id": sid, "owner_uid": uid, "worker_token": worker_token,
         "created_at": now, "expires_at": now + SESSION_TTL_SECONDS,
-        "job_queue": [], "job_results": {},
+        "pending_job": None, "job_results": {},
     }
     async with _sessions_lock:
-        _sessions[uid] = sess
-    _persist_sessions()
+        _sessions[sid] = sess
 
     if not kaggle_local_runner.kaggle_enabled():
-        async with _sessions_lock:
-            _sessions.pop(uid, None)
-        _persist_sessions()
         raise HTTPException(503, "Kaggle CLI atau workerlocal.py tidak tersedia di backend")
 
     result = await kaggle_local_runner.start_worker(
@@ -199,8 +125,7 @@ async def connect(request: Request, authorization: str | None = Header(default=N
     )
     if not result.get("ok"):
         async with _sessions_lock:
-            _sessions.pop(uid, None)
-        _persist_sessions()
+            _sessions.pop(sid, None)
         raise HTTPException(502, result.get("error") or "Gagal menjalankan Kaggle worker")
 
     return {"ok": True, "session_id": sid, "status": "booting", "model_id": None, "reused": False}
@@ -230,8 +155,7 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
 
     job_id = uuid.uuid4().hex[:12]
     async with _sessions_lock:
-        # FIFO: jobs are queued, never overwritten.
-        sess["job_queue"].append({"job_id": job_id, "type": job_type, "payload": payload})
+        sess["pending_job"] = {"job_id": job_id, "type": job_type, "payload": payload}
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -242,7 +166,8 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
         await asyncio.sleep(0.5)
 
     async with _sessions_lock:
-        sess["job_queue"] = [job for job in sess["job_queue"] if job.get("job_id") != job_id]
+        if sess.get("pending_job", {}).get("job_id") == job_id:
+            sess["pending_job"] = None
     raise HTTPException(504, "AI Local tidak membalas tepat waktu")
 
 
@@ -308,9 +233,7 @@ async def kaggle_poll(payload: WorkerPollPayload, session_id: str = Query(...),
         kaggle_local_runner.set_worker_status(sess["owner_uid"], status="offline")
         return {"ok": True, "job": None}
     async with _sessions_lock:
-        # Peek (not pop): the job stays queued until its result arrives, so a
-        # poll racing an in-flight job cannot silently drop the job.
-        job = sess["job_queue"][0] if sess["job_queue"] else None
+        job = sess.get("pending_job")
     return {"ok": True, "job": job}
 
 
@@ -322,6 +245,7 @@ async def kaggle_result(payload: WorkerResultPayload, session_id: str = Query(..
         raise HTTPException(410, "session not found or expired")
     _require_worker_token(sess, worker_token)
     async with _sessions_lock:
-        sess["job_queue"] = [job for job in sess["job_queue"] if job.get("job_id") != payload.job_id]
+        if sess.get("pending_job", {}).get("job_id") == payload.job_id:
+            sess["pending_job"] = None
         sess["job_results"][payload.job_id] = {"ok": payload.ok, "result": payload.result, "error": payload.error}
     return {"ok": True}
