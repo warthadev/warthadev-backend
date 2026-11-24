@@ -344,16 +344,13 @@ def wait_ready(proc, port, secs=300):
 
 
 def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8):
-    # Single LLM call budget: the backend waits up to AGENT_LOCAL_CHAT_TIMEOUT
-    # (default 480s) for the whole job, so keep this below that.
-    llm_timeout = int(os.environ.get("WORKER_LLM_TIMEOUT", "420"))
     history.append({"role": "user", "content": user_content})
     for _step in range(max_steps):
         payload = {"messages": history, "tools": TOOLS, "tool_choice": "auto",
                    "max_tokens": -1, "temperature": 0.25, "stream": False}
         req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
                                       headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=llm_timeout) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             body = json.loads(resp.read().decode("utf-8", errors="ignore"))
         choice = (body.get("choices") or [{}])[0]
         message = choice.get("message") or {}
