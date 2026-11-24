@@ -153,7 +153,12 @@ def extract_and_deliver(text, session_id=""):
 _DELIVER_SYSTEM_HINT = (
     "Jika kamu membuat file untuk pengguna, simpan di /kaggle/working/out/ lalu tulis "
     "[[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu. Folder juga boleh (akan di-zip). "
-    "Jangan menempelkan isi file besar ke chat."
+    "Jangan menempelkan isi file besar ke chat. "
+    "Jika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur "
+    "LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. "
+    "Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. "
+    "Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan "
+    "dari titik itu di jawaban berikutnya."
 )
 
 
@@ -738,6 +743,7 @@ def build_system_prompt(base_dir):
         "sebelum menjalankan langkah yang bergantung padanya.\n"
         "- Kerjakan langkah demi langkah: investigasi → rencana singkat → eksekusi → verifikasi hasil.\n"
         "- Laporkan hasil yang konkret (path file, perintah yang dijalankan, error asli) tanpa basa-basi berlebih.\n"
+        "- Jika diminta struktur lengkap / tree / daftar file, keluarkan SELURUH hasil tanpa '...' atau potongan di tengah.\n"
         "Paket dokumen (pymupdf, python-docx, python-pptx, faster-whisper) dipasang offline dari dataset "
         "media-offline-pkgs ke /tmp/docpkgs tanpa menimpa numpy atau pillow bawaan Kaggle. "
         "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
