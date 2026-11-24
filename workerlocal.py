@@ -10,6 +10,7 @@ import html
 import json
 import time
 import base64
+import mimetypes
 import shutil
 import subprocess
 import threading
@@ -36,6 +37,125 @@ PROJECT_IGNORE_DIRS = {
     "llama_bin", "model_gguf",
 }
 SYS_SHALLOW_DIRS = {"proc", "sys", "dev", "usr", "lib", "lib64", "var", "etc", "boot", "run", "opt", "srv"}
+
+
+# ---------------------------------------------------------------------------
+# File delivery ke chat: kecil = base64 inline, besar = upload HF (browser unduh langsung)
+# ---------------------------------------------------------------------------
+import uuid
+import zipfile
+from pathlib import Path as _Path
+
+_DELIVER_WORK_ROOT = _Path(os.getenv("WARTHA_WORK_ROOT", "/kaggle/working")).resolve()
+_DELIVER_INLINE_MAX = int(os.getenv("WARTHA_INLINE_MAX", str(1_500_000)))
+_DELIVER_UPLOAD_MAX = int(os.getenv("WARTHA_UPLOAD_MAX", str(500 * 1024 * 1024)))
+_DELIVER_INLINE_FALLBACK_MAX = int(os.getenv("WARTHA_INLINE_FALLBACK_MAX", str(8_000_000)))
+_DELIVER_HF_REPO = os.getenv("WARTHA_HF_REPO", "")
+_DELIVER_ALLOWED_EXT = {
+    "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "csv", "tsv", "html", "css", "yaml", "yml",
+    "xml", "sql", "sh", "ipynb", "log", "toml", "ini", "cfg", "env.example", "srt", "vtt", "lrc",
+    "pdf", "docx", "pptx", "xlsx", "xls",
+    "zip", "tar", "gz", "tgz", "whl",
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg",
+    "mp3", "wav", "m4a", "ogg", "flac", "opus", "mp4", "mkv", "webm", "mov",
+}
+_DELIVER_BLOCKED = {"kaggle.json", ".env", ".netrc", "id_rsa", "id_ed25519"}
+_DELIVER_MARKER = re.compile(r"\[\[file:([^\]\n]+)\]\]")
+
+
+def _deliver_secret(name):
+    value = os.getenv(name, "")
+    if value:
+        return value
+    try:
+        from kaggle_secrets import UserSecretsClient  # type: ignore
+        return UserSecretsClient().get_secret(name)
+    except Exception:
+        return ""
+
+
+def _deliver_safe_path(raw):
+    path = _Path(raw.strip()).expanduser().resolve()
+    if _DELIVER_WORK_ROOT not in path.parents and path != _DELIVER_WORK_ROOT:
+        raise ValueError("file di luar /kaggle/working tidak boleh dikirim")
+    if any(part.startswith(".") for part in path.relative_to(_DELIVER_WORK_ROOT).parts):
+        raise ValueError("file tersembunyi tidak boleh dikirim")
+    if path.name.lower() in _DELIVER_BLOCKED:
+        raise ValueError("file sensitif tidak boleh dikirim")
+    if not path.exists():
+        raise ValueError("file tidak ditemukan")
+    return path
+
+
+def _deliver_zip_dir(folder):
+    target = _DELIVER_WORK_ROOT / "_deliver" / f"{folder.name}.zip"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in folder.rglob("*"):
+            if item.is_file() and not any(p.startswith(".") for p in item.relative_to(folder).parts):
+                archive.write(item, item.relative_to(folder.parent))
+    return target
+
+
+def _deliver_upload_hf(path, session_id):
+    token = _deliver_secret("HF_TOKEN")
+    if not (_DELIVER_HF_REPO and token):
+        raise RuntimeError("WARTHA_HF_REPO / HF_TOKEN belum diatur")
+    from huggingface_hub import HfApi  # type: ignore
+    remote = f"{session_id or 'session'}/{uuid.uuid4().hex[:12]}/{path.name}"
+    HfApi(token=token).upload_file(
+        path_or_fileobj=str(path), path_in_repo=remote, repo_id=_DELIVER_HF_REPO, repo_type="dataset",
+    )
+    return f"https://huggingface.co/datasets/{_DELIVER_HF_REPO}/resolve/main/{remote}?download=true"
+
+
+def deliver_file(raw_path, session_id=""):
+    path = _deliver_safe_path(raw_path)
+    if path.is_dir():
+        path = _deliver_zip_dir(path)
+    ext = path.suffix.lower().lstrip(".")
+    if ext not in _DELIVER_ALLOWED_EXT:
+        raise ValueError(f"ekstensi .{ext or '?'} tidak didukung")
+    size = path.stat().st_size
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    entry = {"name": path.name, "mime_type": mime, "size": size, "path": str(path)}
+    if size <= _DELIVER_INLINE_MAX:
+        entry["data_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+        return entry
+    if size > _DELIVER_UPLOAD_MAX:
+        raise ValueError("file terlalu besar")
+    try:
+        entry["url"] = _deliver_upload_hf(path, session_id)
+    except Exception as err:
+        if size > _DELIVER_INLINE_FALLBACK_MAX:
+            raise ValueError(f"upload ke Hugging Face gagal ({err}) dan file terlalu besar untuk inline")
+        entry["data_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+    return entry
+
+
+def extract_and_deliver(text, session_id=""):
+    attachments, notes, seen = [], [], set()
+    for match in _DELIVER_MARKER.finditer(text or ""):
+        raw = match.group(1).strip()
+        if raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            attachments.append(deliver_file(raw, session_id))
+        except Exception as err:
+            notes.append(f"Gagal mengirim `{os.path.basename(raw)}`: {err}")
+    cleaned = _DELIVER_MARKER.sub("", text or "").strip()
+    if notes:
+        cleaned = f"{cleaned}\n\n" + "\n".join(notes)
+    return cleaned, attachments
+
+
+_DELIVER_SYSTEM_HINT = (
+    "Jika kamu membuat file untuk pengguna, simpan di /kaggle/working/out/ lalu tulis "
+    "[[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu. Folder juga boleh (akan di-zip). "
+    "Jangan menempelkan isi file besar ke chat."
+)
+
 
 # ---------------------------------------------------------------------------
 # Tool schema exposed to the local model (same shape as codekaggle.py so the
@@ -616,7 +736,8 @@ def build_system_prompt(base_dir):
         "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
         "dan baru dipasang lewat apt bila belum ada.\n"
         "Jangan mengarang data; gunakan tool untuk memverifikasi sebelum menjawab fakta terkini. "
-        "Jujur jika sebuah tool gagal atau data tidak ditemukan."
+        "Jujur jika sebuah tool gagal atau data tidak ditemukan.\n"
+        + _DELIVER_SYSTEM_HINT
     )
 
 
@@ -859,7 +980,11 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             content.append({"type": "image_url", "image_url": {
                                 "url": f"data:{img.get('mime_type')};base64,{img.get('data')}"}})
                     answer = run_agent_turn(history, api_url, base_dir, content)
-                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": answer}})
+                    cleaned, attachments = extract_and_deliver(answer or "", session_id)
+                    result_body = {"content": cleaned}
+                    if attachments:
+                        result_body["attachments"] = attachments
+                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": result_body})
                 elif job_type == "workspace":
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": out.get("ok", False), "result": out})
