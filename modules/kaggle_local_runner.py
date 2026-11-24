@@ -82,6 +82,7 @@ def _get_entry_unlocked(owner_uid: str) -> Dict[str, Any]:
             "status": "offline",
             "model_id": None,
             "error": None,
+            "phase": None,
         }
         _worker_states[owner_uid] = entry
     return entry
@@ -129,12 +130,13 @@ def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
         if not alive:
             if raw == "ready":
                 status = "offline"
-                error = error or "Worker Kaggle berhenti (sesi Kaggle idle/sleep atau dihentikan)."
+                error = error or "The Kaggle worker stopped (the Kaggle session went idle, slept, or was stopped)."
             elif raw == "booting":
                 status = "error"
                 error = error or (
-                    "Worker Kaggle tidak merespons setelah dijalankan. Kemungkinan kuota GPU Kaggle habis, "
-                    "GPU sedang penuh, atau kernel gagal start."
+                    "The Kaggle worker did not respond after it was started. The weekly GPU quota may be used up, "
+                    "no GPU may be free right now, the account may not be phone-verified (Kaggle requires this for "
+                    "GPU and internet), or the kernel failed to start."
                 )
             elif raw not in ("error", "offline"):
                 status = "offline"
@@ -143,6 +145,7 @@ def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
             "alive": alive,
             "status": status,
             "raw_status": raw,
+            "phase": entry.get("phase") if status == "booting" else None,
             "model_id": entry.get("model_id") if status == "ready" else None,
             "error": error,
             "last_push": float(entry.get("last_push") or 0.0),
@@ -162,7 +165,8 @@ def touch_worker(owner_uid: str, session_id: Optional[str] = None) -> None:
     _persist_worker_states()
 
 
-def set_worker_status(owner_uid: str, *, status: str, model_id: Optional[str] = None, error: Optional[str] = None) -> None:
+def set_worker_status(owner_uid: str, *, status: str, model_id: Optional[str] = None, error: Optional[str] = None,
+                      phase: Optional[str] = None) -> None:
     if not owner_uid:
         return
     with _state_lock:
@@ -171,6 +175,7 @@ def set_worker_status(owner_uid: str, *, status: str, model_id: Optional[str] = 
         if model_id is not None:
             entry["model_id"] = model_id
         entry["error"] = error
+        entry["phase"] = phase if status == "booting" else None
         if status in ("offline", "error"):
             entry["last_heartbeat"] = 0.0
             entry["last_push"] = 0.0
@@ -189,6 +194,21 @@ def kaggle_enabled() -> bool:
     return bool(shutil.which("kaggle") and os.path.isfile(_WORKER_PATH))
 
 
+def _friendly_push_error(output: str, returncode: int) -> str:
+    low = (output or "").lower()
+    if any(k in low for k in ("401", "unauthorized", "invalid credentials", "could not authenticate")):
+        return "Kaggle rejected the saved username/API token. Re-enter your Kaggle credentials and try again."
+    if any(k in low for k in ("403", "forbidden", "permission")):
+        return ("Kaggle denied access while creating the worker notebook. Check that your API token is valid and "
+                "that your account can use the model dataset.")
+    if "404" in low or "not found" in low:
+        return ("Kaggle could not find the model dataset for your account. Ask the owner to share it with your "
+                "Kaggle username, then try again.")
+    if "phone" in low or "verif" in low:
+        return "Kaggle requires phone verification before a notebook can use a GPU or the internet."
+    return output or f"Pushing the kernel to Kaggle failed (exit {returncode})."
+
+
 def _push_sync(
     session_id: str,
     backend_url: str,
@@ -200,9 +220,9 @@ def _push_sync(
     username = str(credentials.get("username") or "").strip()
     api_token = str(credentials.get("api_token") or "").strip()
     if not username or not api_token:
-        return {"ok": False, "error": "Kaggle credentials are not configured for this account"}
+        return {"ok": False, "error": "Kaggle credentials are not configured for this account."}
     if not dataset_slug or "/" not in dataset_slug:
-        return {"ok": False, "error": "Local model dataset (owner/slug) is not configured"}
+        return {"ok": False, "error": "The local model dataset (owner/slug) is not configured on the server."}
 
     slug = local_kernel_slug(owner_uid)
     uid_slug = slug.rsplit("-", 1)[-1]
@@ -265,7 +285,7 @@ def _push_sync(
             safe_output = output.replace(api_token, "[redacted]")[-300:]
             if result.returncode != 0:
                 logger.error("kaggle local push failed sid=%s uid=%s: %s", session_id, uid_slug, safe_output)
-                return {"ok": False, "error": safe_output or f"kaggle push failed (exit {result.returncode})"}
+                return {"ok": False, "error": _friendly_push_error(safe_output, result.returncode)}
 
             with _state_lock:
                 entry = _get_entry_unlocked(owner_uid)
@@ -275,17 +295,19 @@ def _push_sync(
                 entry["status"] = "booting"
                 entry["model_id"] = None
                 entry["error"] = None
+                entry["phase"] = None
+            _kernel_status_cache.pop(owner_uid, None)
             _persist_worker_states()
 
             logger.info("kaggle local push ok sid=%s uid=%s slug=%s", session_id, uid_slug, slug)
             return {"ok": True, "slug": slug, "reused_worker": False}
         except FileNotFoundError:
-            return {"ok": False, "error": "kaggle CLI tidak terpasang di server"}
+            return {"ok": False, "error": "The Kaggle CLI is not installed on the server."}
         except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "kaggle push timeout"}
+            return {"ok": False, "error": "Pushing the kernel to Kaggle timed out. Please try again."}
         except Exception as exc:
             logger.error("kaggle local push exception sid=%s uid=%s type=%s", session_id, uid_slug, type(exc).__name__)
-            return {"ok": False, "error": "Kaggle local worker push failed"}
+            return {"ok": False, "error": "Failed to push the local worker to Kaggle."}
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -315,6 +337,9 @@ def _kernel_status_sync(owner_uid: str, credentials: Dict[str, str]) -> Dict[str
         match = re.search(r'status\s+"?([A-Za-z_.]+)"?', output)
         raw_state = (match.group(1).split(".")[-1].lower() if match else "")
         if result.returncode != 0 and not raw_state:
+            lowered = output.lower()
+            if "404" in lowered or "not found" in lowered or "does not exist" in lowered:
+                return {"state": "not_found", "detail": None}
             return {"state": "unknown", "detail": output[-200:] or None}
         if raw_state in ("running", "queued", "complete", "error", "cancelacknowledged", "cancelrequested"):
             state = "cancelled" if raw_state.startswith("cancel") else raw_state
@@ -340,6 +365,60 @@ async def kernel_status(owner_uid: str, credentials: Dict[str, str]) -> Dict[str
     return value
 
 
+_dataset_cache: Dict[str, Dict[str, Any]] = {}
+DATASET_CACHE_SECONDS = 60
+
+
+def _dataset_access_sync(credentials: Dict[str, str], dataset_slug: str) -> Dict[str, Any]:
+    """Can THIS Kaggle account see the model dataset? ready | forbidden | not_found | unknown."""
+    username = str(credentials.get("username") or "").strip()
+    api_token = str(credentials.get("api_token") or "").strip()
+    if not username or not api_token or "/" not in (dataset_slug or ""):
+        return {"state": "unknown", "detail": None}
+    work = tempfile.mkdtemp(prefix="kaggle_local_dataset_")
+    try:
+        cli_env = os.environ.copy()
+        for key in ("KAGGLE_KEY", "KAGGLE_USERNAME", "KAGGLE_API_TOKEN"):
+            cli_env.pop(key, None)
+        cli_env["KAGGLE_USERNAME"] = username
+        cli_env["KAGGLE_API_TOKEN"] = api_token
+        cli_env["KAGGLE_CONFIG_DIR"] = work
+        result = subprocess.run(
+            ["kaggle", "datasets", "status", dataset_slug],
+            capture_output=True, text=True, timeout=30, env=cli_env,
+        )
+        output = ((result.stdout or "") + (result.stderr or "")).strip().replace(api_token, "[redacted]")
+        if result.returncode == 0:
+            return {"state": "ready", "detail": None}
+        low = output.lower()
+        if "403" in low or "forbidden" in low or "permission" in low:
+            return {"state": "forbidden", "detail": None}
+        if "404" in low or "not found" in low:
+            return {"state": "not_found", "detail": None}
+        return {"state": "unknown", "detail": output[-200:] or None}
+    except Exception as exc:  # best-effort; never block the user on a failed check
+        logger.warning("kaggle dataset check failed type=%s", type(exc).__name__)
+        return {"state": "unknown", "detail": None}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def dataset_access(owner_uid: str, credentials: Dict[str, str], dataset_slug: str) -> Dict[str, Any]:
+    now = time.time()
+    key = f"{owner_uid}:{dataset_slug}"
+    cached = _dataset_cache.get(key)
+    if cached and now - cached["at"] < DATASET_CACHE_SECONDS:
+        return cached["value"]
+    value = await asyncio.to_thread(_dataset_access_sync, credentials, dataset_slug)
+    if value.get("state") != "unknown":
+        _dataset_cache[key] = {"at": now, "value": value}
+    return value
+
+
+def invalidate_kernel_status_cache(owner_uid: str) -> None:
+    _kernel_status_cache.pop(owner_uid, None)
+
+
 async def start_worker(
     session_id: str,
     backend_url: str,
@@ -349,7 +428,7 @@ async def start_worker(
     dataset_slug: str,
 ) -> Dict[str, Any]:
     if not kaggle_enabled():
-        return {"ok": False, "error": "Kaggle CLI atau workerlocal.py tidak tersedia di backend"}
+        return {"ok": False, "error": "The Kaggle CLI or workerlocal.py is not available on the backend."}
     return await asyncio.to_thread(_push_sync, session_id, backend_url, owner_uid, worker_token, credentials, dataset_slug)
 
 

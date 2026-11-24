@@ -72,6 +72,13 @@ class WorkerStatusPayload(BaseModel):
     status: str = Field(pattern="^(booting|ready|error|offline)$")
     model_id: str | None = None
     error: str | None = None
+    # Boot sub-phase reported by the worker while status == "booting".
+    phase: str | None = Field(default=None, pattern="^(worker|packages|model)$")
+
+
+class ConnectPayload(BaseModel):
+    # force=True is the manual "Restart Kaggle" button: drop the current session and push a fresh kernel run.
+    force: bool = False
 
 
 class WorkerPollPayload(BaseModel):
@@ -116,24 +123,30 @@ async def _get_session(session_id: str) -> dict[str, Any] | None:
 
 
 @router.post("/connect")
-async def connect(request: Request, authorization: str | None = Header(default=None)):
-    """Dipanggil saat user menekan 'Jalankan di Kaggle' / 'Jalankan ulang'.
-    Memakai ulang worker yang masih hidup; kalau worker sudah mati (Kaggle sleep /
-    idle / dihentikan) sesi lama dibuang dan kernel Kaggle di-push ulang."""
+async def connect(request: Request, payload: ConnectPayload | None = None, authorization: str | None = Header(default=None)):
+    """Called by "Start on Kaggle" / "Restart Kaggle".
+    Reuses a worker that is still alive (unless force=True); if the worker is gone (Kaggle slept,
+    went idle or was stopped) the old session is dropped and the Kaggle kernel is pushed again.
+    The kernel is created automatically on the first run, so a new user needs no notebook of their own."""
+    force = bool(payload and payload.force)
     uid = authenticate_user(authorization)
     credentials = get_user_credentials(uid)
     if not credentials:
-        raise HTTPException(403, "Save this account's Kaggle username and API token first")
+        raise HTTPException(403, "Save this account's Kaggle username and API token first.")
     if not kaggle_local_runner.kaggle_enabled():
-        raise HTTPException(503, "Kaggle CLI atau workerlocal.py tidak tersedia di backend")
+        raise HTTPException(503, "The Kaggle CLI or workerlocal.py is not available on the backend.")
+
+    dataset = await kaggle_local_runner.dataset_access(uid, credentials, LOCAL_MODEL_DATASET)
+    if dataset.get("state") in ("forbidden", "not_found"):
+        raise HTTPException(409, _dataset_blocker_message(credentials["username"]))
 
     existing = await _get_session_for_uid(uid)
     snapshot = kaggle_local_runner.worker_snapshot(uid)
-    if existing and snapshot.get("alive") and snapshot.get("status") in ("booting", "ready"):
+    if not force and existing and snapshot.get("alive") and snapshot.get("status") in ("booting", "ready"):
         return {"ok": True, "session_id": existing["session_id"], "status": snapshot.get("status"),
                 "model_id": snapshot.get("model_id"), "reused": True}
 
-    # Worker mati/hilang -> buang semua sesi lama supaya tidak ada sesi yatim.
+    # Worker is gone (or a restart was forced) -> drop every old session so none are orphaned.
     await _drop_sessions_for_uid(uid)
     kaggle_local_runner.set_worker_status(uid, status="offline")
 
@@ -155,9 +168,110 @@ async def connect(request: Request, authorization: str | None = Header(default=N
     if not result.get("ok"):
         async with _sessions_lock:
             _sessions.pop(sid, None)
-        raise HTTPException(502, result.get("error") or "Gagal menjalankan Kaggle worker")
+        raise HTTPException(502, result.get("error") or "Failed to start the Kaggle worker.")
 
     return {"ok": True, "session_id": sid, "status": "booting", "model_id": None, "reused": False}
+
+
+def _dataset_blocker_message(username: str) -> str:
+    return (
+        f"The Kaggle account \"{username}\" cannot access the model dataset ({LOCAL_MODEL_DATASET}). "
+        "Ask the dataset owner to share it with this Kaggle username, then check again."
+    )
+
+
+@router.get("/preflight")
+async def preflight(authorization: str | None = Header(default=None)):
+    """Everything that must be true BEFORE a worker can start, so the UI can explain what is
+    missing instead of failing after minutes of booting. A missing kernel is NOT a blocker:
+    the first "Start" creates it."""
+    uid = authenticate_user(authorization)
+    credentials = get_user_credentials(uid)
+    cli_ok = kaggle_local_runner.kaggle_enabled()
+    checks: list[dict[str, Any]] = [
+        {"id": "credentials", "label": "Kaggle account connected", "ok": bool(credentials)},
+        {"id": "backend", "label": "Backend can control Kaggle", "ok": cli_ok},
+    ]
+    blocker: str | None = None
+    message: str | None = None
+    kernel_state: str | None = None
+    if not credentials:
+        blocker, message = "no-credentials", "Connect your Kaggle account first."
+    elif not cli_ok:
+        blocker, message = "no-backend", "The backend cannot control Kaggle right now. Please try again later."
+    else:
+        dataset, kernel = await asyncio.gather(
+            kaggle_local_runner.dataset_access(uid, credentials, LOCAL_MODEL_DATASET),
+            kaggle_local_runner.kernel_status(uid, credentials),
+        )
+        dataset_state = dataset.get("state")
+        kernel_state = kernel.get("state")
+        checks.append({
+            "id": "dataset",
+            "label": "Model dataset accessible",
+            "ok": dataset_state not in ("forbidden", "not_found"),
+            "detail": None if dataset_state == "ready" else dataset_state,
+        })
+        checks.append({
+            "id": "kernel",
+            "label": "Worker notebook on Kaggle",
+            "ok": kernel_state not in ("not_found",),
+            "detail": "It will be created automatically on the first start." if kernel_state == "not_found" else kernel_state,
+        })
+        if dataset_state in ("forbidden", "not_found"):
+            blocker, message = "no-dataset", _dataset_blocker_message(credentials["username"])
+    return {
+        "ok": True,
+        "can_start": blocker is None,
+        "blocker": blocker,
+        "message": message,
+        "kernel_exists": kernel_state not in (None, "not_found"),
+        "checks": checks,
+    }
+
+
+# Ordered boot pipeline shown in the UI. Each step is derived from real signals
+# (push time, Kaggle kernel state, worker heartbeat, worker-reported phase).
+_BOOT_STEPS: list[tuple[str, str, str]] = [
+    ("push", "Sending the worker to Kaggle", "Uploading the notebook through the Kaggle API."),
+    ("gpu", "Waiting for a Kaggle GPU", "Kaggle is queuing the notebook and assigning a GPU. This can take a few minutes when it is busy."),
+    ("worker", "Worker connected", "The notebook is running and is about to check in with the backend."),
+    ("packages", "Preparing packages", "Installing document and media tools inside the worker."),
+    ("model", "Loading the model onto the GPU", "Copying the model and starting the inference server. This is usually the longest step."),
+    ("ready", "Model ready", "You can start chatting."),
+]
+_PHASE_DONE_INDEX = {"worker": 2, "packages": 2, "model": 3}
+
+
+def _build_boot_steps(state: str, snapshot: dict[str, Any], kaggle_state: str | None) -> list[dict[str, Any]]:
+    if state == "ready":
+        done_upto = len(_BOOT_STEPS) - 1
+    else:
+        done_upto = -1
+        if (snapshot.get("last_push") or 0) > 0:
+            done_upto = 0
+        if kaggle_state == "running":
+            done_upto = max(done_upto, 1)
+        if (snapshot.get("last_heartbeat") or 0) > 0:
+            done_upto = max(done_upto, 2)
+        phase = snapshot.get("phase")
+        if phase in _PHASE_DONE_INDEX:
+            done_upto = max(done_upto, _PHASE_DONE_INDEX[phase])
+    steps: list[dict[str, Any]] = []
+    for idx, (sid, label, detail) in enumerate(_BOOT_STEPS):
+        if idx <= done_upto:
+            step_state = "done"
+        elif idx == done_upto + 1:
+            step_state = "error" if state == "error" else "active"
+        else:
+            step_state = "pending"
+        step: dict[str, Any] = {"id": sid, "label": label, "state": step_state}
+        if step_state in ("active", "error"):
+            step["detail"] = detail
+            if sid == "gpu" and kaggle_state == "queued":
+                step["detail"] = "Queued on Kaggle. Waiting for a free GPU."
+        steps.append(step)
+    return steps
 
 
 @router.get("/status")
@@ -172,7 +286,7 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
 
     # Worker masih "hidup" tapi sesi backend hilang (mis. backend Render restart): yatim -> anggap mati.
     if not sess and state in ("booting", "ready"):
-        state, error = "offline", "Sesi backend hilang (server restart). Jalankan ulang worker."
+        state, error = "offline", "The backend session was lost (server restart). Restart the worker."
 
     kaggle_state = None
     if deep and state in ("booting", "offline", "error"):
@@ -184,13 +298,19 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
             if state == "booting" and kaggle_state in ("error", "complete", "cancelled") and booting_for > 45:
                 detail = info.get("detail")
                 state = "error"
-                error = ("Kernel Kaggle berhenti saat booting"
+                error = ("The Kaggle kernel stopped while booting"
                          + (f" ({detail})" if detail else f" (status: {kaggle_state})")
-                         + ". Biasanya karena kuota GPU mingguan Kaggle habis atau dataset model tidak bisa diakses.")
+                         + ". Common causes: the weekly GPU quota is used up, the account is not phone-verified "
+                         "(required for GPU and internet), or the model dataset is not accessible.")
                 kaggle_local_runner.set_worker_status(uid, status="error", error=error)
 
+    steps = _build_boot_steps(state, snapshot, kaggle_state) if state in ("booting", "ready") else []
+    last_push = float(snapshot.get("last_push") or 0)
     return {
         "ok": True,
+        "steps": steps,
+        "boot_elapsed": int(time.time() - last_push) if state == "booting" and last_push else None,
+        "phase": snapshot.get("phase"),
         "connected": bool(sess) and state in ("booting", "ready"),
         "session_id": sess["session_id"] if sess else None,
         "status": state,
@@ -205,12 +325,12 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
 async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     sess = await _get_session_for_uid(uid)
     if not sess:
-        raise HTTPException(409, "AI Local belum terhubung. Sambungkan dulu lewat tab Local.")
+        raise HTTPException(409, "AI Local is not connected yet. Start it from the Local tab first.")
     snapshot = kaggle_local_runner.worker_snapshot(uid)
     if snapshot.get("status") != "ready":
         if snapshot.get("status") in ("offline", "error"):
-            raise HTTPException(409, "Worker AI Local sedang mati (Kaggle sleep/berhenti). Jalankan ulang lewat tab Local.")
-        raise HTTPException(409, "AI Local masih memuat GPU & model, belum siap menerima pesan")
+            raise HTTPException(409, "The AI Local worker is down (Kaggle slept or stopped). Restart it from the Local tab.")
+        raise HTTPException(409, "AI Local is still loading the GPU and model and cannot take messages yet.")
 
     job_id = uuid.uuid4().hex[:12]
     async with _sessions_lock:
@@ -226,13 +346,13 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
             async with _sessions_lock:
                 if sess.get("pending_job", {}).get("job_id") == job_id:
                     sess["pending_job"] = None
-            raise HTTPException(503, "Worker AI Local berhenti di tengah proses (Kaggle sleep/berhenti). Jalankan ulang lewat tab Local.")
+            raise HTTPException(503, "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab.")
         await asyncio.sleep(0.5)
 
     async with _sessions_lock:
         if sess.get("pending_job", {}).get("job_id") == job_id:
             sess["pending_job"] = None
-    raise HTTPException(504, "AI Local tidak membalas tepat waktu")
+    raise HTTPException(504, "AI Local did not reply in time.")
 
 
 @router.post("/chat")
@@ -241,7 +361,7 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images]}
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
-        raise HTTPException(502, result.get("error") or "AI Local gagal memproses pesan")
+        raise HTTPException(502, result.get("error") or "AI Local failed to process the message.")
     content = (result.get("result") or {}).get("content") or ""
     return {"success": True, "data": {"result": {"content": content, "model": "ai-local", "usage": {}, "sources": []}}}
 
@@ -257,11 +377,11 @@ async def local_upload(payload: LocalUploadPayload, authorization: str | None = 
     try:
         raw = base64.b64decode(payload.content_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise HTTPException(400, "File tidak valid") from exc
+        raise HTTPException(400, "Invalid file.") from exc
     if not raw:
-        raise HTTPException(400, "File kosong")
+        raise HTTPException(400, "The file is empty.")
     if len(raw) > UPLOAD_LIMIT_BYTES:
-        raise HTTPException(413, "File melebihi batas 20 MB")
+        raise HTTPException(413, "The file exceeds the 20 MB limit.")
     filename = f"{uuid.uuid4().hex[:8]}_{_safe_upload_name(payload.name)}"
     path = f"{UPLOAD_DIR}/{filename}"
     result = await _enqueue_and_wait(
@@ -271,10 +391,10 @@ async def local_upload(payload: LocalUploadPayload, authorization: str | None = 
         UPLOAD_JOB_TIMEOUT_SECONDS,
     )
     if not result.get("ok"):
-        raise HTTPException(502, result.get("error") or "Gagal menulis file di Kaggle")
+        raise HTTPException(502, result.get("error") or "Failed to write the file on Kaggle.")
     inner = result.get("result") or {}
     if isinstance(inner, dict) and inner.get("ok") is False:
-        raise HTTPException(502, inner.get("error") or "Gagal menulis file di Kaggle")
+        raise HTTPException(502, inner.get("error") or "Failed to write the file on Kaggle.")
     return {"success": True, "data": {"path": path, "size": len(raw), "name": filename, "mime_type": payload.mime_type}}
 
 
@@ -310,7 +430,7 @@ async def kaggle_status(payload: WorkerStatusPayload, session_id: str = Query(..
     if not sess:
         raise HTTPException(410, "session not found or expired")
     _require_worker_token(sess, worker_token)
-    kaggle_local_runner.set_worker_status(sess["owner_uid"], status=payload.status, model_id=payload.model_id, error=payload.error)
+    kaggle_local_runner.set_worker_status(sess["owner_uid"], status=payload.status, model_id=payload.model_id, error=payload.error, phase=payload.phase)
     kaggle_local_runner.touch_worker(sess["owner_uid"], session_id)
     return {"ok": True}
 
