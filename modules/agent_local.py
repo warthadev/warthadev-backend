@@ -362,8 +362,13 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
         raise HTTPException(502, result.get("error") or "AI Local failed to process the message.")
-    content = (result.get("result") or {}).get("content") or ""
-    return {"success": True, "data": {"result": {"content": content, "model": "ai-local", "usage": {}, "sources": []}}}
+    inner = result.get("result") or {}
+    content = inner.get("content") or ""
+    attachments = inner.get("attachments") if isinstance(inner.get("attachments"), list) else []
+    payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
+    if attachments:
+        payload_out["attachments"] = attachments
+    return {"success": True, "data": {"result": payload_out}}
 
 
 @router.post("/upload")
