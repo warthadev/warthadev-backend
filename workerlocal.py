@@ -725,17 +725,23 @@ def exec_tool(name, args, base_dir=BASE_DIR):
 
 def build_system_prompt(base_dir):
     return (
-        "Kamu adalah Autonomous AI Partner yang berjalan lokal (GPU Kaggle), bisa membaca/menulis file, "
-        "menjalankan perintah shell, mencari web, dan menganalisis gambar.\n"
+        "Kamu adalah Autonomous AI Partner profesional yang berjalan lokal (GPU Kaggle). "
+        "Kamu bisa membaca/menulis file, menjalankan shell, mencari web, dan menganalisis gambar.\n"
         f"WORKSPACE UTAMA: `{base_dir}` (dan `/kaggle/input` untuk data read-only).\n"
         f"FILE UPLOAD PENGGUNA: `{base_dir}/uploads`. Untuk PDF, DOCX, PPTX, XLSX, CSV, gambar berisi teks, "
         "audio, video, dan arsip zip/tar gunakan tool read_document. Jangan memakai read_file pada file biner.\n"
         "TOOLS: list_dir, read_file, patch_file, write_file, run_bash, web_search, web_fetch, inspect_image, read_document.\n"
+        "Cara kerja profesional:\n"
+        "- Sebelum mengerjakan tugas besar, pahami dulu konteks: cek folder, baca file relevan, atau tanya user "
+        "jika informasi penting kurang (nama proyek, API key, target deploy, kredensial, dsb).\n"
+        "- Jangan mengarang. Jika butuh token/API key/secret, minta user menuliskannya (atau pastikan sudah ada di env/secret) "
+        "sebelum menjalankan langkah yang bergantung padanya.\n"
+        "- Kerjakan langkah demi langkah: investigasi → rencana singkat → eksekusi → verifikasi hasil.\n"
+        "- Laporkan hasil yang konkret (path file, perintah yang dijalankan, error asli) tanpa basa-basi berlebih.\n"
         "Paket dokumen (pymupdf, python-docx, python-pptx, faster-whisper) dipasang offline dari dataset "
         "media-offline-pkgs ke /tmp/docpkgs tanpa menimpa numpy atau pillow bawaan Kaggle. "
         "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
         "dan baru dipasang lewat apt bila belum ada.\n"
-        "Jangan mengarang data; gunakan tool untuk memverifikasi sebelum menjawab fakta terkini. "
         "Jujur jika sebuah tool gagal atau data tidak ditemukan.\n"
         + _DELIVER_SYSTEM_HINT
     )
@@ -812,9 +818,30 @@ def wait_ready(proc, port, secs=300):
     return False
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8):
+_TOOL_ACTIVITY = {
+    "list_dir": "Memeriksa isi folder…",
+    "read_file": "Membaca file…",
+    "patch_file": "Mengedit file…",
+    "write_file": "Menulis file…",
+    "run_bash": "Menjalankan perintah…",
+    "web_search": "Mencari di web…",
+    "web_fetch": "Mengambil halaman web…",
+    "inspect_image": "Menganalisis gambar…",
+    "read_document": "Membaca dokumen…",
+}
+
+
+def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8, on_activity=None):
+    def _act(msg):
+        if on_activity:
+            try:
+                on_activity(msg)
+            except Exception:
+                pass
+
     history.append({"role": "user", "content": user_content})
     for _step in range(max_steps):
+        _act("Sedang berpikir…")
         payload = {"messages": history, "tools": TOOLS, "tool_choice": "auto",
                    "max_tokens": -1, "temperature": 0.25, "stream": False}
         req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
@@ -827,6 +854,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8):
         history.append({"role": "assistant", "content": message.get("content"),
                          **({"tool_calls": tool_calls} if tool_calls else {})})
         if not tool_calls:
+            _act("Menyusun jawaban…")
             return message.get("content") or ""
 
         pending_images = []
@@ -836,6 +864,22 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8):
                 parsed_args = json.loads(tc["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 parsed_args = {}
+            label = _TOOL_ACTIVITY.get(fn_name, f"Menjalankan {fn_name}…")
+            # Tambah detail singkat biar tidak monoton
+            detail = ""
+            if fn_name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
+                p = str(parsed_args.get("path") or "")
+                if p:
+                    detail = f" ({p.rsplit('/', 1)[-1]})"
+            elif fn_name == "run_bash":
+                cmd = str(parsed_args.get("command") or "")[:40]
+                if cmd:
+                    detail = f" ({cmd}…)" if len(str(parsed_args.get("command") or "")) > 40 else f" ({cmd})"
+            elif fn_name == "web_search":
+                q = str(parsed_args.get("query") or "")[:40]
+                if q:
+                    detail = f" “{q}”"
+            _act(label + detail)
             result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
             if isinstance(result, dict) and "__image_payload__" in result:
                 img_fp, q_img = result["__image_payload__"], result["question"]
@@ -979,8 +1023,19 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         for img in images:
                             content.append({"type": "image_url", "image_url": {
                                 "url": f"data:{img.get('mime_type')};base64,{img.get('data')}"}})
-                    answer = run_agent_turn(history, api_url, base_dir, content)
+                    def _report_activity(msg):
+                        try:
+                            _post("/agent/local/kaggle-activity", {"activity": msg}, timeout=5)
+                        except Exception:
+                            pass
+                    _report_activity("Memahami permintaan…")
+                    answer = run_agent_turn(history, api_url, base_dir, content, on_activity=_report_activity)
+                    _report_activity("Menyiapkan file dan jawaban…")
                     cleaned, attachments = extract_and_deliver(answer or "", session_id)
+                    try:
+                        _post("/agent/local/kaggle-activity", {"activity": None}, timeout=5)
+                    except Exception:
+                        pass
                     result_body = {"content": cleaned}
                     if attachments:
                         result_body["attachments"] = attachments
