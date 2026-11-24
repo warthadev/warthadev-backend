@@ -13,12 +13,14 @@ import base64
 import shutil
 import subprocess
 import threading
+import importlib
+import importlib.util
 import urllib.parse
 import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-24-ai-local-kaggle-poll-b64"
+WORKER_VERSION = "2026-11-24-ai-local-kaggle-uploads"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -104,6 +106,19 @@ TOOLS = [
             "question": {"type": "string"},
         }, "required": ["path"]},
     }},
+    {"type": "function", "function": {
+        "name": "read_document",
+        "description": (
+            "Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: "
+            "PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), "
+            "gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. "
+            "Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path absolut file, misal /kaggle/working/uploads/nama.pdf"},
+            "max_chars": {"type": "integer", "description": "Batas karakter hasil, default 12000"},
+        }, "required": ["path"]},
+    }},
 ]
 
 
@@ -153,6 +168,330 @@ def perform_web_search(query, max_results=6):
     if not items:
         return "[PENCARIAN WEB TIDAK MENGHASILKAN DATA VALID]"
     return "\n".join(items[:max_results])
+
+
+# Paket dari dataset media-offline-pkgs. Dipasang ke folder terpisah dengan
+# --no-deps supaya numpy/pillow bawaan Kaggle tidak tertimpa. Yang tidak ada
+# di dataset (pandas, openpyxl, tesseract) memakai yang sudah terpasang di image,
+# atau apt hanya jika biner itu memang belum ada.
+_DOC_TARGET = "/tmp/docpkgs"
+_DOC_WHEEL_GLOBS = (
+    "pymupdf-*.whl", "pymupdf4llm-*.whl", "pymupdf_layout-*.whl",
+    "python_docx-*.whl", "python_pptx-*.whl", "lxml-*.whl", "xlsxwriter-*.whl",
+    "faster_whisper-*.whl", "ctranslate2-*.whl", "av-*.whl",
+    "onnxruntime-*.whl", "tokenizers-*.whl",
+)
+_WHISPER_MODEL = None
+_DOC_TEXT_LIMIT = 12000
+
+
+def _wheel_matches_python(filename):
+    low = filename.lower()
+    if "py3-none-any" in low or "py2.py3-none-any" in low:
+        return True
+    current = sys.version_info.major * 100 + sys.version_info.minor
+    for match in re.finditer(r"cp(\d+)", low):
+        tag = int(match.group(1))
+        if "abi3" in low and tag <= current:
+            return True
+        if tag == current:
+            return True
+    return False
+
+
+def _run_quiet(cmd, timeout=180):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+
+
+def _prepare_media_packages():
+    """Pasang wheel offline seperti worker downloader, lalu lengkapi biner yang belum ada."""
+    os.makedirs(BASE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
+    wheels = next(iter(glob.glob("/kaggle/input/**/wheels", recursive=True)), None)
+    installed = []
+    if wheels:
+        os.makedirs(_DOC_TARGET, exist_ok=True)
+        files = []
+        for pattern in _DOC_WHEEL_GLOBS:
+            for path in glob.glob(os.path.join(wheels, pattern)):
+                if _wheel_matches_python(os.path.basename(path)):
+                    files.append(path)
+        if files:
+            result = _run_quiet([
+                sys.executable, "-m", "pip", "install", "-q", "--no-index", "--no-deps",
+                "--target", _DOC_TARGET, *files,
+            ], timeout=300)
+            if result.returncode != 0:
+                print(f"[setup] pip offline gagal: {(result.stdout or '')[-400:]}", flush=True)
+            else:
+                installed = [os.path.basename(path) for path in files]
+        deb_dir = os.path.join(os.path.dirname(wheels), "deb")
+        if not shutil.which("ffmpeg"):
+            ffdebs = sorted(glob.glob(os.path.join(deb_dir, "ffmpeg*.deb")))
+            if ffdebs:
+                _run_quiet(["dpkg", "-i", *ffdebs], timeout=180)
+    if _DOC_TARGET not in sys.path:
+        sys.path.insert(0, _DOC_TARGET)
+    os.environ["PYTHONPATH"] = _DOC_TARGET + os.pathsep + os.environ.get("PYTHONPATH", "")
+    importlib.invalidate_caches()
+    missing_apt = []
+    if not shutil.which("ffmpeg"):
+        missing_apt.append("ffmpeg")
+    if not shutil.which("tesseract"):
+        missing_apt.extend(["tesseract-ocr", "tesseract-ocr-eng", "tesseract-ocr-ind"])
+    if missing_apt:
+        print(f"[setup] tidak ada di dataset, memasang dari image Kaggle: {', '.join(missing_apt)}", flush=True)
+        _run_quiet(["apt-get", "update", "-qq"], timeout=180)
+        _run_quiet(["apt-get", "install", "-y", "-qq", *missing_apt], timeout=300)
+    ready = []
+    for module_name, label in (
+        ("fitz", "pymupdf"), ("docx", "python-docx"), ("pptx", "python-pptx"),
+        ("faster_whisper", "faster-whisper"), ("pandas", "pandas"),
+    ):
+        if importlib.util.find_spec(module_name) is not None:
+            ready.append(label)
+    print(
+        f"[setup] media packages offline={len(installed)} siap={','.join(ready) or '-'} "
+        f"ffmpeg={bool(shutil.which('ffmpeg'))} tesseract={bool(shutil.which('tesseract'))}",
+        flush=True,
+    )
+
+
+def _clip_text(text, limit=_DOC_TEXT_LIMIT):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text or "(kosong)"
+    return text[:limit] + f"\n\n... [dipotong, total {len(text)} karakter]"
+
+
+def _ocr_image(path):
+    if not shutil.which("tesseract"):
+        return ""
+    result = subprocess.run(
+        ["tesseract", path, "stdout", "-l", "ind+eng"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=90,
+    )
+    return (result.stdout or "").strip()
+
+
+def _read_pdf(path, limit):
+    import fitz
+    doc = fitz.open(path)
+    parts = []
+    ocr_budget = 6
+    for index, page in enumerate(doc):
+        if index >= 40:
+            parts.append(f"... [{doc.page_count} halaman, hanya 40 pertama]")
+            break
+        text = page.get_text("text").strip()
+        if len(text) < 40 and ocr_budget > 0 and shutil.which("tesseract"):
+            image_path = f"/tmp/ocr_page_{index}.png"
+            page.get_pixmap(matrix=fitz.Matrix(2, 2)).save(image_path)
+            scanned = _ocr_image(image_path)
+            if scanned:
+                text = "[OCR]\n" + scanned
+                ocr_budget -= 1
+        parts.append(f"--- halaman {index + 1} ---\n{text}")
+    return _clip_text("\n\n".join(parts), limit)
+
+
+def _read_docx(path, limit):
+    import docx
+    document = docx.Document(path)
+    chunks = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                chunks.append(" | ".join(cells))
+    return _clip_text("\n".join(chunks), limit)
+
+
+def _read_pptx(path, limit):
+    from pptx import Presentation
+    presentation = Presentation(path)
+    parts = []
+    for index, slide in enumerate(presentation.slides, 1):
+        texts = []
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False) and shape.text_frame.text.strip():
+                texts.append(shape.text_frame.text.strip())
+        parts.append(f"--- slide {index} ---\n" + ("\n".join(texts) or "(tanpa teks)"))
+        if index >= 60:
+            parts.append("... [slide selebihnya dipotong]")
+            break
+    return _clip_text("\n\n".join(parts), limit)
+
+
+def _read_table(path, limit):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        import pandas as pd
+    except Exception as exc:
+        return f"Error: pandas bawaan Kaggle tidak bisa diimpor ({exc})."
+    if ext == ".csv" or ext == ".tsv":
+        frame = pd.read_csv(path, sep="\t" if ext == ".tsv" else ",", nrows=200)
+        return _clip_text(f"CSV preview {frame.shape[0]} baris x {frame.shape[1]} kolom\n{frame.to_csv(index=False)}", limit)
+    book = pd.ExcelFile(path)
+    parts = []
+    for name in book.sheet_names[:8]:
+        frame = book.parse(name, nrows=200)
+        parts.append(f"Sheet: {name} ({frame.shape[0]} x {frame.shape[1]})\n{frame.to_csv(index=False)}")
+    return _clip_text("\n\n".join(parts), limit)
+
+
+def _reject_unsafe_archive_name(name):
+    pure = os.path.normpath(name)
+    if pure.startswith("/") or pure.startswith("..") or "/../" in f"/{pure}" or pure == "..":
+        raise ValueError(f"arsip berisi path tidak aman: {name}")
+
+
+def _extract_archive(path):
+    base = os.path.splitext(os.path.basename(path))[0][:80] or "arsip"
+    dest = os.path.join(BASE_DIR, "uploads", "_extracted", base)
+    os.makedirs(dest, exist_ok=True)
+    lower = path.lower()
+    names = []
+    if lower.endswith(".zip"):
+        import zipfile
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if len(infos) > 500:
+                return "Error: arsip berisi lebih dari 500 entri."
+            total = 0
+            for info in infos:
+                _reject_unsafe_archive_name(info.filename)
+                total += int(info.file_size or 0)
+            if total > 200 * 1024 * 1024:
+                return "Error: isi arsip lebih dari 200 MB."
+            archive.extractall(dest)
+            names = [info.filename for info in infos]
+    elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2")):
+        import tarfile
+        with tarfile.open(path) as archive:
+            members = archive.getmembers()
+            if len(members) > 500:
+                return "Error: arsip berisi lebih dari 500 entri."
+            total = 0
+            for member in members:
+                _reject_unsafe_archive_name(member.name)
+                total += int(member.size or 0)
+            if total > 200 * 1024 * 1024:
+                return "Error: isi arsip lebih dari 200 MB."
+            archive.extractall(dest)
+            names = [member.name for member in members]
+    else:
+        return "Error: format arsip ini tidak didukung. Pakai zip, tar, atau tar.gz."
+    preview = "\n".join(names[:80])
+    extra = "" if len(names) <= 80 else f"\n... [{len(names) - 80} entri lagi]"
+    return f"Diekstrak ke {dest} ({len(names)} entri)\n{preview}{extra}"
+
+
+def _transcribe_audio(path):
+    global _WHISPER_MODEL
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        return f"Error: faster-whisper tidak siap ({exc}). Paket ada di dataset, tapi import gagal."
+    if _WHISPER_MODEL is None:
+        # CPU supaya tidak berebut VRAM dengan llama-server.
+        _WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
+    segments, _info = _WHISPER_MODEL.transcribe(path, vad_filter=True)
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    return text or "(tidak ada ucapan yang terdengar)"
+
+
+def _read_media(path, limit):
+    ext = os.path.splitext(path)[1].lower()
+    audio_path = path
+    notes = []
+    if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+        if not shutil.which("ffmpeg"):
+            return "Error: ffmpeg tidak tersedia untuk memisahkan audio video."
+        audio_path = "/tmp/media_audio.wav"
+        frame_path = "/tmp/media_frame.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", audio_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=False,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", "1", "-i", path, "-frames:v", "1", frame_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
+        )
+        if os.path.isfile(frame_path):
+            scanned = _ocr_image(frame_path)
+            if scanned:
+                notes.append("Teks pada satu frame:\n" + scanned)
+    transcript = _transcribe_audio(audio_path)
+    body = "Transkrip:\n" + transcript
+    if notes:
+        body += "\n\n" + "\n\n".join(notes)
+    return _clip_text(body, limit)
+
+
+def read_document(path, max_chars=_DOC_TEXT_LIMIT):
+    if not path or not os.path.isfile(path):
+        return f"Error: File '{path}' tidak ditemukan."
+    if os.path.getsize(path) > 200 * 1024 * 1024:
+        return f"Error: File '{path}' terlalu besar (>200 MB)."
+    limit = max(1000, min(int(max_chars or _DOC_TEXT_LIMIT), 20000))
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".pdf":
+            return _read_pdf(path, limit)
+        if ext == ".docx":
+            return _read_docx(path, limit)
+        if ext in {".doc", ".ppt"}:
+            return "Format Office lama ini tidak ada di paket offline. Simpan sebagai DOCX, PPTX, atau PDF."
+        if ext == ".pptx":
+            return _read_pptx(path, limit)
+        if ext in {".xlsx", ".xlsm", ".xls", ".csv", ".tsv"}:
+            return _read_table(path, limit)
+        if ext == ".parquet":
+            import pandas as pd
+            frame = pd.read_parquet(path)
+            return _clip_text(f"Parquet {frame.shape}\n{frame.head(200).to_csv(index=False)}", limit)
+        if ext in {".sqlite", ".db"}:
+            import sqlite3
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+                parts = [f"Tabel: {', '.join(tables) or '(tidak ada)'}"]
+                for table in tables[:8]:
+                    safe_table = str(table).replace('"', '""')
+                    rows = connection.execute(f'SELECT * FROM "{safe_table}" LIMIT 50').fetchall()
+                    parts.append(f"--- {table} ({len(rows)} baris) ---\n{rows}")
+            finally:
+                connection.close()
+            return _clip_text("\n\n".join(parts), limit)
+        if ext in {".zip", ".tar", ".tgz", ".gz"} or path.lower().endswith(".tar.gz"):
+            return _extract_archive(path)
+        if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+            scanned = _ocr_image(path)
+            if not scanned:
+                return "OCR tidak menghasilkan teks. Untuk isi visual, pakai inspect_image."
+            return _clip_text(scanned, limit)
+        if ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+            return _read_media(path, limit)
+        if ext == ".ipynb":
+            notebook = json.load(open(path, "r", encoding="utf-8"))
+            cells = notebook.get("cells") if isinstance(notebook, dict) else None
+            if not isinstance(cells, list):
+                return "Error: notebook tidak punya cells."
+            chunks = []
+            for index, cell in enumerate(cells, 1):
+                source = cell.get("source") if isinstance(cell, dict) else ""
+                text = "".join(source) if isinstance(source, list) else str(source or "")
+                kind = cell.get("cell_type") if isinstance(cell, dict) else ""
+                chunks.append(f"Cell {index} ({kind})\n{text}")
+            return _clip_text("\n\n".join(chunks), limit)
+        return (
+            "Format ini tidak punya pembaca khusus. "
+            "CSV/JSON/teks bisa dibaca read_file atau pandas lewat run_bash. "
+            f"Ukuran file: {os.path.getsize(path)} byte."
+        )
+    except Exception as exc:
+        return f"Error membaca {path}: {exc}"
 
 
 def exec_tool(name, args, base_dir=BASE_DIR):
@@ -256,6 +595,9 @@ def exec_tool(name, args, base_dir=BASE_DIR):
                 return f"Error: Gambar '{fp}' tidak ditemukan."
             return {"__image_payload__": fp, "question": args.get("question", "Analisis gambar ini.")}
 
+        if name == "read_document":
+            return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT)
+
         return f"Error: Tool '{name}' tidak dikenal."
     except Exception as ex:
         return f"Error eksekusi {name}: {ex}"
@@ -266,7 +608,13 @@ def build_system_prompt(base_dir):
         "Kamu adalah Autonomous AI Partner yang berjalan lokal (GPU Kaggle), bisa membaca/menulis file, "
         "menjalankan perintah shell, mencari web, dan menganalisis gambar.\n"
         f"WORKSPACE UTAMA: `{base_dir}` (dan `/kaggle/input` untuk data read-only).\n"
-        "TOOLS: list_dir, read_file, patch_file, write_file, run_bash, web_search, web_fetch, inspect_image.\n"
+        f"FILE UPLOAD PENGGUNA: `{base_dir}/uploads`. Untuk PDF, DOCX, PPTX, XLSX, CSV, gambar berisi teks, "
+        "audio, video, dan arsip zip/tar gunakan tool read_document. Jangan memakai read_file pada file biner.\n"
+        "TOOLS: list_dir, read_file, patch_file, write_file, run_bash, web_search, web_fetch, inspect_image, read_document.\n"
+        "Paket dokumen (pymupdf, python-docx, python-pptx, faster-whisper) dipasang offline dari dataset "
+        "media-offline-pkgs ke /tmp/docpkgs tanpa menimpa numpy atau pillow bawaan Kaggle. "
+        "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
+        "dan baru dipasang lewat apt bila belum ada.\n"
         "Jangan mengarang data; gunakan tool untuk memverifikasi sebelum menjawab fakta terkini. "
         "Jujur jika sebuah tool gagal atau data tidak ditemukan."
     )
@@ -429,11 +777,17 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
 
     import requests
 
+    gone = {"count": 0}  # berapa kali berturut-turut backend menjawab 410 (sesi hilang)
+
     def _post(path, json_body=None, timeout=15):
         try:
             r = requests.post(f"{backend_url}{path}", params={"session_id": session_id}, json=json_body or {},
                                headers={"X-Kaggle-Worker-Token": worker_token}, timeout=timeout)
+            if r.status_code in (401, 410):
+                gone["count"] += 1
+                return None
             if r.ok:
+                gone["count"] = 0
                 return r.json()
         except Exception:
             pass
@@ -458,6 +812,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
     hb_thread.start()
     try:
         _status("booting")
+        _prepare_media_packages()
         proc, log_file, model_id = start_llama_server(base_dir, DEFAULT_PORT, DEFAULT_MAX_CTX)
         if not wait_ready(proc, DEFAULT_PORT):
             tail = ""
@@ -476,6 +831,11 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         while True:
             job_res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": False}, timeout=10)
             job = job_res.get("job") if isinstance(job_res, dict) else None
+            if gone["count"] >= 6:
+                # Backend sudah tidak mengenal sesi ini (restart / user menjalankan ulang worker baru).
+                # Berhenti supaya GPU Kaggle tidak terbuang sia-sia.
+                print("[ai-local] sesi backend hilang, mematikan worker.", flush=True)
+                break
             if not job:
                 if time.time() - idle_since > idle_shutdown_seconds:
                     print("[ai-local] idle timeout, mematikan worker.", flush=True)
