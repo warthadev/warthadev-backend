@@ -83,6 +83,7 @@ def _get_entry_unlocked(owner_uid: str) -> Dict[str, Any]:
             "model_id": None,
             "error": None,
             "phase": None,
+            "activity": None,
         }
         _worker_states[owner_uid] = entry
     return entry
@@ -146,6 +147,7 @@ def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
             "status": status,
             "raw_status": raw,
             "phase": entry.get("phase") if status == "booting" else None,
+            "activity": entry.get("activity"),
             "model_id": entry.get("model_id") if status == "ready" else None,
             "error": error,
             "last_push": float(entry.get("last_push") or 0.0),
@@ -166,7 +168,7 @@ def touch_worker(owner_uid: str, session_id: Optional[str] = None) -> None:
 
 
 def set_worker_status(owner_uid: str, *, status: str, model_id: Optional[str] = None, error: Optional[str] = None,
-                      phase: Optional[str] = None) -> None:
+                      phase: Optional[str] = None, activity: Optional[str] = None) -> None:
     if not owner_uid:
         return
     with _state_lock:
@@ -176,10 +178,23 @@ def set_worker_status(owner_uid: str, *, status: str, model_id: Optional[str] = 
             entry["model_id"] = model_id
         entry["error"] = error
         entry["phase"] = phase if status == "booting" else None
+        if activity is not None:
+            entry["activity"] = activity
         if status in ("offline", "error"):
             entry["last_heartbeat"] = 0.0
             entry["last_push"] = 0.0
+            entry["activity"] = None
     _persist_worker_states()
+
+
+def set_worker_activity(owner_uid: str, activity: Optional[str]) -> None:
+    """Update only the live activity line shown in the chat while a job runs."""
+    if not owner_uid:
+        return
+    with _state_lock:
+        entry = _get_entry_unlocked(owner_uid)
+        entry["activity"] = activity
+    # Do not persist every keystroke of activity to disk.
 
 
 def _push_lock_for(owner_uid: str) -> threading.Lock:

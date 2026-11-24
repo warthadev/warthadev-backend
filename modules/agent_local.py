@@ -74,6 +74,12 @@ class WorkerStatusPayload(BaseModel):
     error: str | None = None
     # Boot sub-phase reported by the worker while status == "booting".
     phase: str | None = Field(default=None, pattern="^(worker|packages|model)$")
+    # Live activity line while a chat/tool job is running (shown in the UI as streaming status).
+    activity: str | None = Field(default=None, max_length=240)
+
+
+class WorkerActivityPayload(BaseModel):
+    activity: str | None = Field(default=None, max_length=240)
 
 
 class ConnectPayload(BaseModel):
@@ -318,6 +324,7 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
         "error": error,
         "alive": bool(snapshot.get("alive")),
         "kaggle_state": kaggle_state,
+        "activity": snapshot.get("activity") if state == "ready" else None,
         "resumable": state in ("offline", "error"),
     }
 
@@ -435,7 +442,27 @@ async def kaggle_status(payload: WorkerStatusPayload, session_id: str = Query(..
     if not sess:
         raise HTTPException(410, "session not found or expired")
     _require_worker_token(sess, worker_token)
-    kaggle_local_runner.set_worker_status(sess["owner_uid"], status=payload.status, model_id=payload.model_id, error=payload.error, phase=payload.phase)
+    kaggle_local_runner.set_worker_status(
+        sess["owner_uid"],
+        status=payload.status,
+        model_id=payload.model_id,
+        error=payload.error,
+        phase=payload.phase,
+        activity=payload.activity,
+    )
+    kaggle_local_runner.touch_worker(sess["owner_uid"], session_id)
+    return {"ok": True}
+
+
+@router.post("/kaggle-activity")
+async def kaggle_activity(payload: WorkerActivityPayload, session_id: str = Query(...),
+                          worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token")):
+    """Lightweight live status from the worker while a chat job is running."""
+    sess = await _get_session(session_id)
+    if not sess:
+        raise HTTPException(410, "session not found or expired")
+    _require_worker_token(sess, worker_token)
+    kaggle_local_runner.set_worker_activity(sess["owner_uid"], payload.activity)
     kaggle_local_runner.touch_worker(sess["owner_uid"], session_id)
     return {"ok": True}
 
