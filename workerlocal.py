@@ -630,7 +630,7 @@ def _stage_model_assets(base_dir):
     if not os.path.isdir(bin_dst):
         src_bin = next(iter(glob.glob("/kaggle/input/**/llama_bin", recursive=True)), None)
         if not src_bin:
-            raise FileNotFoundError("Dataset tidak punya folder llama_bin")
+            raise FileNotFoundError("The dataset has no llama_bin folder")
         shutil.copytree(src_bin, bin_dst)
         for root, _, files in os.walk(bin_dst):
             for fn in files:
@@ -641,7 +641,7 @@ def _stage_model_assets(base_dir):
     if not os.path.isdir(model_dst):
         src_model = next(iter(glob.glob("/kaggle/input/**/model_gguf", recursive=True)), None)
         if not src_model:
-            raise FileNotFoundError("Dataset tidak punya folder model_gguf")
+            raise FileNotFoundError("The dataset has no model_gguf folder")
         shutil.copytree(src_model, model_dst)
     return bin_dst, model_dst
 
@@ -793,8 +793,8 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             pass
         return None
 
-    def _status(status, model_id=None, error=None):
-        _post("/agent/local/kaggle-status", {"status": status, "model_id": model_id, "error": error})
+    def _status(status, model_id=None, error=None, phase=None):
+        _post("/agent/local/kaggle-status", {"status": status, "model_id": model_id, "error": error, "phase": phase})
 
     _stop = threading.Event()
 
@@ -811,8 +811,10 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb_thread.start()
     try:
-        _status("booting")
+        _status("booting", phase="worker")
+        _status("booting", phase="packages")
         _prepare_media_packages()
+        _status("booting", phase="model")
         proc, log_file, model_id = start_llama_server(base_dir, DEFAULT_PORT, DEFAULT_MAX_CTX)
         if not wait_ready(proc, DEFAULT_PORT):
             tail = ""
