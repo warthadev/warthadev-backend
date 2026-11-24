@@ -18,7 +18,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-24-ai-local-kaggle-poll"
+WORKER_VERSION = "2026-11-24-ai-local-kaggle-poll-b64"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -390,6 +390,13 @@ def run_workspace_job(op, payload, base_dir):
     if op == "read":
         return {"ok": True, "result": exec_tool("read_file", {"path": payload["path"]}, base_dir)}
     if op == "write":
+        b64 = payload.get("content_base64")
+        if b64:
+            fp = payload["path"]
+            os.makedirs(os.path.dirname(os.path.abspath(fp)), exist_ok=True)
+            with open(fp, "wb") as fh:
+                fh.write(base64.b64decode(b64))
+            return {"ok": True, "result": f"Sukses menulis file biner {fp} ({len(b64)} char base64)."}
         return {"ok": True, "result": exec_tool("write_file", {"path": payload["path"], "content": payload.get("content", "")}, base_dir)}
     if op == "move":
         src, dst = payload["source"], payload["destination"]
