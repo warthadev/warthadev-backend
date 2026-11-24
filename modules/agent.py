@@ -584,17 +584,102 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     }
 
 
-def _runtime_stream_url() -> str:
-    runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip().rstrip("/")
-    if not runtime_url:
-        raise HTTPException(status_code=503, detail="Agent runtime is not configured")
-    return f"{runtime_url}/v1/agent/run/stream"
+async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict[str, str]], api_key: str, selected_model: str):
+    """No separate `warthadev-agent` runtime is configured (AGENT_RUNTIME_URL /
+    AGENT_INTERNAL_API_KEY unset) - that service has nothing to do with Kaggle and
+    is a standalone deployment. Rather than error out, stream a plain (tool-less)
+    OpenRouter chat completion in the same SSE event shape the frontend already
+    understands, so "AI Cloud" always behaves like a normal chat instead of
+    showing "Agent runtime is not configured"."""
+    request_body = {
+        "model": selected_model,
+        "messages": _chat_messages(payload, images),
+        "temperature": 0.2,
+        "stream": True,
+    }
+    accumulated_text = ""
+    accumulated_usage: dict[str, Any] = {}
+    result_model = selected_model
+    try:
+        target: RouterTarget = await validate_router_base_url(OPENROUTER_API_BASE_URL)
+        url = f"{target.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        connector = make_pinned_connector(target)
+        timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as client:
+            async with client.post(url, headers=headers, json=request_body, allow_redirects=False) as upstream:
+                if upstream.status >= 400:
+                    body = await _read_router_response(upstream.content)
+                    message = body.decode("utf-8", errors="ignore")[:400] or f"OpenRouter chat request failed ({upstream.status})"
+                    status = 401 if upstream.status in (401, 403) else 429 if upstream.status == 429 else 502
+                    yield f"data: {json.dumps({'type': 'error', 'status': status, 'message': message})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                buffer = ""
+                async for raw_chunk in upstream.content:
+                    if not raw_chunk:
+                        continue
+                    buffer += raw_chunk.decode("utf-8", errors="ignore")
+                    lines = buffer.split("\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if not raw or raw == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(raw)
+                        except ValueError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        result_model = chunk.get("model") or result_model
+                        if isinstance(chunk.get("usage"), dict):
+                            accumulated_usage = chunk["usage"]
+                        choices = chunk.get("choices")
+                        choice = choices[0] if isinstance(choices, list) and choices else None
+                        delta = choice.get("delta") if isinstance(choice, dict) else None
+                        content = delta.get("content") if isinstance(delta, dict) else None
+                        if isinstance(content, str) and content:
+                            accumulated_text += content
+                            yield f"data: {json.dumps({'type': 'token', 'delta': content})}\n\n"
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        yield f"data: {json.dumps({'type': 'error', 'status': 502, 'message': 'OpenRouter is unavailable'})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    if not accumulated_text.strip():
+        yield f"data: {json.dumps({'type': 'error', 'status': 502, 'message': 'OpenRouter returned an empty chat response'})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    final_event = {
+        "type": "final",
+        "result": {
+            "content": accumulated_text,
+            "model": result_model or selected_model,
+            "usage": accumulated_usage,
+            "sources": [],
+        },
+    }
+    yield f"data: {json.dumps(final_event)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @router.post("/chat/stream")
 async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     """Relay the runtime's SSE stream to the browser: tokens, status, and tool
-    activity flow through as they happen instead of one final payload."""
+    activity flow through as they happen instead of one final payload.
+
+    `AGENT_RUNTIME_URL`/`AGENT_INTERNAL_API_KEY` point at the separate
+    `warthadev-agent` service (its own deployment, unrelated to Kaggle). When
+    that service is not configured, this falls back to a plain streamed
+    OpenRouter chat (`_plain_chat_stream_events`) instead of failing, so
+    "AI Cloud" always works as ordinary chat even without that extra service."""
     claims = _claims(authorization)
     images = _validate_chat_images(payload.images)
     user_id = str(claims["uid"])
@@ -609,7 +694,11 @@ async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None
     internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "").strip()
     runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip().rstrip("/")
     if not runtime_url or not internal_key:
-        raise HTTPException(status_code=503, detail="Agent runtime is not configured")
+        return StreamingResponse(
+            _plain_chat_stream_events(payload, images, api_key, selected_model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     owner_uid = os.getenv("AGENT_OWNER_UID", "").strip()
 
     upstream_body = {
