@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +28,12 @@ _STATE_FILE = os.environ.get("KAGGLE_LOCAL_WORKER_STATE_FILE", "/tmp/wartha-kagg
 # Model gguf + llama.cpp binaries disiapkan di dataset privat milik user sendiri.
 # Override lewat env var kalau slug dataset-nya beda.
 LOCAL_MODEL_DATASET = os.environ.get("KAGGLE_LOCAL_MODEL_DATASET", "")  # "" => wajib dikirim oleh caller
+# Paket dokumen/media offline yang sama dengan worker downloader (wheels/ + deb/).
+# Dipasang di workerlocal saat boot, terisolasi, supaya numpy/pillow bawaan Kaggle tidak tertimpa.
+_PUBLIC_PACKAGE_DATASET = os.environ.get(
+    "KAGGLE_MEDIA_OFFLINE_DATASET",
+    "herbanuwarthakusuma/media-offline-pkgs",
+).strip()
 
 # Boot GPU + load model 9B jauh lebih lama daripada boot worker downloader (CPU-only).
 HEARTBEAT_TTL_SECONDS = int(os.environ.get("KAGGLE_LOCAL_WORKER_HEARTBEAT_TTL", "40"))
@@ -100,17 +107,46 @@ def active_session_for(owner_uid: str) -> Optional[str]:
     return None
 
 
+def local_kernel_slug(owner_uid: str) -> str:
+    return f"wartha-local-{hashlib.sha256(owner_uid.encode('utf-8')).hexdigest()[:10]}"
+
+
 def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
+    """State yang SUDAH dikoreksi terhadap heartbeat.
+
+    Status mentah ("ready"/"booting") hanya benar selama worker masih
+    heartbeat. Begitu Kaggle idle/sleep/berhenti, heartbeat putus, jadi:
+      - ready   + heartbeat putus          -> offline  (worker berhenti)
+      - booting + lewat BOOT_GRACE / mati  -> error    (gagal boot)
+    """
     now = time.time()
     with _state_lock:
         entry = _get_entry_unlocked(owner_uid)
         alive = _is_worker_active_unlocked(entry, now)
+        raw = entry.get("status") or "offline"
+        error = entry.get("error")
+        status = raw
+        if not alive:
+            if raw == "ready":
+                status = "offline"
+                error = error or "Worker Kaggle berhenti (sesi Kaggle idle/sleep atau dihentikan)."
+            elif raw == "booting":
+                status = "error"
+                error = error or (
+                    "Worker Kaggle tidak merespons setelah dijalankan. Kemungkinan kuota GPU Kaggle habis, "
+                    "GPU sedang penuh, atau kernel gagal start."
+                )
+            elif raw not in ("error", "offline"):
+                status = "offline"
         return {
             "session_id": entry.get("session_id"),
             "alive": alive,
-            "status": entry.get("status") or "offline",
-            "model_id": entry.get("model_id"),
-            "error": entry.get("error"),
+            "status": status,
+            "raw_status": raw,
+            "model_id": entry.get("model_id") if status == "ready" else None,
+            "error": error,
+            "last_push": float(entry.get("last_push") or 0.0),
+            "last_heartbeat": float(entry.get("last_heartbeat") or 0.0),
         }
 
 
@@ -168,8 +204,8 @@ def _push_sync(
     if not dataset_slug or "/" not in dataset_slug:
         return {"ok": False, "error": "Local model dataset (owner/slug) is not configured"}
 
-    uid_slug = hashlib.sha256(owner_uid.encode("utf-8")).hexdigest()[:10]
-    slug = f"wartha-local-{uid_slug}"
+    slug = local_kernel_slug(owner_uid)
+    uid_slug = slug.rsplit("-", 1)[-1]
 
     with _push_lock_for(owner_uid):
         now = time.time()
@@ -193,6 +229,9 @@ def _push_sync(
             )
             with open(os.path.join(work, "worker_loader.py"), "w", encoding="utf-8") as target:
                 target.write(code)
+            sources = [dataset_slug]
+            if _PUBLIC_PACKAGE_DATASET and _PUBLIC_PACKAGE_DATASET not in sources:
+                sources.append(_PUBLIC_PACKAGE_DATASET)
             meta = {
                 "id": f"{username}/{slug}",
                 "title": slug,
@@ -202,7 +241,7 @@ def _push_sync(
                 "is_private": True,
                 "enable_gpu": True,
                 "enable_internet": True,
-                "dataset_sources": [dataset_slug],
+                "dataset_sources": sources,
             }
             with open(os.path.join(work, "kernel-metadata.json"), "w", encoding="utf-8") as target:
                 json.dump(meta, target)
@@ -232,7 +271,9 @@ def _push_sync(
                 entry = _get_entry_unlocked(owner_uid)
                 entry["session_id"] = session_id
                 entry["last_push"] = time.time()
+                entry["last_heartbeat"] = 0.0
                 entry["status"] = "booting"
+                entry["model_id"] = None
                 entry["error"] = None
             _persist_worker_states()
 
@@ -247,6 +288,56 @@ def _push_sync(
             return {"ok": False, "error": "Kaggle local worker push failed"}
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+
+_kernel_status_cache: Dict[str, Dict[str, Any]] = {}
+KERNEL_STATUS_CACHE_SECONDS = 15
+
+
+def _kernel_status_sync(owner_uid: str, credentials: Dict[str, str]) -> Dict[str, Any]:
+    username = str(credentials.get("username") or "").strip()
+    api_token = str(credentials.get("api_token") or "").strip()
+    if not username or not api_token:
+        return {"state": "unknown", "detail": None}
+    work = tempfile.mkdtemp(prefix="kaggle_local_status_")
+    try:
+        cli_env = os.environ.copy()
+        for key in ("KAGGLE_KEY", "KAGGLE_USERNAME", "KAGGLE_API_TOKEN"):
+            cli_env.pop(key, None)
+        cli_env["KAGGLE_USERNAME"] = username
+        cli_env["KAGGLE_API_TOKEN"] = api_token
+        cli_env["KAGGLE_CONFIG_DIR"] = work
+        result = subprocess.run(
+            ["kaggle", "kernels", "status", f"{username}/{local_kernel_slug(owner_uid)}"],
+            capture_output=True, text=True, timeout=30, env=cli_env,
+        )
+        output = ((result.stdout or "") + (result.stderr or "")).strip().replace(api_token, "[redacted]")
+        match = re.search(r'status\s+"?([A-Za-z_.]+)"?', output)
+        raw_state = (match.group(1).split(".")[-1].lower() if match else "")
+        if result.returncode != 0 and not raw_state:
+            return {"state": "unknown", "detail": output[-200:] or None}
+        if raw_state in ("running", "queued", "complete", "error", "cancelacknowledged", "cancelrequested"):
+            state = "cancelled" if raw_state.startswith("cancel") else raw_state
+        else:
+            state = "unknown"
+        failure = re.search(r'failure\w*\s*[:=]?\s*"?([^"\n]+)', output, re.IGNORECASE)
+        return {"state": state, "detail": (failure.group(1).strip() if failure else None)}
+    except Exception as exc:  # status check is best-effort
+        logger.warning("kaggle local status check failed type=%s", type(exc).__name__)
+        return {"state": "unknown", "detail": None}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def kernel_status(owner_uid: str, credentials: Dict[str, str]) -> Dict[str, Any]:
+    """Status asli kernel di Kaggle (running/queued/complete/error/cancelled), di-cache 15 dtk."""
+    now = time.time()
+    cached = _kernel_status_cache.get(owner_uid)
+    if cached and now - cached["at"] < KERNEL_STATUS_CACHE_SECONDS:
+        return cached["value"]
+    value = await asyncio.to_thread(_kernel_status_sync, owner_uid, credentials)
+    _kernel_status_cache[owner_uid] = {"at": now, "value": value}
+    return value
 
 
 async def start_worker(
