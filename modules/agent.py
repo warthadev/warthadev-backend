@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
@@ -23,7 +24,6 @@ from .firestore_storage import init_firestore
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
 OPENROUTER_PROVIDER = "openrouter"
-LEGACY_ROUTER_PROVIDER = "9router"
 OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
 MAX_ROUTER_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -138,50 +138,7 @@ def _get_key_record(user_id: str, provider: str) -> dict[str, Any] | None:
     record = key_map.get(provider) if isinstance(key_map, dict) else None
     if isinstance(record, dict):
         return record
-
-    # Migrate the previous encrypted subcollection format on access, preserving account scope.
-    legacy_reference = _legacy_key_doc(user_id, provider)
-    legacy_snapshot = legacy_reference.get()
-    legacy_data = legacy_snapshot.to_dict() if legacy_snapshot.exists else {}
-    encrypted_key = legacy_data.get("encryptedKey") if isinstance(legacy_data, dict) else None
-    if isinstance(encrypted_key, str) and encrypted_key:
-        record = {
-            "encryptedKey": encrypted_key,
-            "baseUrl": str(legacy_data.get("baseUrl") or ""),
-            "model": str(legacy_data.get("model") or ""),
-            "fingerprint": str(legacy_data.get("fingerprint") or ""),
-            "enabled": bool(legacy_data.get("enabled", True)),
-        }
-        migration = {"agentKeys": {provider: record}}
-        if provider == LEGACY_ROUTER_PROVIDER:
-            migration.update({"nineRouterApiKey": None, "nineRouterModel": None})
-        user_reference.set(migration, merge=True)
-        legacy_reference.delete()
-        return record
-
-    # Migrate original plaintext 9Router fields, encrypting before the write and clearing them.
-    if provider != LEGACY_ROUTER_PROVIDER:
-        return None
-    legacy_key = user_data.get("nineRouterApiKey")
-    if not isinstance(legacy_key, str) or not legacy_key.strip():
-        return None
-
-    normalized_key = legacy_key.strip()
-    legacy_model = user_data.get("nineRouterModel")
-    model = legacy_model.strip() if isinstance(legacy_model, str) and legacy_model.strip() else ""
-    record = {
-        "encryptedKey": _fernet().encrypt(normalized_key.encode()).decode(),
-        "baseUrl": "",
-        "model": model,
-        "fingerprint": _fingerprint(normalized_key),
-        "enabled": True,
-    }
-    user_reference.set({
-        "agentKeys": {provider: record},
-        "nineRouterApiKey": None,
-        "nineRouterModel": None,
-    }, merge=True)
-    return record
+    return None
 
 
 def _set_key_record(user_id: str, provider: str, record: dict[str, Any]) -> None:
@@ -195,27 +152,21 @@ def _delete_key_record(user_id: str, provider: str) -> None:
     key_map = (user_data or {}).get("agentKeys")
     if isinstance(key_map, dict) and provider in key_map:
         user_reference.update({f"agentKeys.{provider}": firestore.DELETE_FIELD})
-    if provider == LEGACY_ROUTER_PROVIDER:
-        user_reference.set({"nineRouterApiKey": None, "nineRouterModel": None}, merge=True)
     _legacy_key_doc(user_id, provider).delete()
 
 
 def _delete_legacy_router_config(user_id: str) -> None:
-    """Remove only this user's former 9Router data after an OpenRouter key is saved."""
+    """Remove this user's former plaintext legacy fields after an OpenRouter key is saved."""
     user_reference = _user_doc(user_id)
     snapshot = user_reference.get()
     user_data = snapshot.to_dict() if snapshot.exists else {}
     user_data = user_data or {}
-    key_map = user_data.get("agentKeys")
     updates: dict[str, Any] = {}
-    if isinstance(key_map, dict) and LEGACY_ROUTER_PROVIDER in key_map:
-        updates[f"agentKeys.{LEGACY_ROUTER_PROVIDER}"] = firestore.DELETE_FIELD
     for field_name in ("nineRouterApiKey", "nineRouterModel"):
         if field_name in user_data:
             updates[field_name] = firestore.DELETE_FIELD
     if updates:
         user_reference.update(updates)
-    _legacy_key_doc(user_id, LEGACY_ROUTER_PROVIDER).delete()
 
 
 def _saved_openrouter_credentials(user_id: str) -> tuple[str, dict[str, Any]] | None:
@@ -512,8 +463,8 @@ async def save_agent_key(payload: AgentKeyPayload, authorization: str | None = H
     await _verify_openrouter_authentication(api_key)
     models = await _fetch_openrouter_models(api_key)
     _persist_openrouter_plaintext_key(user_id, api_key, previous_record)
-    # Remove only this user's former 9Router data after verification, catalog
-    # validation, and plaintext Firestore readback have all succeeded.
+    # Remove only this user's former legacy plaintext fields after verification,
+    # catalog validation, and plaintext Firestore readback have all succeeded.
     _delete_legacy_router_config(user_id)
     return {
         "success": True,
@@ -563,8 +514,8 @@ async def verify_openrouter_key(authorization: str | None = Header(default=None)
     await _verify_openrouter_authentication(api_key)
     models = await _fetch_openrouter_models(api_key)
     _persist_openrouter_plaintext_key(user_id, api_key, saved[1])
-    # Remove only this user's former 9Router data after authenticated verification,
-    # catalog success, and plaintext Firestore readback.
+    # Remove only this user's former legacy plaintext fields after authenticated
+    # verification, catalog success, and plaintext Firestore readback.
     _delete_legacy_router_config(user_id)
     return {
         "success": True,
@@ -631,3 +582,70 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
             }
         },
     }
+
+
+def _runtime_stream_url() -> str:
+    runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip().rstrip("/")
+    if not runtime_url:
+        raise HTTPException(status_code=503, detail="Agent runtime is not configured")
+    return f"{runtime_url}/v1/agent/run/stream"
+
+
+@router.post("/chat/stream")
+async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
+    """Relay the runtime's SSE stream to the browser: tokens, status, and tool
+    activity flow through as they happen instead of one final payload."""
+    claims = _claims(authorization)
+    images = _validate_chat_images(payload.images)
+    user_id = str(claims["uid"])
+    _normalize_provider(payload.provider)
+    selected_model = (payload.model or "").strip()
+    if not selected_model:
+        raise HTTPException(status_code=400, detail="Select an available model")
+    saved = _saved_openrouter_credentials(user_id)
+    if saved is None:
+        raise HTTPException(status_code=403, detail="An OpenRouter API key is not configured for this account")
+    api_key, _ = saved
+    internal_key = os.getenv("AGENT_INTERNAL_API_KEY", "").strip()
+    runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip().rstrip("/")
+    if not runtime_url or not internal_key:
+        raise HTTPException(status_code=503, detail="Agent runtime is not configured")
+    owner_uid = os.getenv("AGENT_OWNER_UID", "").strip()
+
+    upstream_body = {
+        "prompt": payload.prompt,
+        "model": selected_model,
+        "provider_api_key": api_key,
+        "user_uid": user_id,
+        "web_search": payload.web_search,
+        "search_query": payload.search_query,
+        "timezone": payload.timezone,
+        "history": payload.history,
+        "images": [image.model_dump() for image in payload.images],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Agent-Internal-Key": internal_key,
+        "X-Agent-User-UID": user_id,
+        "X-Agent-User-Role": "owner" if owner_uid and user_id == owner_uid else "user",
+        "X-Agent-Owner-UID": owner_uid,
+    }
+
+    async def relay():
+        timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as client:
+                async with client.post(f"{runtime_url}/v1/agent/run/stream", headers=headers, json=upstream_body) as upstream:
+                    if upstream.status >= 400:
+                        body = await upstream.text()
+                        yield f"data: {json.dumps({'type': 'error', 'status': upstream.status, 'message': body[:400]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for raw in upstream.content:
+                        if raw:
+                            yield raw.decode("utf-8", errors="ignore")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            yield f"data: {json.dumps({'type': 'error', 'status': 502, 'message': 'Agent runtime is unavailable'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(relay(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

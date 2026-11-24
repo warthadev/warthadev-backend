@@ -22,20 +22,20 @@ class RouterTarget:
 def normalize_router_base_url(value: str) -> tuple[str, str, int]:
     raw = value.strip()
     if not raw or len(raw) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in raw):
-        raise HTTPException(status_code=400, detail="Enter a valid public HTTPS 9Router base URL")
+        raise HTTPException(status_code=400, detail="Enter a valid public HTTPS router base URL")
     try:
         parsed = urlsplit(raw)
         host_value = parsed.hostname
         port = parsed.port
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="The 9Router URL is malformed") from exc
+        raise HTTPException(status_code=400, detail="The router URL is malformed") from exc
 
     if parsed.scheme.lower() != "https" or not host_value:
-        raise HTTPException(status_code=400, detail="The 9Router URL must use HTTPS and include a hostname")
+        raise HTTPException(status_code=400, detail="The router URL must use HTTPS and include a hostname")
     if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-        raise HTTPException(status_code=400, detail="The 9Router URL cannot contain credentials, query parameters, or a fragment")
+        raise HTTPException(status_code=400, detail="The router URL cannot contain credentials, query parameters, or a fragment")
     if port not in (None, 443):
-        raise HTTPException(status_code=400, detail="The 9Router URL must use the standard HTTPS port")
+        raise HTTPException(status_code=400, detail="The router URL must use the standard HTTPS port")
 
     try:
         ipaddress.ip_address(host_value.rstrip("."))
@@ -47,24 +47,24 @@ def normalize_router_base_url(value: str) -> tuple[str, str, int]:
     try:
         host = host_value.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as exc:
-        raise HTTPException(status_code=400, detail="The 9Router hostname is invalid") from exc
+        raise HTTPException(status_code=400, detail="The router hostname is invalid") from exc
     if len(host) > 253 or "." not in host or host in {"localhost", "localhost.localdomain"}:
-        raise HTTPException(status_code=400, detail="The 9Router hostname must be a public DNS name")
+        raise HTTPException(status_code=400, detail="The router hostname must be a public DNS name")
     blocked_suffixes = (".localhost", ".local", ".internal", ".lan", ".home", ".test", ".example", ".invalid", ".onion")
     if host.endswith(blocked_suffixes):
         raise HTTPException(status_code=400, detail="Local or special-use hostnames are not allowed")
     labels = host.split(".")
     if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
-        raise HTTPException(status_code=400, detail="The 9Router hostname is invalid")
+        raise HTTPException(status_code=400, detail="The router hostname is invalid")
 
     try:
         path = unquote(parsed.path or "", errors="strict")
     except (UnicodeDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="The 9Router URL path is invalid") from exc
+        raise HTTPException(status_code=400, detail="The router URL path is invalid") from exc
     if "\\" in path or "//" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
-        raise HTTPException(status_code=400, detail="The 9Router URL path is invalid")
+        raise HTTPException(status_code=400, detail="The router URL path is invalid")
     if any(part in {".", ".."} for part in path.split("/")):
-        raise HTTPException(status_code=400, detail="Dot segments are not allowed in the 9Router URL path")
+        raise HTTPException(status_code=400, detail="Dot segments are not allowed in the router URL path")
     normalized_path = "/" + path.strip("/") if path.strip("/") else ""
     base_url = urlunsplit(("https", host, normalized_path, "", "")).rstrip("/")
     return base_url, host, 443
@@ -84,7 +84,7 @@ async def resolve_public_addresses(host: str, port: int) -> tuple[str, ...]:
             timeout=5,
         )
     except (OSError, asyncio.TimeoutError) as exc:
-        raise HTTPException(status_code=400, detail="The 9Router hostname could not be resolved") from exc
+        raise HTTPException(status_code=400, detail="The router hostname could not be resolved") from exc
 
     addresses: list[str] = []
     for family, _socktype, _proto, _canonname, sockaddr in records:
@@ -92,15 +92,15 @@ async def resolve_public_addresses(host: str, port: int) -> tuple[str, ...]:
         try:
             ip = ipaddress.ip_address(raw_ip)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="The 9Router hostname resolved to an invalid address") from exc
+            raise HTTPException(status_code=400, detail="The router hostname resolved to an invalid address") from exc
         if not ip.is_global:
-            raise HTTPException(status_code=400, detail="The 9Router hostname must resolve only to public IP addresses")
+            raise HTTPException(status_code=400, detail="The router hostname must resolve only to public IP addresses")
         normalized = str(ip)
         if normalized not in addresses:
             addresses.append(normalized)
 
     if not addresses:
-        raise HTTPException(status_code=400, detail="The 9Router hostname has no public IP addresses")
+        raise HTTPException(status_code=400, detail="The router hostname has no public IP addresses")
     return tuple(addresses)
 
 
