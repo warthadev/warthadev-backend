@@ -40,7 +40,7 @@ def get_frontend_config():
 
 
 def load_modules(app_instance):
-    modules_to_load = ["telegram", "proxy", "hf", "torrent", "universal", "agent", "workspace", "kaggle_settings", "router"]
+    modules_to_load = ["telegram", "proxy", "hf", "torrent", "universal", "agent", "agent_local", "workspace", "kaggle_settings", "router"]
     for mod_name in modules_to_load:
         start_ts = time.perf_counter()
         try:
