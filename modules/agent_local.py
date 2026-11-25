@@ -31,7 +31,7 @@ router = APIRouter(prefix="/agent/local", tags=["agent-local"])
 LOCAL_MODEL_DATASET = os.environ.get("KAGGLE_LOCAL_MODEL_DATASET", "herbanuwarthakusuma/media-ai-local")
 
 SESSION_TTL_SECONDS = int(os.environ.get("AGENT_LOCAL_SESSION_TTL", str(6 * 60 * 60)))
-CHAT_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_CHAT_TIMEOUT", "240"))
+CHAT_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_CHAT_TIMEOUT", "900"))
 WORKSPACE_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_WORKSPACE_TIMEOUT", "60"))
 UPLOAD_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_UPLOAD_TIMEOUT", "120"))
 UPLOAD_LIMIT_BYTES = int(os.environ.get("AGENT_LOCAL_UPLOAD_LIMIT_BYTES", str(20 * 1024 * 1024)))
