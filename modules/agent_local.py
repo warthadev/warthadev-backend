@@ -38,7 +38,6 @@ _SESSIONS_FILE = os.environ.get("AGENT_LOCAL_SESSIONS_FILE", "/tmp/wartha-agent-
 _PERSIST_EVERY_SECONDS = 60
 STOP_WAIT_SECONDS = 20
 CHAT_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_CHAT_TIMEOUT", "900"))
-WORKSPACE_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_WORKSPACE_TIMEOUT", "60"))
 UPLOAD_JOB_TIMEOUT_SECONDS = int(os.environ.get("AGENT_LOCAL_UPLOAD_TIMEOUT", "120"))
 UPLOAD_LIMIT_BYTES = int(os.environ.get("AGENT_LOCAL_UPLOAD_LIMIT_BYTES", str(20 * 1024 * 1024)))
 UPLOAD_DIR = "/kaggle/working/uploads"
@@ -109,11 +108,6 @@ def _safe_upload_name(name: str) -> str:
     base = os.path.basename(name.replace("\\", "/")).strip()
     base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "file"
     return base[:160]
-
-
-class WorkspaceJobPayload(BaseModel):
-    op: str = Field(pattern="^(list|read|write|move|delete)$")
-    op_payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkerStatusPayload(BaseModel):
@@ -557,20 +551,6 @@ async def local_upload(payload: LocalUploadPayload, authorization: str | None = 
     if isinstance(inner, dict) and inner.get("ok") is False:
         raise HTTPException(502, inner.get("error") or "Failed to write the file on Kaggle.")
     return {"success": True, "data": {"path": path, "size": len(raw), "name": filename, "mime_type": payload.mime_type}}
-
-
-async def run_workspace_job(uid: str, op: str, op_payload: dict[str, Any]) -> dict[str, Any]:
-    """Called directly (same process) by modules/workspace.py when this user's
-    active workspace is the Kaggle worker rather than the Sandbox runtime."""
-    result = await _enqueue_and_wait(uid, "workspace", {"op": op, "op_payload": op_payload}, WORKSPACE_JOB_TIMEOUT_SECONDS)
-    if not result.get("ok"):
-        raise HTTPException(502, (result.get("result") or {}).get("error") or result.get("error") or "Workspace job failed")
-    return (result.get("result") or {}).get("result")
-
-
-def has_active_worker(uid: str) -> bool:
-    snapshot = kaggle_local_runner.worker_snapshot(uid)
-    return bool(snapshot.get("alive") and snapshot.get("status") == "ready")
 
 
 # --------------------------- worker-facing endpoints ---------------------------
