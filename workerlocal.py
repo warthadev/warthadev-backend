@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-24-ai-local-kaggle-uploads"
+WORKER_VERSION = "2026-11-25-ai-local-steps-loopguard"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -763,6 +763,13 @@ def build_system_prompt(base_dir):
         "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
         "dan baru dipasang lewat apt bila belum ada.\n"
         "Jujur jika sebuah tool gagal atau data tidak ditemukan.\n"
+        "MEMBUAT FILE: pilih cara paling sederhana yang pasti jalan. Teks/laporan/tabel sederhana: tulis langsung "
+        ".txt/.md/.html/.csv dengan write_file. PDF: pakai pymupdf (`import fitz`) yang sudah terpasang; JANGAN pip install "
+        "(internet bisa mati). Cek sekali dengan run_bash `python -c \"import fitz\"`; jika gagal, pakai format lain "
+        "dan beri tahu pengguna.\n"
+        "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika gagal dua kali, ganti pendekatan atau laporkan "
+        "error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker "
+        "[[file:...]] — jangan memeriksa berulang-ulang.\n"
         + _DELIVER_SYSTEM_HINT
     )
 
@@ -852,9 +859,109 @@ _TOOL_ACTIVITY = {
 
 
 AGENT_MAX_STEPS = int(os.getenv("WARTHA_AGENT_MAX_STEPS", "30"))
+_REPEAT_LIMIT = 2        # panggilan tool identik ke-3 dan seterusnya ditolak
+_FAIL_STREAK_LIMIT = 6   # tool gagal/ditolak berturut-turut sebelum dipaksa menjawab
+_OUTPUT_DIR = os.path.join(BASE_DIR, "out")
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX_STEPS, on_activity=None):
+def _short(text, limit=600):
+    text = str(text if text is not None else "").strip()
+    return text if len(text) <= limit else text[:limit] + f"… [+{len(text) - limit} karakter]"
+
+
+def _split_thinking(message):
+    """Pisahkan teks berpikir dari teks yang layak tampil sebagai jawaban."""
+    content = message.get("content") or ""
+    thought = str(message.get("reasoning_content") or "").strip()
+    found = _THINK_RE.findall(content)
+    if found:
+        thought = (thought + "\n" + "\n".join(found)).strip()
+        content = _THINK_RE.sub("", content)
+    elif re.search(r"<think>", content, re.IGNORECASE):
+        head, tail = re.split(r"<think>", content, maxsplit=1, flags=re.IGNORECASE)
+        thought = (thought + "\n" + tail).strip()
+        content = head
+    return content.strip(), thought
+
+
+def _describe_tool(fn_name, args):
+    label = _TOOL_ACTIVITY.get(fn_name, f"Menjalankan {fn_name}…")
+    detail = ""
+    if fn_name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
+        p = str(args.get("path") or "")
+        if p:
+            detail = f" ({p.rsplit('/', 1)[-1] or p})"
+    elif fn_name == "run_bash":
+        full = str(args.get("command") or "")
+        if full:
+            detail = f" ({full[:60]}…)" if len(full) > 60 else f" ({full})"
+    elif fn_name == "web_search":
+        q = str(args.get("query") or "")[:60]
+        if q:
+            detail = f" “{q}”"
+    elif fn_name == "web_fetch":
+        u = str(args.get("url") or "")[:70]
+        if u:
+            detail = f" ({u})"
+    return label, detail
+
+
+def _snapshot_out():
+    snap = {}
+    try:
+        for root, dirs, files in os.walk(_OUTPUT_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                if fn.startswith(".") or fn.endswith(".bak"):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    snap[fp] = os.path.getmtime(fp)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return snap
+
+
+def _append_missing_markers(answer, before):
+    """File baru/berubah di /kaggle/working/out yang lupa diberi marker tetap dikirim ke chat."""
+    answer = answer or ""
+    after = _snapshot_out()
+    changed = [p for p, mtime in after.items() if before.get(p) != mtime]
+    missing = [p for p in changed if p not in answer]
+    if not missing:
+        return answer
+    if len(missing) > 8:
+        return (answer + f"\n\n[[file:{_OUTPUT_DIR}]]").strip()
+    return (answer + "\n\n" + "\n".join(f"[[file:{p}]]" for p in sorted(missing))).strip()
+
+
+def _llm_call(api_url, history, with_tools=True):
+    payload = {"messages": history, "max_tokens": -1, "temperature": 0.25, "stream": False}
+    if with_tools:
+        payload["tools"] = TOOLS
+        payload["tool_choice"] = "auto"
+    req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    return ((body.get("choices") or [{}])[0].get("message")) or {}
+
+
+def _fallback_summary(ran_tools):
+    if not ran_tools:
+        return "Maaf, model tidak menghasilkan jawaban. Coba kirim ulang permintaannya dengan lebih spesifik."
+    lines = ["Aku sudah menjalankan beberapa langkah tapi belum sampai ke hasil akhir. Langkah terakhir:"]
+    for name, detail, ok, preview in ran_tools[-5:]:
+        mark = "OK" if ok else "GAGAL"
+        lines.append(f"- [{mark}] {name}{detail}: {_short(preview, 160)}")
+    lines.append("Kirim pesan lagi (misalnya “lanjutkan”) atau minta format file yang lebih sederhana.")
+    return "\n".join(lines)
+
+
+def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX_STEPS, on_activity=None, on_step=None):
     def _act(msg):
         if on_activity:
             try:
@@ -862,61 +969,137 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
             except Exception:
                 pass
 
+    counter = {"n": 0}
+
+    def _new_id():
+        counter["n"] += 1
+        return f"s{counter['n']}"
+
+    def _step(step_id, **fields):
+        if on_step:
+            try:
+                on_step({"id": step_id, **fields})
+            except Exception:
+                pass
+
+    out_before = _snapshot_out()
     history.append({"role": "user", "content": user_content})
-    for _step in range(max_steps):
+    seen_calls = {}
+    ran_tools = []        # (nama tool, detail, ok, preview)
+    fail_streak = 0
+    nudged = False
+    empty_retry = False
+    stalled = False
+
+    for step_idx in range(max_steps):
+        if max_steps - step_idx == 3 and not nudged:
+            nudged = True
+            history.append({"role": "user", "content": (
+                "[SISTEM] Sisa 3 langkah tool. Berhenti menjelajah, selesaikan yang bisa diselesaikan, "
+                "lalu beri jawaban akhir berisi hasil nyata dan marker [[file:...]] bila ada file.")})
+        think_id = _new_id()
         _act("Sedang berpikir…")
-        payload = {"messages": history, "tools": TOOLS, "tool_choice": "auto",
-                   "max_tokens": -1, "temperature": 0.25, "stream": False}
-        req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
-                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        choice = (body.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
+        _step(think_id, kind="thinking", title="Sedang berpikir…", status="running")
+        try:
+            message = _llm_call(api_url, history, with_tools=True)
+        except Exception as exc:
+            _step(think_id, status="error", title="Model gagal menjawab", output=_short(_clean_err(exc)))
+            raise
+        visible, thought = _split_thinking(message)
         tool_calls = message.get("tool_calls") or []
-        history.append({"role": "assistant", "content": message.get("content"),
-                         **({"tool_calls": tool_calls} if tool_calls else {})})
+
         if not tool_calls:
+            _step(think_id, status="done", title="Berpikir", output=_short(thought, 1200))
+            if not visible and not empty_retry:
+                empty_retry = True
+                history.append({"role": "assistant", "content": ""})
+                history.append({"role": "user", "content": "[SISTEM] Jawabanmu kosong. Tulis jawaban akhir sekarang."})
+                continue
+            history.append({"role": "assistant", "content": visible})
             _act("Menyusun jawaban…")
-            return message.get("content") or ""
+            return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before)
+
+        # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
+        for tc in tool_calls:
+            tc.setdefault("type", "function")
+            tc["id"] = tc.get("id") or f"call_{uuid.uuid4().hex[:10]}"
+            fn = tc.setdefault("function", {})
+            if not isinstance(fn.get("arguments"), str):
+                fn["arguments"] = json.dumps(fn.get("arguments") or {}, ensure_ascii=False)
+        history.append({"role": "assistant", "content": visible, "tool_calls": tool_calls})
+        _step(think_id, status="done", title="Berpikir", output=_short(thought or visible, 1200))
 
         pending_images = []
         for tc in tool_calls:
-            fn_name = tc["function"]["name"]
+            fn_name = tc["function"].get("name") or "unknown"
+            parse_error = None
             try:
                 parsed_args = json.loads(tc["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                parsed_args = {}
-            label = _TOOL_ACTIVITY.get(fn_name, f"Menjalankan {fn_name}…")
-            # Tambah detail singkat biar tidak monoton
-            detail = ""
-            if fn_name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
-                p = str(parsed_args.get("path") or "")
-                if p:
-                    detail = f" ({p.rsplit('/', 1)[-1]})"
-            elif fn_name == "run_bash":
-                cmd = str(parsed_args.get("command") or "")[:40]
-                if cmd:
-                    detail = f" ({cmd}…)" if len(str(parsed_args.get("command") or "")) > 40 else f" ({cmd})"
-            elif fn_name == "web_search":
-                q = str(parsed_args.get("query") or "")[:40]
-                if q:
-                    detail = f" “{q}”"
+            except json.JSONDecodeError as exc:
+                parsed_args, parse_error = {}, str(exc)
+            if not isinstance(parsed_args, dict):
+                parsed_args, parse_error = {}, "argumen harus berupa objek JSON"
+
+            label, detail = _describe_tool(fn_name, parsed_args)
+            sid = _new_id()
             _act(label + detail)
-            result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
+            _step(sid, kind="tool", tool=fn_name, title=label.rstrip("…"), detail=detail.strip(), status="running")
+
+            sig = fn_name + ":" + json.dumps(parsed_args, sort_keys=True, ensure_ascii=False)[:2000]
+            seen_calls[sig] = seen_calls.get(sig, 0) + 1
+            if parse_error:
+                result = (f"Error: argumen tool '{fn_name}' bukan JSON valid ({parse_error}). "
+                          "Kirim ulang dengan JSON valid. Untuk file panjang, tulis per bagian kecil.")
+            elif seen_calls[sig] > _REPEAT_LIMIT:
+                result = (f"Error: panggilan '{fn_name}' dengan argumen identik sudah dijalankan {seen_calls[sig] - 1} kali "
+                          "dan hasilnya tidak akan berubah. JANGAN ulangi. Ganti pendekatan, atau beri jawaban akhir "
+                          "yang jujur berisi hasil dan error aslinya.")
+            else:
+                result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
+
             if isinstance(result, dict) and "__image_payload__" in result:
                 img_fp, q_img = result["__image_payload__"], result["question"]
-                history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name,
-                                 "content": f"Gambar '{img_fp}' dimuat untuk inspeksi visual."})
+                text_result = f"Gambar '{img_fp}' dimuat untuk inspeksi visual."
+                history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
                 pending_images.append((img_fp, q_img))
+                ok = True
             else:
-                history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": str(result)})
+                text_result = str(result)
+                history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
+                ok = not (text_result.startswith("Error") or re.match(r"EXIT CODE: (?!0\b)", text_result))
+
+            _step(sid, status="done" if ok else "error", output=_short(text_result))
+            ran_tools.append((fn_name, detail, ok, text_result))
+            fail_streak = 0 if ok else fail_streak + 1
+
         for img_fp, q_img in pending_images:
             history.append({"role": "user", "content": [
                 {"type": "text", "text": f"[Inspeksi Visual: {img_fp}] {q_img}"},
                 {"type": "image_url", "image_url": {"url": encode_image_b64(img_fp)}},
             ]})
-    return "[Berhenti: terlalu banyak langkah tool berturut-turut tanpa jawaban akhir.]"
+
+        if fail_streak >= _FAIL_STREAK_LIMIT:
+            stalled = True
+            break
+
+    # Langkah habis / macet: minta jawaban akhir TANPA tool, jangan berhenti dengan pesan kosong.
+    final_id = _new_id()
+    _act("Menyusun jawaban akhir…")
+    _step(final_id, kind="thinking", title="Menyusun jawaban akhir…", status="running")
+    history.append({"role": "user", "content": (
+        "[SISTEM] " + ("Pekerjaan macet karena tool gagal berulang. " if stalled else "Batas langkah tool tercapai. ") +
+        "JANGAN panggil tool lagi. Tulis jawaban akhir sekarang dalam bahasa pengguna: apa yang sudah berhasil, "
+        "apa yang gagal beserta error aslinya, dan saran langkah berikutnya. Jika ada file jadi di "
+        "/kaggle/working/out, sertakan marker [[file:...]].")})
+    try:
+        final_visible, _ = _split_thinking(_llm_call(api_url, history, with_tools=False))
+    except Exception:
+        final_visible = ""
+    if not final_visible:
+        final_visible = _fallback_summary(ran_tools)
+    history.append({"role": "assistant", "content": final_visible})
+    _step(final_id, status="done", title="Menyusun jawaban akhir")
+    return _append_missing_markers(final_visible, out_before)
 
 
 def run_workspace_job(op, payload, base_dir):
@@ -1051,8 +1234,11 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             _post("/agent/local/kaggle-activity", {"activity": msg}, timeout=5)
                         except Exception:
                             pass
-                    _report_activity("Memahami permintaan…")
-                    answer = run_agent_turn(history, api_url, base_dir, content, on_activity=_report_activity)
+                    def _report_step(step):
+                        _post("/agent/local/kaggle-activity", {"activity": step.get("title"), "step": step}, timeout=5)
+                    _post("/agent/local/kaggle-activity", {"activity": "Memahami permintaan…", "reset": True}, timeout=5)
+                    answer = run_agent_turn(history, api_url, base_dir, content,
+                                            on_activity=lambda _m: None, on_step=_report_step)
                     _report_activity("Menyiapkan file dan jawaban…")
                     cleaned, attachments = extract_and_deliver(answer or "", session_id)
                     try:
