@@ -49,6 +49,9 @@ class AgentChatPayload(BaseModel):
     web_search: bool = False
     search_query: str = Field(default="", max_length=500)
     timezone: str = Field(default="Asia/Jakarta", max_length=64)
+    # Konteks user (zona waktu + waktu lokal + locale), sama seperti yang dikirim
+    # AI Local di tiap chat. Dipakai untuk catatan [CURRENT CONTEXT] di bawah.
+    context: dict[str, Any] | None = None
     history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     images: list[AgentImagePayload] = Field(default_factory=list, max_length=12)
 
@@ -411,6 +414,25 @@ def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | li
     return content
 
 
+def _build_context_note(context: dict[str, Any] | None) -> str | None:
+    """[CURRENT CONTEXT] note — the cloud twin of the Kaggle worker's
+    [KONTEKS SAAT INI]: the user's own time/zone plus where this backend runs,
+    so the cloud agent knows its own region and the user's region, time, date."""
+    if not isinstance(context, dict):
+        return None
+    local_time = str(context.get("local_time") or "").strip()
+    timezone = str(context.get("timezone") or "").strip()
+    if not local_time and not timezone:
+        return None
+    parts = ["[CURRENT CONTEXT]"]
+    if local_time:
+        parts.append(f"User's local time right now: {local_time}" + (f" ({timezone})" if timezone else "") + ".")
+    elif timezone:
+        parts.append(f"User's timezone: {timezone}.")
+    parts.append("Backend runs in Oregon, USA. Use this for time, date, and place questions; do not guess the user's city from the timezone alone.")
+    return "\n".join(parts)
+
+
 def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [{"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION}]
     for item in payload.history:
@@ -418,6 +440,9 @@ def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> l
         content = item.get("content")
         if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
             messages.append({"role": role, "content": content})
+    note = _build_context_note(payload.context)
+    if note:
+        messages.append({"role": "user", "content": note})
     messages.append({"role": "user", "content": _chat_message_content(payload.prompt, images)})
     return messages
 
@@ -596,6 +621,9 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
         "messages": _chat_messages(payload, images),
         "temperature": 0.2,
         "stream": True,
+        # Tanpa ini OpenRouter tidak mengirim usage di stream, jadi jumlah token
+        # tidak pernah sampai ke frontend (beda dengan lokal yang selalu lapor).
+        "stream_options": {"include_usage": True},
     }
     accumulated_text = ""
     accumulated_usage: dict[str, Any] = {}
@@ -709,6 +737,7 @@ async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None
         "web_search": payload.web_search,
         "search_query": payload.search_query,
         "timezone": payload.timezone,
+        "context": payload.context,
         "history": payload.history,
         "images": [image.model_dump() for image in payload.images],
     }
