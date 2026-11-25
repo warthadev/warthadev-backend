@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-hot-boot"
+WORKER_VERSION = "2026-11-25-ai-local-cloud-bridge"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -1619,6 +1619,22 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         except Exception:
                             pass
                     job_strings = _agent_strings(payload.get("language"))
+                    # Riwayat bersama: sinkronisasi history worker dari percakapan
+                    # yang dilihat user (cloud + lokal), supaya lokal paham apa yang
+                    # cloud kerjakan dan sebaliknya. Detail tool-call di dalam satu
+                    # giliran tetap tercatat selama giliran itu; giliran berikut
+                    # sinkron lagi dari riwayat bersama.
+                    shared = payload.get("history") or []
+                    if isinstance(shared, list) and shared:
+                        synced = [{"role": "system", "content": build_system_prompt(base_dir)}]
+                        for item in shared[-40:]:
+                            if not isinstance(item, dict):
+                                continue
+                            role = item.get("role")
+                            shared_content = item.get("content")
+                            if role in ("user", "assistant") and isinstance(shared_content, str) and shared_content.strip():
+                                synced.append({"role": role, "content": shared_content[:8000]})
+                        history = synced
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
                     _cancel_event.clear()
                     answer = run_agent_turn(history, api_url, base_dir, content,
@@ -1644,6 +1660,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                 elif job_type == "workspace":
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": out.get("ok", False), "result": out})
+                elif job_type == "tool":
+                    # Satu tool call dari model cloud: eksekusi langsung, tanpa
+                    # giliran agen. Tidak masuk ke history percakapan worker —
+                    # cloud yang memegang pembahasannya dan menerima hasilnya.
+                    result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
+                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": result_text}})
                 else:
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": f"unknown job type {job_type}"})
             except Exception as exc:

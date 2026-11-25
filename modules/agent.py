@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
+from . import agent_local
 from .agent_prompt import DEFAULT_SYSTEM_INSTRUCTION
 from .agent_ssrf import RouterTarget, make_pinned_connector, validate_router_base_url
 from .firestore_storage import init_firestore
@@ -609,26 +610,146 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     }
 
 
-async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict[str, str]], api_key: str, selected_model: str):
+# Tool Kaggle yang bisa dipakai model cloud saat worker lokal user sedang ready.
+# Dijalankan di kernel Kaggle user (/kaggle/working), bukan di komputer user.
+# Skema ini cerminan TOOLS di workerlocal.py, diterjemahkan ke Inggris karena
+# prompt cloud berbahasa Inggris.
+_KAGGLE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "List folders, files, and sizes in a directory on the Kaggle GPU worker (default workspace: /kaggle/working).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Target directory, e.g. /kaggle/working or /"}
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file with line numbers (up to 7,500 lines at a time) from the Kaggle worker disk.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer"},
+            "end_line": {"type": "integer"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "patch_file",
+        "description": "Replace specific lines in a large file without rewriting the whole file (automatic .bak backup).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer"},
+            "end_line": {"type": "integer"},
+            "new_code": {"type": "string"},
+        }, "required": ["path", "start_line", "end_line", "new_code"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Create a new file or overwrite a small/medium file with complete content on the Kaggle worker disk.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "run_bash",
+        "description": "Run a non-interactive shell command on this Kaggle kernel.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"},
+            "cwd": {"type": "string"},
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the internet for current information.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "Fetch the full content of a web page from a specific URL.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"}
+        }, "required": ["url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "inspect_image",
+        "description": "Load an image file from the Kaggle worker disk so it can be analyzed visually.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "question": {"type": "string"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_document",
+        "description": (
+            "Read a file on the Kaggle worker disk without pasting its whole content into context: "
+            "PDF (text, or OCR if scanned), DOCX, PPTX, XLSX/CSV (built-in pandas), "
+            "images (OCR), audio/video (ffmpeg + faster-whisper), and zip/tar/gz archives. "
+            "Use this for files in /kaggle/working/uploads. Do not use read_file for PDF/binary files."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Absolute file path, e.g. /kaggle/working/uploads/name.pdf"},
+            "max_chars": {"type": "integer", "description": "Result character limit, default 12000"},
+        }, "required": ["path"]},
+    }},
+]
+
+_TOOL_RESULT_LIMIT = 12000
+
+
+class _OpenRouterError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict[str, str]], api_key: str, selected_model: str, user_id: str):
     """No separate `warthadev-agent` runtime is configured (AGENT_RUNTIME_URL /
     AGENT_INTERNAL_API_KEY unset) - that service has nothing to do with Kaggle and
-    is a standalone deployment. Rather than error out, stream a plain (tool-less)
+    is a standalone deployment. Rather than error out, stream a plain
     OpenRouter chat completion in the same SSE event shape the frontend already
     understands, so "AI Cloud" always behaves like a normal chat instead of
-    showing "Agent runtime is not configured"."""
-    request_body = {
-        "model": selected_model,
-        "messages": _chat_messages(payload, images),
-        "temperature": 0.2,
-        "stream": True,
-        # Tanpa ini OpenRouter tidak mengirim usage di stream, jadi jumlah token
-        # tidak pernah sampai ke frontend (beda dengan lokal yang selalu lapor).
-        "stream_options": {"include_usage": True},
-    }
+    showing "Agent runtime is not configured".
+
+    When the user's AI Local worker is live (status ready), the model is also
+    offered the Kaggle tools: cloud thinks, the worker executes. Each tool call
+    runs on the Kaggle kernel via agent_local.run_kaggle_tool, its result comes
+    back into the model's context, and tool_call/tool_result events flow to the
+    frontend so the Process block shows the work. Stopping is human-like, same
+    idea as the worker: no fixed step count — the loop runs until the model
+    answers, and only forces a final text-only answer when it recognizes a stuck
+    pattern (same identical tool call after one warning, or the same tool failing
+    with the same error twice in a row)."""
+    messages: list[dict[str, Any]] = _chat_messages(payload, images)
+    try:
+        use_tools = await agent_local.local_tools_available(user_id)
+    except Exception:
+        use_tools = False
+    tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else None
+    force_text_only = False
     accumulated_text = ""
     accumulated_usage: dict[str, Any] = {}
     result_model = selected_model
-    try:
+    seen_calls: dict[str, str] = {}
+    warned_repeats: set[str] = set()
+    last_error: str | None = None
+    timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
+
+    async def one_round(holder: dict[str, Any]):
+        """One streamed OpenRouter call. Yields token events live as they arrive
+        and stores (text, tool_calls) in holder. Tool calls are accumulated by
+        index, like the worker's _llm_call."""
+        nonlocal accumulated_usage, result_model
+        body: dict[str, Any] = {
+            "model": selected_model,
+            "messages": messages,
+            "temperature": 0.2,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools and not force_text_only:
+            body["tools"] = tools
         target: RouterTarget = await validate_router_base_url(OPENROUTER_API_BASE_URL)
         url = f"{target.base_url}/chat/completions"
         headers = {
@@ -637,48 +758,127 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             "Content-Type": "application/json",
         }
         connector = make_pinned_connector(target)
-        timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as client:
-            async with client.post(url, headers=headers, json=request_body, allow_redirects=False) as upstream:
-                if upstream.status >= 400:
-                    body = await _read_router_response(upstream.content)
-                    message = body.decode("utf-8", errors="ignore")[:400] or f"OpenRouter chat request failed ({upstream.status})"
-                    status = 401 if upstream.status in (401, 403) else 429 if upstream.status == 429 else 502
-                    yield f"data: {json.dumps({'type': 'error', 'status': status, 'message': message})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                buffer = ""
-                async for raw_chunk in upstream.content:
-                    if not raw_chunk:
-                        continue
-                    buffer += raw_chunk.decode("utf-8", errors="ignore")
-                    lines = buffer.split("\n")
-                    buffer = lines.pop()
-                    for line in lines:
-                        line = line.strip()
-                        if not line.startswith("data:"):
+        text = ""
+        calls: dict[int, dict[str, Any]] = {}
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as client:
+                async with client.post(url, headers=headers, json=body, allow_redirects=False) as upstream:
+                    if upstream.status >= 400:
+                        raw = await _read_router_response(upstream.content)
+                        message = raw.decode("utf-8", errors="ignore")[:400] or f"OpenRouter chat request failed ({upstream.status})"
+                        status = 401 if upstream.status in (401, 403) else 429 if upstream.status == 429 else 502
+                        raise _OpenRouterError(status, message)
+                    buffer = ""
+                    async for raw_chunk in upstream.content:
+                        if not raw_chunk:
                             continue
-                        raw = line[5:].strip()
-                        if not raw or raw == "[DONE]":
-                            continue
-                        try:
-                            chunk = json.loads(raw)
-                        except ValueError:
-                            continue
-                        if not isinstance(chunk, dict):
-                            continue
-                        result_model = chunk.get("model") or result_model
-                        if isinstance(chunk.get("usage"), dict):
-                            accumulated_usage = chunk["usage"]
-                        choices = chunk.get("choices")
-                        choice = choices[0] if isinstance(choices, list) and choices else None
-                        delta = choice.get("delta") if isinstance(choice, dict) else None
-                        content = delta.get("content") if isinstance(delta, dict) else None
-                        if isinstance(content, str) and content:
-                            accumulated_text += content
-                            yield f"data: {json.dumps({'type': 'token', 'delta': content})}\n\n"
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-        yield f"data: {json.dumps({'type': 'error', 'status': 502, 'message': 'OpenRouter is unavailable'})}\n\n"
+                        buffer += raw_chunk.decode("utf-8", errors="ignore")
+                        lines = buffer.split("\n")
+                        buffer = lines.pop()
+                        for line in lines:
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            raw = line[5:].strip()
+                            if not raw or raw == "[DONE]":
+                                continue
+                            try:
+                                chunk = json.loads(raw)
+                            except ValueError:
+                                continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            result_model = chunk.get("model") or result_model
+                            if isinstance(chunk.get("usage"), dict):
+                                accumulated_usage = chunk["usage"]
+                            choices = chunk.get("choices")
+                            choice = choices[0] if isinstance(choices, list) and choices else None
+                            delta = choice.get("delta") if isinstance(choice, dict) else None
+                            if not isinstance(delta, dict):
+                                continue
+                            content = delta.get("content")
+                            if isinstance(content, str) and content:
+                                text += content
+                                yield f"data: {json.dumps({'type': 'token', 'delta': content})}\n\n"
+                            for tc in delta.get("tool_calls") or []:
+                                if not isinstance(tc, dict):
+                                    continue
+                                idx = tc.get("index", 0)
+                                entry = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                                if isinstance(tc.get("id"), str):
+                                    entry["id"] = tc["id"]
+                                fn = tc.get("function") or {}
+                                if isinstance(fn.get("name"), str) and fn["name"]:
+                                    entry["name"] = fn["name"]
+                                if isinstance(fn.get("arguments"), str):
+                                    entry["arguments"] += fn["arguments"]
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            raise _OpenRouterError(502, "OpenRouter is unavailable")
+        tool_calls = []
+        for idx in sorted(calls):
+            entry = calls[idx]
+            if not entry["name"]:
+                continue
+            try:
+                args = json.loads(entry["arguments"] or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except ValueError:
+                args = {}
+            tool_calls.append({"id": entry["id"] or f"call-{idx}", "name": entry["name"], "args": args})
+        holder["text"] = text
+        holder["tool_calls"] = tool_calls
+
+    try:
+        while True:
+            holder: dict[str, Any] = {}
+            async for event in one_round(holder):
+                yield event
+            text = str(holder.get("text") or "")
+            tool_calls = holder.get("tool_calls") or []
+            if not tool_calls:
+                accumulated_text = text
+                break
+            messages.append({"role": "assistant", "content": text or None,
+                             "tool_calls": [{"id": c["id"], "type": "function",
+                                            "function": {"name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}} for c in tool_calls]})
+            for call in tool_calls:
+                name = str(call["name"])
+                args = call["args"] if isinstance(call["args"], dict) else {}
+                yield f"data: {json.dumps({'type': 'tool_call', 'name': name})}\n\n"
+                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                if signature in seen_calls:
+                    if signature in warned_repeats:
+                        force_text_only = True
+                        result_text = seen_calls[signature]
+                    else:
+                        warned_repeats.add(signature)
+                        result_text = seen_calls[signature] + "\n[Note: this exact tool call was already made. Do not call it again — use the result above.]"
+                else:
+                    try:
+                        result_text = await agent_local.run_kaggle_tool(user_id, name, args)
+                        last_error = None
+                    except Exception as exc:
+                        err_text = str(exc)[:500]
+                        first_line = err_text.splitlines()[0] if err_text.splitlines() else ""
+                        error_sig = f"{name}:{first_line}"
+                        if last_error is not None and error_sig == last_error:
+                            force_text_only = True
+                        last_error = error_sig
+                        result_text = f"Error: {err_text}"
+                    seen_calls[signature] = result_text
+                if len(result_text) > _TOOL_RESULT_LIMIT:
+                    result_text = result_text[:_TOOL_RESULT_LIMIT] + "\n[...dipotong, hasil tool dibatasi 12000 karakter...]"
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_text})
+                yield f"data: {json.dumps({'type': 'tool_result', 'name': name})}\n\n"
+            if force_text_only:
+                holder2: dict[str, Any] = {}
+                async for event in one_round(holder2):
+                    yield event
+                accumulated_text = str(holder2.get("text") or "")
+                break
+    except _OpenRouterError as exc:
+        yield f"data: {json.dumps({'type': 'error', 'status': exc.status, 'message': exc.message})}\n\n"
         yield "data: [DONE]\n\n"
         return
     if not accumulated_text.strip():
@@ -723,7 +923,7 @@ async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None
     runtime_url = os.getenv("AGENT_RUNTIME_URL", "").strip().rstrip("/")
     if not runtime_url or not internal_key:
         return StreamingResponse(
-            _plain_chat_stream_events(payload, images, api_key, selected_model),
+            _plain_chat_stream_events(payload, images, api_key, selected_model, user_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

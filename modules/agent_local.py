@@ -102,6 +102,9 @@ class LocalChatPayload(BaseModel):
     language: str | None = Field(default=None, max_length=8)
     # Konteks waktu & wilayah user (zona waktu, waktu lokal, locale) dari browser.
     context: dict[str, Any] | None = None
+    # Riwayat bersama (cloud + lokal) dari frontend, supaya worker paham
+    # pembahasan yang terjadi di luar gilirannya sendiri.
+    history: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
 
 
 class LocalUploadPayload(BaseModel):
@@ -568,11 +571,34 @@ def _normalize_agent_language(value: Any) -> str:
     return "id"
 
 
+async def local_tools_available(uid: str) -> bool:
+    """True kalau sesi lokal user sedang ready — syarat cloud boleh menawarkan tool Kaggle."""
+    sess = await _get_session_for_uid(uid)
+    if not sess:
+        return False
+    return kaggle_local_runner.worker_snapshot(uid).get("status") == "ready"
+
+
+async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: float = 300.0) -> str:
+    """Jalankan SATU tool di worker Kaggle user dan kembalikan hasil teksnya.
+    Error (worker mati / timeout) dilempar sebagai exception supaya pemanggil
+    bisa memberikannya ke model sebagai hasil tool yang gagal, bukan mematikan turn."""
+    result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args}, timeout)
+    if isinstance(result, dict) and result.get("ok"):
+        inner = result.get("result") or {}
+        if isinstance(inner, dict):
+            return str(inner.get("content") or "")
+        return str(inner)
+    err = result.get("error") if isinstance(result, dict) else None
+    raise RuntimeError(str(err or "Tool failed on the Kaggle worker"))
+
+
 async def local_chat(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
     uid = authenticate_user(authorization)
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
                    "language": _normalize_agent_language(payload.language),
-                   "context": payload.context if isinstance(payload.context, dict) else {}}
+                   "context": payload.context if isinstance(payload.context, dict) else {},
+                   "history": payload.history if isinstance(payload.history, list) else []}
     kaggle_local_runner.reset_activity_log(uid)
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
@@ -594,7 +620,8 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
     uid = authenticate_user(authorization)
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
                    "language": _normalize_agent_language(payload.language),
-                   "context": payload.context if isinstance(payload.context, dict) else {}}
+                   "context": payload.context if isinstance(payload.context, dict) else {},
+                   "history": payload.history if isinstance(payload.history, list) else []}
     kaggle_local_runner.reset_activity_log(uid)
     sess, job_id = await _enqueue_job(uid, "chat", job_payload)
 
