@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-steps-loopguard"
+WORKER_VERSION = "2026-11-25-ai-local-manual-stop-idle"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -1135,7 +1135,7 @@ def run_workspace_job(op, payload, base_dir):
 # ---------------------------------------------------------------------------
 # Headless backend polling loop (this replaces codekaggle.py's input() loop)
 # ---------------------------------------------------------------------------
-def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
+def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None, idle_timeout=None):
     if not IS_KAGGLE:
         raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
     print(f"[ai-local] worker version: {WORKER_VERSION}", flush=True)
@@ -1168,12 +1168,40 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         _post("/agent/local/kaggle-status", {"status": status, "model_id": model_id, "error": error, "phase": phase})
 
     _stop = threading.Event()
+    state = {"proc": None}  # llama-server saat ini (diganti saat restart model)
+
+    def _shutdown_now(reason):
+        """Dipanggil dari thread heartbeat: berhenti walau main thread sedang sibuk memuat model."""
+        print(f"[ai-local] {reason}, mematikan worker.", flush=True)
+        try:
+            _post("/agent/local/kaggle-poll", {"closing": True, "heartbeat_only": False, "reason": reason[:40]}, timeout=8)
+        except Exception:
+            pass
+        try:
+            proc_now = state.get("proc")
+            if proc_now and proc_now.poll() is None:
+                proc_now.terminate()
+        except Exception:
+            pass
+        os._exit(0)  # kernel Kaggle selesai -> GPU dilepas
 
     def _heartbeat_loop():
         while not _stop.is_set():
-            _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": True}, timeout=10)
+            res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": True}, timeout=10)
+            if isinstance(res, dict) and res.get("control") == "stop":
+                _shutdown_now("stop diminta user")
+            if gone["count"] >= 6:
+                # Backend tidak mengenal sesi ini lagi (worker yatim / sesi diganti): jangan buang kuota GPU.
+                _shutdown_now("sesi backend hilang")
             if _stop.wait(8):
                 break
+
+    # Idle 3-6 jam: model tidak dibangun ulang hanya karena user jeda sebentar.
+    try:
+        idle_shutdown_seconds = int(idle_timeout or os.environ.get("WORKER_IDLE_TIMEOUT") or 4 * 3600)
+    except (TypeError, ValueError):
+        idle_shutdown_seconds = 4 * 3600
+    idle_shutdown_seconds = max(3 * 3600, min(6 * 3600, idle_shutdown_seconds))
 
     base_dir = BASE_DIR
     os.makedirs(base_dir, exist_ok=True)
@@ -1187,6 +1215,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         _prepare_media_packages()
         _status("booting", phase="model")
         proc, log_file, model_id = start_llama_server(base_dir, DEFAULT_PORT, DEFAULT_MAX_CTX)
+        state["proc"] = proc
         if not wait_ready(proc, DEFAULT_PORT):
             tail = ""
             if os.path.exists("/tmp/server.log"):
@@ -1199,11 +1228,35 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         api_url = f"http://127.0.0.1:{DEFAULT_PORT}/v1/chat/completions"
         history = [{"role": "system", "content": build_system_prompt(base_dir)}]
         idle_since = time.time()
-        idle_shutdown_seconds = int(os.environ.get("WORKER_IDLE_TIMEOUT", "900"))
+        print(f"[ai-local] idle shutdown after {idle_shutdown_seconds // 3600}h without activity", flush=True)
 
         while True:
             job_res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": False}, timeout=10)
             job = job_res.get("job") if isinstance(job_res, dict) else None
+            control = job_res.get("control") if isinstance(job_res, dict) else None
+            if control == "restart":
+                # Restart di tempat: muat ulang model di worker yang SAMA (tanpa kernel Kaggle baru).
+                print("[ai-local] restart model diminta user.", flush=True)
+                _status("booting", phase="model")
+                try:
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=30)
+                except Exception:
+                    pass
+                if log_file:
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
+                proc, log_file, model_id = start_llama_server(base_dir, DEFAULT_PORT, DEFAULT_MAX_CTX)
+                state["proc"] = proc
+                if not wait_ready(proc, DEFAULT_PORT):
+                    raise RuntimeError("llama-server gagal start setelah restart")
+                history = [{"role": "system", "content": build_system_prompt(base_dir)}]
+                _status("ready", model_id=model_id)
+                idle_since = time.time()
+                continue
             if gone["count"] >= 6:
                 # Backend sudah tidak mengenal sesi ini (restart / user menjalankan ulang worker baru).
                 # Berhenti supaya GPU Kaggle tidak terbuang sia-sia.
@@ -1212,6 +1265,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             if not job:
                 if time.time() - idle_since > idle_shutdown_seconds:
                     print("[ai-local] idle timeout, mematikan worker.", flush=True)
+                    _post("/agent/local/kaggle-poll", {"closing": True, "heartbeat_only": False, "reason": "idle"}, timeout=10)
                     break
                 time.sleep(2.5)
                 continue
