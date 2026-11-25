@@ -39,6 +39,18 @@ _PUBLIC_PACKAGE_DATASET = os.environ.get(
 HEARTBEAT_TTL_SECONDS = int(os.environ.get("KAGGLE_LOCAL_WORKER_HEARTBEAT_TTL", "40"))
 BOOT_GRACE_SECONDS = int(os.environ.get("KAGGLE_LOCAL_WORKER_BOOT_GRACE", "420"))
 
+# Worker Kaggle TIDAK boleh berhenti sendiri hanya karena idle sebentar (model harus dibangun ulang = boros kuota GPU).
+# Dibatasi 3-6 jam; default 4 jam. Dihitung dari aktivitas terakhir (chat/upload/workspace).
+_IDLE_MIN_SECONDS = 3 * 60 * 60
+_IDLE_MAX_SECONDS = 6 * 60 * 60
+IDLE_TIMEOUT_SECONDS = max(
+    _IDLE_MIN_SECONDS,
+    min(_IDLE_MAX_SECONDS, int(os.environ.get("KAGGLE_LOCAL_WORKER_IDLE_TIMEOUT", str(4 * 60 * 60)))),
+)
+# Setelah adopsi worker yang masih jalan di Kaggle (mis. backend baru bangun dari tidur),
+# beri waktu singkat sampai heartbeat-nya masuk lagi.
+ADOPT_GRACE_SECONDS = 60
+
 _push_locks: Dict[str, threading.Lock] = {}
 _push_locks_guard = threading.Lock()
 
@@ -140,7 +152,7 @@ def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
                     "GPU and internet), or the kernel failed to start."
                 )
             elif raw not in ("error", "offline"):
-                status = "offline"
+                status = "offline"  # termasuk "stopping" yang heartbeat-nya sudah putus
         return {
             "session_id": entry.get("session_id"),
             "alive": alive,
@@ -153,6 +165,46 @@ def worker_snapshot(owner_uid: str) -> Dict[str, Any]:
             "last_push": float(entry.get("last_push") or 0.0),
             "last_heartbeat": float(entry.get("last_heartbeat") or 0.0),
         }
+
+
+def adopt_running_worker(owner_uid: str, session_id: str) -> None:
+    """Kernel masih jalan di Kaggle dan sesinya masih dikenal backend, tapi heartbeat belum masuk lagi
+    (mis. backend baru bangun / restart). Jangan push kernel baru: tunggu heartbeat worker yang lama."""
+    with _state_lock:
+        entry = _get_entry_unlocked(owner_uid)
+        entry["session_id"] = session_id
+        entry["last_heartbeat"] = 0.0
+        entry["last_push"] = time.time() - BOOT_GRACE_SECONDS + ADOPT_GRACE_SECONDS
+        if entry.get("status") not in ("booting", "ready"):
+            entry["status"] = "booting"
+            entry["phase"] = "worker"
+            entry["model_id"] = None
+        entry["error"] = None
+    _persist_worker_states()
+
+
+def mark_restarting_model(owner_uid: str) -> None:
+    """Restart di tempat: worker yang sama memuat ulang model, tanpa kernel Kaggle baru."""
+    with _state_lock:
+        entry = _get_entry_unlocked(owner_uid)
+        entry["status"] = "booting"
+        entry["phase"] = "model"
+        entry["model_id"] = None
+        entry["error"] = None
+        entry["activity"] = None
+        entry["last_push"] = time.time()  # dipakai untuk hitung boot_elapsed & grace
+    _persist_worker_states()
+
+
+def mark_stopping(owner_uid: str) -> None:
+    with _state_lock:
+        entry = _get_entry_unlocked(owner_uid)
+        entry["status"] = "stopping"
+        entry["phase"] = None
+        entry["model_id"] = None
+        entry["error"] = None
+        entry["activity"] = None
+    _persist_worker_states()
 
 
 def touch_worker(owner_uid: str, session_id: Optional[str] = None) -> None:
@@ -314,7 +366,8 @@ def _push_sync(
                 + "\n\nif __name__ == '__main__':\n"
                 + f"    run_kaggle_worker(session_id={json.dumps(session_id)}, "
                 + f"backend_url={json.dumps(backend_url.rstrip('/'))}, "
-                + f"worker_token={json.dumps(worker_token)})\n"
+                + f"worker_token={json.dumps(worker_token)}, "
+                + f"idle_timeout={IDLE_TIMEOUT_SECONDS})\n"
             )
             with open(os.path.join(work, "worker_loader.py"), "w", encoding="utf-8") as target:
                 target.write(code)
@@ -423,11 +476,12 @@ def _kernel_status_sync(owner_uid: str, credentials: Dict[str, str]) -> Dict[str
         shutil.rmtree(work, ignore_errors=True)
 
 
-async def kernel_status(owner_uid: str, credentials: Dict[str, str]) -> Dict[str, Any]:
-    """Status asli kernel di Kaggle (running/queued/complete/error/cancelled), di-cache 15 dtk."""
+async def kernel_status(owner_uid: str, credentials: Dict[str, str], fresh: bool = False) -> Dict[str, Any]:
+    """Status asli kernel di Kaggle (running/queued/complete/error/cancelled), di-cache 15 dtk.
+    fresh=True melewati cache: dipakai sebelum memutuskan membuat worker baru."""
     now = time.time()
     cached = _kernel_status_cache.get(owner_uid)
-    if cached and now - cached["at"] < KERNEL_STATUS_CACHE_SECONDS:
+    if not fresh and cached and now - cached["at"] < KERNEL_STATUS_CACHE_SECONDS:
         return cached["value"]
     value = await asyncio.to_thread(_kernel_status_sync, owner_uid, credentials)
     _kernel_status_cache[owner_uid] = {"at": now, "value": value}
