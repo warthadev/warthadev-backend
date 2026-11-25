@@ -80,6 +80,9 @@ class WorkerStatusPayload(BaseModel):
 
 class WorkerActivityPayload(BaseModel):
     activity: str | None = Field(default=None, max_length=240)
+    # Satu langkah proses (berpikir / tool) untuk log yang bisa dibuka-tutup di chat.
+    step: dict[str, Any] | None = None
+    reset: bool = False
 
 
 class ConnectPayload(BaseModel):
@@ -366,6 +369,7 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
 async def local_chat(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
     uid = authenticate_user(authorization)
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images]}
+    kaggle_local_runner.reset_activity_log(uid)
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
         raise HTTPException(502, result.get("error") or "AI Local failed to process the message.")
@@ -376,6 +380,15 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     if attachments:
         payload_out["attachments"] = attachments
     return {"success": True, "data": {"result": payload_out}}
+
+
+@router.get("/activity")
+async def local_activity(since: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
+    """Log langkah proses (berpikir / tool) milik chat yang sedang berjalan. Murah, aman di-poll tiap ~1 detik."""
+    uid = authenticate_user(authorization)
+    snapshot = kaggle_local_runner.worker_snapshot(uid)
+    log = kaggle_local_runner.get_activity_log(uid, since)
+    return {"ok": True, "activity": snapshot.get("activity"), "seq": log["seq"], "steps": log["steps"]}
 
 
 @router.post("/upload")
@@ -462,8 +475,13 @@ async def kaggle_activity(payload: WorkerActivityPayload, session_id: str = Quer
     if not sess:
         raise HTTPException(410, "session not found or expired")
     _require_worker_token(sess, worker_token)
-    kaggle_local_runner.set_worker_activity(sess["owner_uid"], payload.activity)
-    kaggle_local_runner.touch_worker(sess["owner_uid"], session_id)
+    uid = sess["owner_uid"]
+    if payload.reset:
+        kaggle_local_runner.reset_activity_log(uid)
+    if payload.step:
+        kaggle_local_runner.upsert_activity_step(uid, payload.step)
+    kaggle_local_runner.set_worker_activity(uid, payload.activity)
+    kaggle_local_runner.touch_worker(uid, session_id)
     return {"ok": True}
 
 

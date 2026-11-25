@@ -197,6 +197,60 @@ def set_worker_activity(owner_uid: str, activity: Optional[str]) -> None:
     # Do not persist every keystroke of activity to disk.
 
 
+# --- Live step log (proses berpikir / tool) untuk tampilan chat -------------------------
+# Hanya di memori: tidak ditulis ke disk. Direset setiap pesan chat baru masuk.
+_ACTIVITY_MAX_STEPS = 150
+_ACTIVITY_FIELD_LIMITS = {"id": 24, "tool": 40, "title": 160, "detail": 200, "output": 1500}
+_ACTIVITY_KINDS = {"thinking", "tool", "info"}
+_ACTIVITY_STATUSES = {"running", "done", "error"}
+_activity_logs: Dict[str, Dict[str, Any]] = {}
+
+
+def reset_activity_log(owner_uid: str) -> None:
+    if not owner_uid:
+        return
+    with _state_lock:
+        _activity_logs[owner_uid] = {"seq": 0, "steps": []}
+
+
+def upsert_activity_step(owner_uid: str, step: Dict[str, Any]) -> None:
+    """Tambah langkah baru, atau perbarui langkah dengan id yang sama (status/hasil)."""
+    if not owner_uid or not isinstance(step, dict):
+        return
+    step_id = str(step.get("id") or "").strip()[: _ACTIVITY_FIELD_LIMITS["id"]]
+    if not step_id:
+        return
+    clean: Dict[str, Any] = {}
+    for key, limit in _ACTIVITY_FIELD_LIMITS.items():
+        if key == "id" or key not in step or step[key] is None:
+            continue
+        clean[key] = str(step[key])[:limit]
+    if step.get("kind") in _ACTIVITY_KINDS:
+        clean["kind"] = step["kind"]
+    if step.get("status") in _ACTIVITY_STATUSES:
+        clean["status"] = step["status"]
+    with _state_lock:
+        log = _activity_logs.setdefault(owner_uid, {"seq": 0, "steps": []})
+        log["seq"] += 1
+        existing = next((item for item in log["steps"] if item["id"] == step_id), None)
+        if existing:
+            existing.update(clean)
+            existing["seq"] = log["seq"]
+        else:
+            log["steps"].append({"id": step_id, "kind": "info", "status": "running", **clean, "seq": log["seq"]})
+            if len(log["steps"]) > _ACTIVITY_MAX_STEPS:
+                del log["steps"][: len(log["steps"]) - _ACTIVITY_MAX_STEPS]
+
+
+def get_activity_log(owner_uid: str, since: int = 0) -> Dict[str, Any]:
+    with _state_lock:
+        log = _activity_logs.get(owner_uid) or {"seq": 0, "steps": []}
+        seq = int(log["seq"])
+        if since > seq:  # log sudah direset (pesan baru) -> kirim ulang dari awal
+            since = 0
+        return {"seq": seq, "steps": [dict(item) for item in log["steps"] if item["seq"] > since]}
+
+
 def _push_lock_for(owner_uid: str) -> threading.Lock:
     with _push_locks_guard:
         lock = _push_locks.get(owner_uid)
