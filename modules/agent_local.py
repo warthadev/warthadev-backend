@@ -281,9 +281,16 @@ async def restart(request: Request, authorization: str | None = Header(default=N
 
 @router.post("/stop")
 async def stop(authorization: str | None = Header(default=None)):
-    """Tombol "Stop": hentikan worker Kaggle milik user. Worker yang sudah terhubung diberi perintah stop
-    (berhenti sendiri dalam beberapa detik, kernel Kaggle selesai dan GPU dilepas). Worker yang belum
-    sempat terhubung (masih antre di Kaggle) tidak punya sesi lagi, jadi mati sendiri begitu mulai jalan."""
+    """Tombol "Stop": hentikan SESI worker Kaggle milik user.
+    - Worker yang sudah terhubung diberi perintah stop lewat `control`, lalu endpoint ini
+      menunggu sampai worker menutup sesinya sendiri (kernel Kaggle selesai, GPU dilepas).
+    - Apa pun yang terjadi, sesi SELALU dihapus oleh endpoint ini sebelum kembali: kalau
+      worker lambat mati, sesinya tetap dihapus, jadi worker itu mati sendiri begitu
+      check-in berikutnya dijawab 410. Stop tidak pernah menyisakan sesi "stopping".
+    - Worker yang belum sempat terhubung (masih antre di Kaggle) langsung kehilangan
+      sesinya, jadi mati sendiri begitu mulai jalan.
+    Kaggle sendiri tidak punya API untuk mematikan kernel, jadi kernel selalu dimatikan
+    dari dalam worker, bukan dari backend."""
     uid = authenticate_user(authorization)
     sess = await _get_session_for_uid(uid)
     snapshot = kaggle_local_runner.worker_snapshot(uid)
@@ -306,7 +313,12 @@ async def stop(authorization: str | None = Header(default=None)):
         if kaggle_local_runner.worker_snapshot(uid).get("status") == "offline":
             return {"ok": True, "status": "offline", "stopped": True}
         await asyncio.sleep(0.5)
-    return {"ok": True, "status": "stopping", "stopped": False}
+    # Worker lambat mati: hapus sesi di sini juga. Sesi sudah berakhir, dan worker
+    # yang masih hidup akan mati sendiri saat check-in berikutnya dijawab 410.
+    await _drop_sessions_for_uid(uid)
+    kaggle_local_runner.set_worker_status(uid, status="offline")
+    kaggle_local_runner.invalidate_kernel_status_cache(uid)
+    return {"ok": True, "status": "offline", "stopped": True}
 
 
 def _dataset_blocker_message(username: str) -> str:
@@ -456,7 +468,6 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
         "kaggle_state": kaggle_state,
         "activity": snapshot.get("activity") if state == "ready" else None,
         "resumable": state in ("offline", "error"),
-        "idle_timeout_hours": round(kaggle_local_runner.IDLE_TIMEOUT_SECONDS / 3600, 1),
     }
 
 

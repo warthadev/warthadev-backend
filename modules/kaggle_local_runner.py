@@ -39,14 +39,9 @@ _PUBLIC_PACKAGE_DATASET = os.environ.get(
 HEARTBEAT_TTL_SECONDS = int(os.environ.get("KAGGLE_LOCAL_WORKER_HEARTBEAT_TTL", "40"))
 BOOT_GRACE_SECONDS = int(os.environ.get("KAGGLE_LOCAL_WORKER_BOOT_GRACE", "420"))
 
-# Worker Kaggle TIDAK boleh berhenti sendiri hanya karena idle sebentar (model harus dibangun ulang = boros kuota GPU).
-# Dibatasi 3-6 jam; default 4 jam. Dihitung dari aktivitas terakhir (chat/upload/workspace).
-_IDLE_MIN_SECONDS = 3 * 60 * 60
-_IDLE_MAX_SECONDS = 6 * 60 * 60
-IDLE_TIMEOUT_SECONDS = max(
-    _IDLE_MIN_SECONDS,
-    min(_IDLE_MAX_SECONDS, int(os.environ.get("KAGGLE_LOCAL_WORKER_IDLE_TIMEOUT", str(4 * 60 * 60)))),
-)
+# Worker Kaggle tidak punya batas idle dari aplikasi: dia hidup selama Kaggle
+# membiarkan kernel jalan, dan hanya mati kalau user menekan Stop, sesinya
+# hilang, error, atau Kaggle sendiri yang mengakhiri kernel.
 # Setelah adopsi worker yang masih jalan di Kaggle (mis. backend baru bangun dari tidur),
 # beri waktu singkat sampai heartbeat-nya masuk lagi.
 ADOPT_GRACE_SECONDS = 60
@@ -366,8 +361,7 @@ def _push_sync(
                 + "\n\nif __name__ == '__main__':\n"
                 + f"    run_kaggle_worker(session_id={json.dumps(session_id)}, "
                 + f"backend_url={json.dumps(backend_url.rstrip('/'))}, "
-                + f"worker_token={json.dumps(worker_token)}, "
-                + f"idle_timeout={IDLE_TIMEOUT_SECONDS})\n"
+                + f"worker_token={json.dumps(worker_token)})\n"
             )
             with open(os.path.join(work, "worker_loader.py"), "w", encoding="utf-8") as target:
                 target.write(code)
