@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-any-file-multi"
+WORKER_VERSION = "2026-11-25-ai-local-manual-stop-idle"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -51,12 +51,16 @@ _DELIVER_INLINE_MAX = int(os.getenv("WARTHA_INLINE_MAX", str(1_500_000)))
 _DELIVER_UPLOAD_MAX = int(os.getenv("WARTHA_UPLOAD_MAX", str(500 * 1024 * 1024)))
 _DELIVER_INLINE_FALLBACK_MAX = int(os.getenv("WARTHA_INLINE_FALLBACK_MAX", str(8_000_000)))
 _DELIVER_HF_REPO = os.getenv("WARTHA_HF_REPO", "")
-# Semua jenis file boleh dikirim (tanpa whitelist ekstensi). Yang diblokir hanya rahasia/kredensial.
-_DELIVER_BLOCKED = {"kaggle.json", ".env", ".netrc", "id_rsa", "id_ed25519", "id_ecdsa", "credentials", "secrets.json"}
-_DELIVER_BLOCKED_SUFFIX = (".pem", ".key", ".p12", ".pfx", ".keystore")
+_DELIVER_ALLOWED_EXT = {
+    "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "csv", "tsv", "html", "css", "yaml", "yml",
+    "xml", "sql", "sh", "ipynb", "log", "toml", "ini", "cfg", "env.example", "srt", "vtt", "lrc",
+    "pdf", "docx", "pptx", "xlsx", "xls",
+    "zip", "tar", "gz", "tgz", "whl",
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg",
+    "mp3", "wav", "m4a", "ogg", "flac", "opus", "mp4", "mkv", "webm", "mov",
+}
+_DELIVER_BLOCKED = {"kaggle.json", ".env", ".netrc", "id_rsa", "id_ed25519"}
 _DELIVER_MARKER = re.compile(r"\[\[file:([^\]\n]+)\]\]")
-_DELIVER_MAX_FILES = int(os.getenv("WARTHA_DELIVER_MAX_FILES", "25"))  # lebih dari ini -> digabung jadi 1 zip
-_DELIVER_INLINE_TOTAL = int(os.getenv("WARTHA_INLINE_TOTAL", str(20_000_000)))  # total base64 mentah per jawaban
 
 
 def _deliver_secret(name):
@@ -71,19 +75,12 @@ def _deliver_secret(name):
 
 
 def _deliver_safe_path(raw):
-    ref = (raw or "").strip().strip("`'\"")
-    if not ref.startswith("/"):
-        # Nama/relatif: cari di folder output dulu, lalu di root kerja.
-        for base in (_Path(_OUTPUT_DIR), _DELIVER_WORK_ROOT):
-            if (base / ref).exists():
-                ref = str(base / ref)
-                break
-    path = _Path(ref).expanduser().resolve()
+    path = _Path(raw.strip()).expanduser().resolve()
     if _DELIVER_WORK_ROOT not in path.parents and path != _DELIVER_WORK_ROOT:
         raise ValueError("file di luar /kaggle/working tidak boleh dikirim")
     if any(part.startswith(".") for part in path.relative_to(_DELIVER_WORK_ROOT).parts):
         raise ValueError("file tersembunyi tidak boleh dikirim")
-    if path.name.lower() in _DELIVER_BLOCKED or path.name.lower().endswith(_DELIVER_BLOCKED_SUFFIX):
+    if path.name.lower() in _DELIVER_BLOCKED:
         raise ValueError("file sensitif tidak boleh dikirim")
     if not path.exists():
         raise ValueError("file tidak ditemukan")
@@ -100,23 +97,6 @@ def _deliver_zip_dir(folder):
     return target
 
 
-def _deliver_zip_files(paths, name):
-    """Banyak file sekaligus -> satu zip (dipakai saat jumlah file melebihi batas)."""
-    target = _DELIVER_WORK_ROOT / "_deliver" / name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-        used = set()
-        for item in paths:
-            arc = item.name
-            n = 1
-            while arc in used:
-                n += 1
-                arc = f"{item.stem}_{n}{item.suffix}"
-            used.add(arc)
-            archive.write(item, arc)
-    return target
-
-
 def _deliver_upload_hf(path, session_id):
     token = _deliver_secret("HF_TOKEN")
     if not (_DELIVER_HF_REPO and token):
@@ -129,120 +109,42 @@ def _deliver_upload_hf(path, session_id):
     return f"https://huggingface.co/datasets/{_DELIVER_HF_REPO}/resolve/main/{remote}?download=true"
 
 
-def deliver_file(raw_path, session_id="", budget=None):
-    """Satu file (atau folder -> zip) -> entri lampiran. `budget` = {"inline": sisa byte inline} dibagi
-    ke semua file dalam satu jawaban supaya banyak file tidak membuat balasan raksasa."""
-    budget = budget if budget is not None else {"inline": _DELIVER_INLINE_TOTAL}
-    path = raw_path if isinstance(raw_path, _Path) else _deliver_safe_path(raw_path)
+def deliver_file(raw_path, session_id=""):
+    path = _deliver_safe_path(raw_path)
     if path.is_dir():
         path = _deliver_zip_dir(path)
+    ext = path.suffix.lower().lstrip(".")
+    if ext not in _DELIVER_ALLOWED_EXT:
+        raise ValueError(f"ekstensi .{ext or '?'} tidak didukung")
     size = path.stat().st_size
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     entry = {"name": path.name, "mime_type": mime, "size": size, "path": str(path)}
-
-    def _inline():
+    if size <= _DELIVER_INLINE_MAX:
         entry["data_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
-        budget["inline"] -= size
         return entry
-
-    if size <= _DELIVER_INLINE_MAX and size <= budget["inline"]:
-        return _inline()
     if size > _DELIVER_UPLOAD_MAX:
-        raise ValueError(f"file terlalu besar ({size // (1024 * 1024)} MB, batas {_DELIVER_UPLOAD_MAX // (1024 * 1024)} MB)")
+        raise ValueError("file terlalu besar")
     try:
         entry["url"] = _deliver_upload_hf(path, session_id)
-        return entry
     except Exception as err:
-        if size <= _DELIVER_INLINE_FALLBACK_MAX and size <= budget["inline"]:
-            return _inline()
-        reason = "Hugging Face belum diatur" if "belum diatur" in str(err) else f"upload ke Hugging Face gagal ({err})"
-        raise ValueError(f"{reason}, dan file terlalu besar untuk dikirim langsung di chat")
-
-
-def _expand_deliver_ref(raw):
-    """Satu marker bisa berupa file, folder, atau pola glob (*.png) -> daftar path."""
-    ref = (raw or "").strip().strip("`'\"")
-    if any(ch in ref for ch in "*?"):
-        import glob as _glob
-        base = ref if ref.startswith("/") else str(_Path(_OUTPUT_DIR) / ref)
-        hits = sorted(_glob.glob(base, recursive=True))
-        if not hits:
-            raise ValueError("tidak ada file yang cocok dengan pola itu")
-        files = []
-        for hit in hits:
-            hp = _Path(hit)
-            if hp.is_dir():
-                files.extend(sorted(x for x in hp.rglob("*") if x.is_file()))
-            else:
-                files.append(hp)
-        return files
-    return [_deliver_safe_path(ref)]
-
-
-_DELIVER_PATH_MENTION = re.compile(
-    r"(?<![\w/.])(" + re.escape(str(_DELIVER_WORK_ROOT)) + r"/[^\s`'\"<>\[\]()|*]+)"
-)
-
-
-def _mentioned_output_files(text):
-    """Model sering hanya MENULIS path file (mis. saat user minta 'kirim file-nya') tanpa marker [[file:...]],
-    padahal file itu sudah ada dari giliran sebelumnya. Path yang menunjuk file nyata di folder output
-    tetap dikirim sebagai lampiran (semua jenis file)."""
-    found, already = [], set(m.group(1).strip() for m in _DELIVER_MARKER.finditer(text or ""))
-    out_root = _Path(_OUTPUT_DIR).resolve()
-    for match in _DELIVER_PATH_MENTION.finditer(text or ""):
-        raw = match.group(1).rstrip(".,;:!?")
-        if raw in already or raw in found:
-            continue
-        try:
-            path = _Path(raw).resolve()
-            if out_root in path.parents and path.is_file():
-                found.append(raw)
-        except Exception:
-            continue
-        if len(found) >= _DELIVER_MAX_FILES:
-            break
-    return found
+        if size > _DELIVER_INLINE_FALLBACK_MAX:
+            raise ValueError(f"upload ke Hugging Face gagal ({err}) dan file terlalu besar untuk inline")
+        entry["data_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+    return entry
 
 
 def extract_and_deliver(text, session_id=""):
-    """Ambil semua marker [[file:...]] (juga path yang hanya disebut), kirim SEMUA sekaligus. Satu file maupun
-    banyak file, jenis apa pun. Jika jumlahnya melebihi batas, digabung jadi satu zip."""
-    text = text or ""
-    extra = _mentioned_output_files(text)
-    if extra:
-        text = text + "\n" + "\n".join(f"[[file:{p}]]" for p in extra)
-    notes, targets, seen_refs, seen_files = [], [], set(), set()
-    for match in _DELIVER_MARKER.finditer(text):
+    attachments, notes, seen = [], [], set()
+    for match in _DELIVER_MARKER.finditer(text or ""):
         raw = match.group(1).strip()
-        if raw in seen_refs:
+        if raw in seen:
             continue
-        seen_refs.add(raw)
+        seen.add(raw)
         try:
-            for item in _expand_deliver_ref(raw):
-                key = str(_Path(item).resolve())
-                if key not in seen_files:
-                    seen_files.add(key)
-                    targets.append(_Path(item))
+            attachments.append(deliver_file(raw, session_id))
         except Exception as err:
-            notes.append(f"Gagal mengirim `{os.path.basename(raw) or raw}`: {err}")
-    cleaned = _DELIVER_MARKER.sub("", text).strip()
-
-    attachments = []
-    budget = {"inline": _DELIVER_INLINE_TOTAL}
-    if len(targets) > _DELIVER_MAX_FILES:
-        try:
-            bundle = _deliver_zip_files(targets, f"files_{uuid.uuid4().hex[:6]}.zip")
-            targets = [bundle]
-            notes.append(f"Ada {len(seen_files)} file, jadi dikemas dalam satu zip.")
-        except Exception as err:
-            notes.append(f"Gagal mengemas banyak file jadi zip: {err}")
-            targets = targets[:_DELIVER_MAX_FILES]
-    for item in targets:
-        try:
-            attachments.append(deliver_file(item, session_id, budget))
-        except Exception as err:
-            notes.append(f"Gagal mengirim `{item.name}`: {err}")
+            notes.append(f"Gagal mengirim `{os.path.basename(raw)}`: {err}")
+    cleaned = _DELIVER_MARKER.sub("", text or "").strip()
     if notes:
         cleaned = f"{cleaned}\n\n" + "\n".join(notes)
     return cleaned, attachments
@@ -251,11 +153,7 @@ def extract_and_deliver(text, session_id=""):
 _DELIVER_SYSTEM_HINT = (
     "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file "
     "di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — "
-    "ini satu-satunya cara mengirim file ke pengguna. Semua jenis file boleh (gambar, video, audio, dokumen, "
-    "arsip, kode, data, apa pun). Kirim BANYAK file sekaligus dengan menulis satu marker per file, atau pola "
-    "seperti [[file:/kaggle/working/out/*.png]]. Folder juga boleh (akan otomatis di-zip). "
-    "Jika pengguna meminta file yang SUDAH ada dari sebelumnya ('kirim file-nya', 'download'), jangan hanya "
-    "menyebut path: cukup tulis marker [[file:PATH_LENGKAP]] di jawabanmu dan file otomatis terkirim. "
+    "ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). "
     "Jangan menempelkan isi file besar ke chat sebagai gantinya.\n"
     "ATURAN KERAS SOAL PENGIRIMAN FILE:\n"
     "- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. "
@@ -1032,10 +930,10 @@ def _append_missing_markers(answer, before):
     answer = answer or ""
     after = _snapshot_out()
     changed = [p for p, mtime in after.items() if before.get(p) != mtime]
-    missing = [p for p in changed if f"[[file:{p}]]" not in answer]
+    missing = [p for p in changed if p not in answer]
     if not missing:
         return answer
-    if len(missing) > _DELIVER_MAX_FILES:
+    if len(missing) > 8:
         return (answer + f"\n\n[[file:{_OUTPUT_DIR}]]").strip()
     return (answer + "\n\n" + "\n".join(f"[[file:{p}]]" for p in sorted(missing))).strip()
 
