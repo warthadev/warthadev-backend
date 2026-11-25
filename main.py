@@ -71,7 +71,7 @@ async def lifespan(app_instance: FastAPI):
 app = FastAPI(
     title="Wartha Sensei API",
     description="Backend for WarthaCV - Torrent Downloader, Telegram Integration, Token API",
-    version="1.0.0",
+    version="1.0.1",
     lifespan=lifespan
 )
 
@@ -167,7 +167,7 @@ def home():
     return {
         "server": "Online",
         "status": "Ready",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "modules": MODULE_STATUS
     }
 
