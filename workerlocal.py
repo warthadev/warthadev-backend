@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-live-stream"
+WORKER_VERSION = "2026-11-25-ai-local-hot-boot"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -322,6 +322,10 @@ _DOC_WHEEL_GLOBS = (
 )
 _WHISPER_MODEL = None
 _DOC_TEXT_LIMIT = 12000
+# Format yang butuh paket berat (pymupdf/docx/pptx/pandas/tesseract/ffmpeg/faster-whisper).
+_MEDIA_EXTS = {".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".parquet",
+               ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+               ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".webm", ".mov", ".avi"}
 
 
 def _wheel_matches_python(filename):
@@ -340,6 +344,28 @@ def _wheel_matches_python(filename):
 
 def _run_quiet(cmd, timeout=180):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+
+
+_MEDIA_PACKAGES_READY = False
+
+
+def _prepare_work_dirs():
+    os.makedirs(BASE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
+
+
+def _ensure_media_packages():
+    """Pasang paket media berat (wheel offline + ffmpeg/tesseract) sekali saja,
+    saat pertama kali benar-benar dibutuhkan (baca dokumen/media) — bukan di boot.
+    Sekali coba saja; gagal pun jangan ulangi di tiap baca."""
+    global _MEDIA_PACKAGES_READY
+    if _MEDIA_PACKAGES_READY:
+        return
+    _MEDIA_PACKAGES_READY = True
+    try:
+        _prepare_media_packages()
+    except Exception as exc:
+        print(f"[setup] media packages gagal (diabaikan): {_clean_err(exc)[:200]}", flush=True)
 
 
 def _prepare_media_packages():
@@ -575,6 +601,8 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT):
         return f"Error: File '{path}' terlalu besar (>200 MB)."
     limit = max(1000, min(int(max_chars or _DOC_TEXT_LIMIT), 20000))
     ext = os.path.splitext(path)[1].lower()
+    if ext in _MEDIA_EXTS:
+        _ensure_media_packages()
     try:
         if ext == ".pdf":
             return _read_pdf(path, limit)
@@ -802,12 +830,13 @@ def build_system_prompt(base_dir):
 
 
 # ---------------------------------------------------------------------------
-# Staging: copy the dataset's llama.cpp binaries + gguf model onto local disk
-# so they are executable (the /kaggle/input mount is read-only).
+# Staging: copy HANYA binary llama-server (kecil) supaya bisa dieksekusi.
+# File model GGUF dibaca langsung dari /kaggle/input — read-only tidak masalah
+# karena model hanya di-mmap (tidak ditulis/dieksekusi). Dulu seluruh folder
+# model ikut di-copy (GB-an) di tiap boot; itu yang bikin boot lama.
 # ---------------------------------------------------------------------------
 def _stage_model_assets(base_dir):
     bin_dst = os.path.join(base_dir, "llama_bin")
-    model_dst = os.path.join(base_dir, "model_gguf")
     if not os.path.isdir(bin_dst):
         src_bin = next(iter(glob.glob("/kaggle/input/**/llama_bin", recursive=True)), None)
         if not src_bin:
@@ -819,26 +848,24 @@ def _stage_model_assets(base_dir):
                     os.chmod(os.path.join(root, fn), 0o755)
                 except Exception:
                     pass
-    if not os.path.isdir(model_dst):
-        src_model = next(iter(glob.glob("/kaggle/input/**/model_gguf", recursive=True)), None)
-        if not src_model:
-            raise FileNotFoundError("The dataset has no model_gguf folder")
-        shutil.copytree(src_model, model_dst)
-    return bin_dst, model_dst
+    src_model = next(iter(glob.glob("/kaggle/input/**/model_gguf", recursive=True)), None)
+    if not src_model:
+        raise FileNotFoundError("The dataset has no model_gguf folder")
+    return bin_dst, src_model
 
 
 def start_llama_server(base_dir, port, max_ctx):
-    _stage_model_assets(base_dir)
-    srv_matches = glob.glob(f"{base_dir}/llama_bin/**/llama-server", recursive=True)
+    bin_dst, model_dir = _stage_model_assets(base_dir)
+    srv_matches = glob.glob(f"{bin_dst}/**/llama-server", recursive=True)
     if not srv_matches:
-        raise FileNotFoundError(f"Binary llama-server tidak ditemukan di {base_dir}/llama_bin")
+        raise FileNotFoundError(f"Binary llama-server tidak ditemukan di {bin_dst}")
     srv = srv_matches[0]
     d = os.path.dirname(srv)
-    model_matches = sorted(glob.glob(f"{base_dir}/model_gguf/*.gguf"))
+    model_matches = sorted(glob.glob(f"{model_dir}/*.gguf"))
     model_matches_q4 = [m for m in model_matches if "mmproj" not in m.lower()]
     mmproj_matches = [m for m in model_matches if "mmproj" in m.lower()]
     if not model_matches_q4:
-        raise FileNotFoundError(f"File model GGUF tidak ditemukan di {base_dir}/model_gguf")
+        raise FileNotFoundError(f"File model GGUF tidak ditemukan di {model_dir}")
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
@@ -857,6 +884,24 @@ def start_llama_server(base_dir, port, max_ctx):
     proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
     model_id = os.path.basename(model_matches_q4[0])
     return proc, log_file, model_id
+
+
+def _warmup_model(api_url, base_dir):
+    """Hot reload: prefill system prompt sekali setelah model naik, supaya chat
+    pertama tidak membayar prefill dingin. Gagal warmup tidak menggagalkan boot:
+    chat pertama tetap jalan, hanya lebih lambat."""
+    try:
+        payload = {"messages": [{"role": "system", "content": build_system_prompt(base_dir)},
+                                 {"role": "user", "content": "hi"}],
+                   "max_tokens": 8, "temperature": 0.25, "repeat_penalty": 1.1,
+                   "cache_prompt": True, "stream": False}
+        req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            resp.read()
+        print("[ai-local] warmup selesai: system prompt sudah di-cache, model siap.", flush=True)
+    except Exception as exc:
+        print(f"[ai-local] warmup gagal (diabaikan, chat tetap jalan): {_clean_err(exc)[:200]}", flush=True)
 
 
 def wait_ready(proc, port, secs=300):
@@ -1046,8 +1091,10 @@ def _build_context_note(context):
 def _llm_call(api_url, history, with_tools=True, on_token=None):
     # repeat_penalty menahan model mengulang kata/kalimat yang sama; tanpa ini
     # suhu rendah (0.25) membuatnya terus memilih token yang sama.
+    # cache_prompt: awalan yang sama (system prompt + riwayat) dipakai ulang dari
+    # KV cache, bukan dihitung dari nol di tiap panggilan.
     payload = {"messages": history, "max_tokens": -1, "temperature": 0.25,
-               "repeat_penalty": 1.1, "stream": False}
+               "repeat_penalty": 1.1, "cache_prompt": True, "stream": False}
     if with_tools:
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"
@@ -1468,7 +1515,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
     try:
         _status("booting", phase="worker")
         _status("booting", phase="packages")
-        _prepare_media_packages()
+        _prepare_work_dirs()  # paket berat dipasang lazy saat pertama baca dokumen/media
         _status("booting", phase="model")
         proc, log_file, model_id = start_llama_server(base_dir, DEFAULT_PORT, DEFAULT_MAX_CTX)
         state["proc"] = proc
@@ -1478,10 +1525,11 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                 with open("/tmp/server.log", "r", errors="ignore") as lf:
                     tail = lf.read()[-800:]
             raise RuntimeError(f"llama-server gagal start: {tail}")
+        api_url = f"http://127.0.0.1:{DEFAULT_PORT}/v1/chat/completions"
+        _warmup_model(api_url, base_dir)
         _status("ready", model_id=model_id)
         print(f"[ai-local] ready, model={model_id}", flush=True)
 
-        api_url = f"http://127.0.0.1:{DEFAULT_PORT}/v1/chat/completions"
         history = [{"role": "system", "content": build_system_prompt(base_dir)}]
         print("[ai-local] worker hidup sampai Stop ditekan atau Kaggle mengakhiri kernel.", flush=True)
 
@@ -1514,6 +1562,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                 state["proc"] = proc
                 if not wait_ready(proc, DEFAULT_PORT):
                     raise RuntimeError("llama-server gagal start setelah restart")
+                _warmup_model(api_url, base_dir)
                 history = [{"role": "system", "content": build_system_prompt(base_dir)}]
                 _status("ready", model_id=model_id)
                 continue
