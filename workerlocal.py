@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-human-stop"
+WORKER_VERSION = "2026-11-25-ai-local-live-stream"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -770,7 +770,30 @@ def build_system_prompt(base_dir):
         "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, "
         "ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya "
         "hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah "
-        "menyampaikan sesuatu, lanjut ke hal berikutnya.\n"
+        "menyampaikan sesuatu, lanjut ke hal berikutnya.\n"        "CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, "
+        "to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.\n"
+        "SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat "
+        "(1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan "
+        "pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, "
+        "bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.\n"        "TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari "
+        "konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: \"saya anggap maksudmu X\"). "
+        "Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — "
+        "tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, "
+        "kirim sesuatu, ubah data).\n"
+        "KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi waktu dan wilayah user serta "
+        "wilayahmu — pakai itu saat menjawab pertanyaan tentang waktu, tanggal, dan tempat.\n"        "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. "
+        "Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n"
+        "- card: {\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap\",\"title\":\"..\",\"body\":\"..\"} — sorotan/penting/peringatan.\n"
+        "- steps: {\"type\":\"steps\",\"title\":\"..\",\"items\":[{\"title\":\"..\",\"text\":\"..\"}]} — langkah berurutan.\n"
+        "- flow: {\"type\":\"flow\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"text\":\"..\"}]} — alur/diagram bentuk.\n"
+        "- timeline: {\"type\":\"timeline\",\"title\":\"..\",\"items\":[{\"date\":\"..\",\"title\":\"..\",\"text\":\"..\"}]} — urutan waktu.\n"
+        "- compare: {\"type\":\"compare\",\"title\":\"..\",\"columns\":[{\"title\":\"..\",\"tone\":\"good|bad|neutral\",\"items\":[\"..\"]}]} — perbandingan.\n"
+        "- chart: {\"type\":\"chart\",\"title\":\"..\",\"labels\":[\"..\"],\"values\":[angka]} — grafik batang data.\n"
+        "- checklist: {\"type\":\"checklist\",\"title\":\"..\",\"items\":[{\"text\":\"..\",\"done\":true}]} — daftar centang.\n"
+        "- stats: {\"type\":\"stats\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"value\":\"..\",\"note\":\"..\"}]} — angka penting.\n"
+        "Aturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Prosa biasa, "
+        "penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup "
+        "dijelaskan dengan satu paragraf.\n"
         "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan "
         "error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker "
         "[[file:...]] — jangan memeriksa berulang-ulang.\n"
@@ -873,6 +896,8 @@ AGENT_STRINGS = {
         "understanding": "Memahami permintaan…",
         "preparing": "Menyiapkan file dan jawaban…",
         "running_tool": "Menjalankan",
+        "tokens_used": "Token dipakai",
+        "cancelled": "Dibatalkan oleh user.",
     },
     "en": {
         "tools": {
@@ -895,6 +920,8 @@ AGENT_STRINGS = {
         "understanding": "Understanding request…",
         "preparing": "Preparing files and answer…",
         "running_tool": "Running",
+        "tokens_used": "Tokens used",
+        "cancelled": "Cancelled by user.",
     },
 }
 
@@ -991,7 +1018,32 @@ def _append_missing_markers(answer, before):
     return (answer + "\n\n" + "\n".join(f"[[file:{p}]]" for p in sorted(missing))).strip()
 
 
-def _llm_call(api_url, history, with_tools=True):
+def _fmt_tokens(n, language):
+    # 1.240 (id) vs 1,240 (en).
+    grouped = f"{int(n):,}"
+    return grouped.replace(",", ".") if str(language or "").startswith("id") else grouped
+
+
+def _build_context_note(context):
+    """Catatan [KONTEKS SAAT INI] di tiap giliran: waktu & wilayah user (dari browser)
+    dan wilayah worker sendiri, supaya AI tahu waktu, tanggal, dan tempat kedua belah pihak."""
+    ctx = context if isinstance(context, dict) else {}
+    tz = str(ctx.get("timezone") or "").strip()
+    local_time = str(ctx.get("local_time") or "").strip()
+    now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+    lines = ["[KONTEKS SAAT INI]"]
+    if tz or local_time:
+        lines.append(f"- Waktu user sekarang: {local_time or '?'} (zona waktu {tz or 'tidak diketahui'}).")
+    lines.append(f"- Waktumu sekarang (worker Kaggle, UTC): {now_utc} UTC.")
+    lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat.")
+    if tz:
+        lines.append(f"- Wilayah user: zona waktu {tz}.")
+    lines.append("Pakai info ini untuk pertanyaan tentang waktu, tanggal, dan tempat. "
+                 "Jangan menebak kota user dari zona waktu saja.")
+    return "\n".join(lines)
+
+
+def _llm_call(api_url, history, with_tools=True, on_token=None):
     # repeat_penalty menahan model mengulang kata/kalimat yang sama; tanpa ini
     # suhu rendah (0.25) membuatnya terus memilih token yang sama.
     payload = {"messages": history, "max_tokens": -1, "temperature": 0.25,
@@ -999,11 +1051,75 @@ def _llm_call(api_url, history, with_tools=True):
     if with_tools:
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"
+    if on_token is None:
+        req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        message = ((body.get("choices") or [{}])[0].get("message")) or {}
+        usage = body.get("usage") or {}
+        return message, usage
+    # Live stream: baca SSE llama-server token demi token, teruskan tiap delta
+    # ke on_token supaya chat tampil sambil jalan, bukan menunggu selesai.
+    payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}
     req = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
                                   headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        body = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    return ((body.get("choices") or [{}])[0].get("message")) or {}
+    try:
+        content_parts, thought_parts = [], []
+        tool_calls: list[dict] = []
+        usage: dict = {}
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choice = (chunk.get("choices") or [{}])[0]
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                delta = choice.get("delta") or {}
+                if isinstance(delta.get("content"), str) and delta["content"]:
+                    content_parts.append(delta["content"])
+                    try:
+                        on_token(delta["content"])
+                    except Exception:
+                        pass
+                if isinstance(delta.get("reasoning_content"), str) and delta["reasoning_content"]:
+                    thought_parts.append(delta["reasoning_content"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({"type": "function", "id": "", "function": {"name": "", "arguments": ""}})
+                    cur = tool_calls[idx]
+                    if tc.get("id"):
+                        cur["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        cur["function"]["name"] = fn["name"]
+                    if isinstance(fn.get("arguments"), str):
+                        cur["function"]["arguments"] += fn["arguments"]
+        message: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if thought_parts:
+            message["reasoning_content"] = "".join(thought_parts)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message, usage
+    except Exception:
+        # Stream putus di tengah: ulangi sekali tanpa stream supaya jawaban tetap lengkap.
+        req = urllib.request.Request(api_url, data=json.dumps({**payload, "stream": False}).encode(),
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        message = ((body.get("choices") or [{}])[0].get("message")) or {}
+        usage = body.get("usage") or {}
+        return message, usage
 
 
 def _fallback_summary(ran_tools):
@@ -1017,7 +1133,7 @@ def _fallback_summary(ran_tools):
     return "\n".join(lines)
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id"):
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None):
     strings = _agent_strings(language)
     def _act(msg):
         if on_activity:
@@ -1039,7 +1155,18 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             except Exception:
                 pass
 
+    segment = {"n": 0}  # tiap panggilan model = satu segmen stream (sapaan, jawaban akhir, ...)
+
+    def _stream_call(with_tools):
+        segment["n"] += 1
+        seg = segment["n"]
+        if on_token is None:
+            return _llm_call(api_url, history, with_tools=with_tools)
+        return _llm_call(api_url, history, with_tools=with_tools,
+                         on_token=lambda d: on_token(d, seg))
+
     out_before = _snapshot_out()
+    history.append({"role": "user", "content": _build_context_note(context)})
     history.append({"role": "user", "content": user_content})
     # Ingatan kerja, bukan hitungan: panggilan apa yang sudah dicoba dan apa hasilnya,
     # supaya pengulangan bisa dikenali dari polanya, bukan dari angkanya.
@@ -1049,6 +1176,13 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     last_error = None     # signature error terakhir, untuk mengenali jalan buntu yang sama
     empty_retry = False
     stuck_reason = None
+    opening_sent = False  # sapaan pembuka dikirim sekali, sebelum tool pertama jalan
+    total_tokens = 0    # akumulasi usage dari semua panggilan model di jawaban ini
+
+    def _report_tokens():
+        if total_tokens > 0:
+            _step(_new_id(), kind="info",
+                  title=f"{strings['tokens_used']}: {_fmt_tokens(total_tokens, language)}", status="done")
 
     # Loop jalan sampai model sendiri memutuskan menjawab — seperti manusia yang
     # berhenti saat merasa sudah cukup, bukan karena kuota langkah habis.
@@ -1056,13 +1190,30 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         think_id = _new_id()
         _act(strings["thinking"])
         _step(think_id, kind="thinking", title=strings["thinking"], status="running")
+        if cancelled and cancelled():
+            # User menekan Berhenti selagi model sedang berpikir.
+            history.append({"role": "assistant", "content": strings["cancelled"]})
+            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+            _report_tokens()
+            return strings["cancelled"]
         try:
-            message = _llm_call(api_url, history, with_tools=True)
+            message, usage = _stream_call(with_tools=True)
+            total_tokens += int((usage or {}).get("total_tokens") or 0)
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
         visible, thought = _split_thinking(message)
         tool_calls = message.get("tool_calls") or []
+
+        if tool_calls and visible and not opening_sent:
+            # Sapa dulu sebelum bertindak: kirim isi jawaban pertama model sebagai
+            # pesan sapaan ke user, baru setelah itu tool mulai jalan.
+            opening_sent = True
+            if on_opening:
+                try:
+                    on_opening(visible.strip()[:600])
+                except Exception:
+                    pass
 
         if not tool_calls:
             _step(think_id, status="done", title=strings["thought_done"], output=_short(thought, 1200))
@@ -1073,6 +1224,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 continue
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
+            _report_tokens()
             return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before)
 
         # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
@@ -1156,6 +1308,11 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 {"type": "image_url", "image_url": {"url": encode_image_b64(img_fp)}},
             ]})
 
+        if cancelled and cancelled():
+            history.append({"role": "assistant", "content": strings["cancelled"]})
+            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+            _report_tokens()
+            return strings["cancelled"]
         if stuck_reason:
             break
 
@@ -1171,13 +1328,16 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         "apa yang gagal beserta error aslinya, dan saran langkah berikutnya. Jika ada file jadi di "
         "/kaggle/working/out, sertakan marker [[file:...]].")})
     try:
-        final_visible, _ = _split_thinking(_llm_call(api_url, history, with_tools=False))
+        final_message, final_usage = _stream_call(with_tools=False)
+        total_tokens += int((final_usage or {}).get("total_tokens") or 0)
+        final_visible, _ = _split_thinking(final_message)
     except Exception:
         final_visible = ""
     if not final_visible:
         final_visible = _fallback_summary(ran_tools)
     history.append({"role": "assistant", "content": final_visible})
     _step(final_id, status="done", title=strings["final_done"])
+    _report_tokens()
     return _append_missing_markers(final_visible, out_before)
 
 
@@ -1247,6 +1407,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         _post("/agent/local/kaggle-status", {"status": status, "model_id": model_id, "error": error, "phase": phase})
 
     _stop = threading.Event()
+    _cancel_event = threading.Event()  # Berhenti: batalkan jawaban berjalan, worker tetap hidup
     state = {"proc": None}  # llama-server saat ini (diganti saat restart model)
 
     def _shutdown_now(reason):
@@ -1269,6 +1430,8 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": True}, timeout=10)
             if isinstance(res, dict) and res.get("control") == "stop":
                 _shutdown_now("stop diminta user")
+            if isinstance(res, dict) and res.get("control") == "cancel":
+                _cancel_event.set()
             if gone["count"] >= 6:
                 # Backend tidak mengenal sesi ini lagi (worker yatim / sesi diganti): jangan buang kuota GPU.
                 _shutdown_now("sesi backend hilang")
@@ -1381,11 +1544,44 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             pass
                     def _report_step(step):
                         _post("/agent/local/kaggle-activity", {"activity": step.get("title"), "step": step}, timeout=5)
+                    def _report_opening(text):
+                        try:
+                            _post("/agent/local/kaggle-activity", {"opening": (text or "").strip()[:600]}, timeout=5)
+                        except Exception:
+                            pass
+                    # Live stream: teruskan token ke backend (di-throttle supaya tidak
+                    # membanjiri HTTP: flush tiap ~150ms atau tiap 400 karakter).
+                    # Segmen = satu panggilan model; ganti segmen -> flush sisa segmen lama.
+                    _stream_state = {"buf": "", "seg": 0, "last_flush": 0.0}
+                    def _report_stream(delta, segment):
+                        try:
+                            st = _stream_state
+                            if segment != st["seg"]:
+                                if st["buf"]:
+                                    _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": st["seg"], "delta": st["buf"]}, timeout=5)
+                                st["buf"] = ""
+                                st["seg"] = segment
+                            st["buf"] += delta or ""
+                            now = time.time()
+                            if len(st["buf"]) >= 400 or now - st["last_flush"] >= 0.15:
+                                _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": segment, "delta": st["buf"]}, timeout=5)
+                                st["buf"] = ""
+                                st["last_flush"] = now
+                        except Exception:
+                            pass
                     job_strings = _agent_strings(payload.get("language"))
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
+                    _cancel_event.clear()
                     answer = run_agent_turn(history, api_url, base_dir, content,
                                             on_activity=lambda _m: None, on_step=_report_step,
-                                            language=payload.get("language"))
+                                            language=payload.get("language"), on_opening=_report_opening,
+                                            cancelled=_cancel_event.is_set, context=payload.get("context"),
+                                            on_token=_report_stream)
+                    if _stream_state["buf"]:
+                        try:
+                            _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": _stream_state["seg"], "delta": _stream_state["buf"]}, timeout=5)
+                        except Exception:
+                            pass
                     _report_activity(job_strings["preparing"])
                     cleaned, attachments = extract_and_deliver(answer or "", session_id)
                     try:

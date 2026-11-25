@@ -20,6 +20,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import kaggle_local_runner
@@ -73,7 +74,7 @@ def _load_sessions() -> None:
         for sid, saved in (data or {}).items():
             if not isinstance(saved, dict) or float(saved.get("expires_at") or 0) <= now:
                 continue
-            _sessions[sid] = {**{k: saved.get(k) for k in _PERSIST_FIELDS}, "pending_job": None, "job_results": {}}
+            _sessions[sid] = {**{k: saved.get(k) for k in _PERSIST_FIELDS}, "pending_job": None, "job_results": {}, "job_streams": {}}
         logger.info("Restored %d AI Local session(s) from disk", len(_sessions))
     except Exception as exc:
         logger.warning("Failed to load AI Local sessions: %s", exc)
@@ -99,6 +100,8 @@ class LocalChatPayload(BaseModel):
     # Bahasa tampilan yang dipakai user (id/en), diteruskan ke worker supaya
     # label tool dan judul langkah mengikuti bahasa user.
     language: str | None = Field(default=None, max_length=8)
+    # Konteks waktu & wilayah user (zona waktu, waktu lokal, locale) dari browser.
+    context: dict[str, Any] | None = None
 
 
 class LocalUploadPayload(BaseModel):
@@ -128,6 +131,8 @@ class WorkerActivityPayload(BaseModel):
     # Satu langkah proses (berpikir / tool) untuk log yang bisa dibuka-tutup di chat.
     step: dict[str, Any] | None = None
     reset: bool = False
+    # Sapaan pembuka dari worker: ditampilkan sebagai pesan chat sebelum proses jalan.
+    opening: str | None = Field(default=None, max_length=600)
 
 
 class ConnectPayload(BaseModel):
@@ -140,6 +145,14 @@ class WorkerPollPayload(BaseModel):
     closing: bool = False
     heartbeat_only: bool = False
     reason: str | None = Field(default=None, max_length=40)
+
+
+class WorkerStreamPayload(BaseModel):
+    # Satu potongan teks live dari worker: segmen = satu panggilan model
+    # (sapaan, jawaban akhir, ...); delta = teks baru sejak potongan sebelumnya.
+    job_id: str
+    segment: int = 0
+    delta: str = Field(default="", max_length=5000)
 
 
 class WorkerResultPayload(BaseModel):
@@ -220,7 +233,7 @@ async def _start_or_reuse(request: Request, uid: str, credentials: dict[str, str
     sess = {
         "session_id": sid, "owner_uid": uid, "worker_token": worker_token,
         "created_at": now, "expires_at": now + SESSION_TTL_SECONDS, "control": None,
-        "pending_job": None, "job_results": {},
+        "pending_job": None, "job_results": {}, "job_streams": {},
     }
     async with _sessions_lock:
         _sessions[sid] = sess
@@ -280,6 +293,30 @@ async def restart(request: Request, authorization: str | None = Header(default=N
         return {"ok": True, "session_id": existing["session_id"], "status": "booting", "model_id": None,
                 "reused": True, "in_place": True}
     return await _start_or_reuse(request, uid, credentials)
+
+
+@router.post("/cancel")
+async def cancel_chat(authorization: str | None = Header(default=None)):
+    """Tombol "Berhenti": batalkan jawaban yang sedang berjalan, worker tetap hidup.
+
+    Berbeda dengan /stop yang mematikan sesi worker Kaggle: cancel hanya menghentikan
+    satu jawaban ini. Worker tetap ready untuk chat berikutnya.
+    """
+    uid = authenticate_user(authorization)
+    sess = await _get_session_for_uid(uid)
+    if not sess:
+        raise HTTPException(409, "AI Local is not connected yet. Start it from the Local tab first.")
+    async with _sessions_lock:
+        pending = sess.get("pending_job") or {}
+        lang = _normalize_agent_language((pending.get("payload") or {}).get("language"))
+        cancelled_text = "Dibatalkan oleh user." if lang == "id" else "Cancelled by user."
+        if pending:
+            job_id = pending.get("job_id")
+            sess["pending_job"] = None
+            sess["job_results"][job_id] = {"ok": True, "result": {"content": cancelled_text, "cancelled": True}}
+        sess["control"] = "cancel"
+        _persist_sessions_unlocked()
+    return {"ok": True, "cancelled": True}
 
 
 @router.post("/stop")
@@ -474,7 +511,8 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
     }
 
 
-async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+async def _enqueue_job(uid: str, job_type: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Periksa worker siap, lalu antrekan satu job. Dipakai /chat dan /chat-stream."""
     sess = await _get_session_for_uid(uid)
     if not sess:
         raise HTTPException(409, "AI Local is not connected yet. Start it from the Local tab first.")
@@ -489,6 +527,17 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
     job_id = uuid.uuid4().hex[:12]
     async with _sessions_lock:
         sess["pending_job"] = {"job_id": job_id, "type": job_type, "payload": payload}
+        streams = sess.setdefault("job_streams", {})
+        streams[job_id] = {"events": []}
+        # Simpan stream maksimal 3 job terakhir supaya memori tidak tumbuh tanpa batas.
+        if len(streams) > 3:
+            for old_id in list(streams)[: len(streams) - 3]:
+                streams.pop(old_id, None)
+    return sess, job_id
+
+
+async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+    sess, job_id = await _enqueue_job(uid, job_type, payload)
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -522,7 +571,8 @@ def _normalize_agent_language(value: Any) -> str:
 async def local_chat(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
     uid = authenticate_user(authorization)
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
-                   "language": _normalize_agent_language(payload.language)}
+                   "language": _normalize_agent_language(payload.language),
+                   "context": payload.context if isinstance(payload.context, dict) else {}}
     kaggle_local_runner.reset_activity_log(uid)
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
@@ -536,13 +586,93 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     return {"success": True, "data": {"result": payload_out}}
 
 
+@router.post("/chat-stream")
+async def local_chat_stream(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
+    """Chat AI Local sebagai SSE live: token mengalir selagi model menulis,
+    lalu satu event final berisi jawaban lengkap + lampiran. Sama seperti /chat,
+    hanya saja jawabannya tidak menunggu sampai selesai."""
+    uid = authenticate_user(authorization)
+    job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
+                   "language": _normalize_agent_language(payload.language),
+                   "context": payload.context if isinstance(payload.context, dict) else {}}
+    kaggle_local_runner.reset_activity_log(uid)
+    sess, job_id = await _enqueue_job(uid, "chat", job_payload)
+
+    async def _events():
+        idx = 0
+        deadline = time.time() + CHAT_JOB_TIMEOUT_SECONDS
+        try:
+            while True:
+                async with _sessions_lock:
+                    stream = (sess.get("job_streams") or {}).get(job_id) or {"events": []}
+                    events = stream["events"]
+                    result = sess["job_results"].get(job_id)
+                while idx < len(events):
+                    ev = events[idx]
+                    idx += 1
+                    yield ("data: " + json.dumps({"type": "token", "segment": ev.get("segment", 0),
+                                                  "delta": ev.get("delta", "")}, ensure_ascii=False) + "\n\n")
+                if result is not None:
+                    async with _sessions_lock:
+                        sess["job_results"].pop(job_id, None)
+                    if not result.get("ok"):
+                        yield ("data: " + json.dumps({"type": "error",
+                                                      "message": result.get("error") or "AI Local failed to process the message."},
+                                                     ensure_ascii=False) + "\n\n")
+                    else:
+                        inner = result.get("result") or {}
+                        out: dict[str, Any] = {"content": inner.get("content") or "", "model": "ai-local",
+                                               "usage": {}, "sources": []}
+                        if isinstance(inner.get("attachments"), list) and inner["attachments"]:
+                            out["attachments"] = inner["attachments"]
+                        yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
+                    break
+                if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":
+                    yield ("data: " + json.dumps({"type": "error",
+                                                  "message": "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."},
+                                                 ensure_ascii=False) + "\n\n")
+                    break
+                if time.time() >= deadline:
+                    yield ("data: " + json.dumps({"type": "error", "message": "AI Local did not reply in time."},
+                                                 ensure_ascii=False) + "\n\n")
+                    break
+                await asyncio.sleep(0.1)
+        finally:
+            async with _sessions_lock:
+                if sess.get("pending_job", {}).get("job_id") == job_id:
+                    sess["pending_job"] = None
+
+    return StreamingResponse(_events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.post("/kaggle-stream")
+async def kaggle_stream(payload: WorkerStreamPayload, session_id: str = Query(...),
+                        worker_token: str | None = Header(default=None, alias="X-Kaggle-Worker-Token")):
+    """Satu potongan teks live dari worker untuk job yang sedang berjalan."""
+    sess = await _get_session(session_id)
+    if not sess:
+        raise HTTPException(410, "session not found or expired")
+    _require_worker_token(sess, worker_token)
+    async with _sessions_lock:
+        streams = sess.setdefault("job_streams", {})
+        entry = streams.setdefault(payload.job_id, {"events": []})
+        events = entry["events"]
+        events.append({"segment": payload.segment, "delta": payload.delta})
+        # Batasi memori: buang potongan paling lama kalau sudah sangat panjang.
+        if len(events) > 5000:
+            del events[: len(events) - 5000]
+    return {"ok": True}
+
+
 @router.get("/activity")
 async def local_activity(since: int = Query(default=0, ge=0), authorization: str | None = Header(default=None)):
     """Log langkah proses (berpikir / tool) milik chat yang sedang berjalan. Murah, aman di-poll tiap ~1 detik."""
     uid = authenticate_user(authorization)
     snapshot = kaggle_local_runner.worker_snapshot(uid)
     log = kaggle_local_runner.get_activity_log(uid, since)
-    return {"ok": True, "activity": snapshot.get("activity"), "seq": log["seq"], "steps": log["steps"]}
+    return {"ok": True, "activity": snapshot.get("activity"), "seq": log["seq"], "steps": log["steps"],
+            "opening": kaggle_local_runner.get_worker_opening(uid)}
 
 
 @router.post("/upload")
@@ -622,6 +752,8 @@ async def kaggle_activity(payload: WorkerActivityPayload, session_id: str = Quer
         kaggle_local_runner.reset_activity_log(uid)
     if payload.step:
         kaggle_local_runner.upsert_activity_step(uid, payload.step)
+    if payload.opening:
+        kaggle_local_runner.set_worker_opening(uid, payload.opening)
     kaggle_local_runner.set_worker_activity(uid, payload.activity)
     kaggle_local_runner.touch_worker(uid, session_id)
     async with _sessions_lock:
@@ -649,11 +781,17 @@ async def kaggle_poll(payload: WorkerPollPayload, session_id: str = Query(...),
             _persist_sessions_unlocked()
         return {"ok": True, "job": None, "control": None}
     if payload.heartbeat_only:
-        # Heartbeat berjalan di thread terpisah (juga saat boot/muat model), jadi hanya "stop" yang dikirim lewat sini.
-        return {"ok": True, "job": None, "control": "stop" if control == "stop" else None}
+        # Heartbeat berjalan di thread terpisah (juga saat boot/muat model), jadi hanya "stop"
+        # dan "cancel" yang dikirim lewat sini. Cancel sekali pakai: langsung dihapus setelah disampaikan.
+        if control == "cancel":
+            async with _sessions_lock:
+                sess["control"] = None
+                _persist_sessions_unlocked()
+        return {"ok": True, "job": None,
+                "control": "stop" if control == "stop" else ("cancel" if control == "cancel" else None)}
     async with _sessions_lock:
         job = sess.get("pending_job")
-        if control == "restart":
+        if control in ("restart", "cancel"):
             sess["control"] = None  # sekali pakai
             _persist_sessions_unlocked()
     return {"ok": True, "job": job, "control": control}

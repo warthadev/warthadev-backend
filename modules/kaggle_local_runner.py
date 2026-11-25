@@ -251,6 +251,8 @@ _ACTIVITY_FIELD_LIMITS = {"id": 24, "tool": 40, "title": 160, "detail": 200, "ou
 _ACTIVITY_KINDS = {"thinking", "tool", "info"}
 _ACTIVITY_STATUSES = {"running", "done", "error"}
 _activity_logs: Dict[str, Dict[str, Any]] = {}
+# Sapaan pembuka dari worker untuk chat yang sedang berjalan (1 pesan per chat).
+_worker_openings: Dict[str, str] = {}
 
 
 def reset_activity_log(owner_uid: str) -> None:
@@ -258,6 +260,25 @@ def reset_activity_log(owner_uid: str) -> None:
         return
     with _state_lock:
         _activity_logs[owner_uid] = {"seq": 0, "steps": []}
+        _worker_openings.pop(owner_uid, None)
+
+
+def set_worker_opening(owner_uid: str, text: Optional[str]) -> None:
+    """Simpan sapaan pembuka dari worker untuk chat yang sedang berjalan."""
+    if not owner_uid:
+        return
+    text = (text or "").strip()[:600]
+    if not text:
+        return
+    with _state_lock:
+        _worker_openings[owner_uid] = text
+
+
+def get_worker_opening(owner_uid: str) -> Optional[str]:
+    if not owner_uid:
+        return None
+    with _state_lock:
+        return _worker_openings.get(owner_uid)
 
 
 def upsert_activity_step(owner_uid: str, step: Dict[str, Any]) -> None:
