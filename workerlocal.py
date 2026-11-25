@@ -151,9 +151,23 @@ def extract_and_deliver(text, session_id=""):
 
 
 _DELIVER_SYSTEM_HINT = (
-    "Jika kamu membuat file untuk pengguna, simpan di /kaggle/working/out/ lalu tulis "
-    "[[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu. Folder juga boleh (akan di-zip). "
-    "Jangan menempelkan isi file besar ke chat. "
+    "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file "
+    "di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — "
+    "ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). "
+    "Jangan menempelkan isi file besar ke chat sebagai gantinya.\n"
+    "ATURAN KERAS SOAL PENGIRIMAN FILE:\n"
+    "- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. "
+    "Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', "
+    "atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n"
+    "- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa "
+    "kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai "
+    "semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu "
+    "marker folder untuk semuanya sekaligus).\n"
+    "- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan "
+    "atau placeholder seperti '# TODO: lengkapi sisanya'.\n"
+    "- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file "
+    "yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih "
+    "akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\n"
     "Jika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur "
     "LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. "
     "Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. "
@@ -837,7 +851,10 @@ _TOOL_ACTIVITY = {
 }
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, max_steps=8, on_activity=None):
+AGENT_MAX_STEPS = int(os.getenv("WARTHA_AGENT_MAX_STEPS", "30"))
+
+
+def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX_STEPS, on_activity=None):
     def _act(msg):
         if on_activity:
             try:
