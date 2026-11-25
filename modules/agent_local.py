@@ -96,6 +96,9 @@ class ChatImagePayload(BaseModel):
 class LocalChatPayload(BaseModel):
     prompt: str = Field(min_length=1)
     images: list[ChatImagePayload] = Field(default_factory=list, max_length=8)
+    # Bahasa tampilan yang dipakai user (id/en), diteruskan ke worker supaya
+    # label tool dan judul langkah mengikuti bahasa user.
+    language: str | None = Field(default=None, max_length=8)
 
 
 class LocalUploadPayload(BaseModel):
@@ -507,9 +510,19 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
 
 
 @router.post("/chat")
+def _normalize_agent_language(value: Any) -> str:
+    lang = str(value or "").strip().lower()
+    if lang.startswith("id"):
+        return "id"
+    if lang.startswith("en"):
+        return "en"
+    return "id"
+
+
 async def local_chat(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
     uid = authenticate_user(authorization)
-    job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images]}
+    job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
+                   "language": _normalize_agent_language(payload.language)}
     kaggle_local_runner.reset_activity_log(uid)
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):

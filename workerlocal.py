@@ -21,7 +21,7 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-no-idle-limit"
+WORKER_VERSION = "2026-11-25-ai-local-human-stop"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -767,7 +767,11 @@ def build_system_prompt(base_dir):
         ".txt/.md/.html/.csv dengan write_file. PDF: pakai pymupdf (`import fitz`) yang sudah terpasang; JANGAN pip install "
         "(internet bisa mati). Cek sekali dengan run_bash `python -c \"import fitz\"`; jika gagal, pakai format lain "
         "dan beri tahu pengguna.\n"
-        "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika gagal dua kali, ganti pendekatan atau laporkan "
+        "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, "
+        "ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya "
+        "hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah "
+        "menyampaikan sesuatu, lanjut ke hal berikutnya.\n"
+        "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan "
         "error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker "
         "[[file:...]] — jangan memeriksa berulang-ulang.\n"
         + _DELIVER_SYSTEM_HINT
@@ -845,22 +849,70 @@ def wait_ready(proc, port, secs=300):
     return False
 
 
-_TOOL_ACTIVITY = {
-    "list_dir": "Memeriksa isi folder…",
-    "read_file": "Membaca file…",
-    "patch_file": "Mengedit file…",
-    "write_file": "Menulis file…",
-    "run_bash": "Menjalankan perintah…",
-    "web_search": "Mencari di web…",
-    "web_fetch": "Mengambil halaman web…",
-    "inspect_image": "Menganalisis gambar…",
-    "read_document": "Membaca dokumen…",
+# Label tampilan berpikir/bertindak mengikuti bahasa user (id/en).
+# Tambah bahasa baru = tambah satu entri di sini + AGENT_PROCESS_STRINGS di frontend.
+AGENT_STRINGS = {
+    "id": {
+        "tools": {
+            "list_dir": "Memeriksa isi folder…",
+            "read_file": "Membaca file…",
+            "patch_file": "Mengedit file…",
+            "write_file": "Menulis file…",
+            "run_bash": "Menjalankan perintah…",
+            "web_search": "Mencari di web…",
+            "web_fetch": "Mengambil halaman web…",
+            "inspect_image": "Menganalisis gambar…",
+            "read_document": "Membaca dokumen…",
+        },
+        "thinking": "Sedang berpikir…",
+        "thought_done": "Berpikir",
+        "composing": "Menyusun jawaban…",
+        "final": "Menyusun jawaban akhir…",
+        "final_done": "Menyusun jawaban akhir",
+        "model_failed": "Model gagal menjawab",
+        "understanding": "Memahami permintaan…",
+        "preparing": "Menyiapkan file dan jawaban…",
+        "running_tool": "Menjalankan",
+    },
+    "en": {
+        "tools": {
+            "list_dir": "Checking folder contents…",
+            "read_file": "Reading file…",
+            "patch_file": "Editing file…",
+            "write_file": "Writing file…",
+            "run_bash": "Running command…",
+            "web_search": "Searching the web…",
+            "web_fetch": "Fetching web page…",
+            "inspect_image": "Analyzing image…",
+            "read_document": "Reading document…",
+        },
+        "thinking": "Thinking…",
+        "thought_done": "Thought",
+        "composing": "Composing answer…",
+        "final": "Composing final answer…",
+        "final_done": "Composing final answer",
+        "model_failed": "Model failed to answer",
+        "understanding": "Understanding request…",
+        "preparing": "Preparing files and answer…",
+        "running_tool": "Running",
+    },
 }
 
 
-AGENT_MAX_STEPS = int(os.getenv("WARTHA_AGENT_MAX_STEPS", "30"))
-_REPEAT_LIMIT = 2        # panggilan tool identik ke-3 dan seterusnya ditolak
-_FAIL_STREAK_LIMIT = 6   # tool gagal/ditolak berturut-turut sebelum dipaksa menjawab
+def _agent_strings(language):
+    lang = str(language or "").strip().lower()
+    if lang.startswith("id"):
+        return AGENT_STRINGS["id"]
+    if lang.startswith("en"):
+        return AGENT_STRINGS["en"]
+    return AGENT_STRINGS["id"]
+
+
+# TIDAK ADA batas angka langkah di sini — berhentinya mengikuti cara otak manusia:
+# loop jalan sampai model sendiri memutuskan menjawab. Yang menghentikan paksa
+# hanya pola "mentok": mengulang panggilan yang sama persis (hasilnya sudah
+# diketahui tidak berubah), atau gagal dengan cara yang sama berulang kali.
+# Batas alami yang tersisa: konteks model (131072 token) dan tombol Stop user.
 _OUTPUT_DIR = os.path.join(BASE_DIR, "out")
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
@@ -885,8 +937,9 @@ def _split_thinking(message):
     return content.strip(), thought
 
 
-def _describe_tool(fn_name, args):
-    label = _TOOL_ACTIVITY.get(fn_name, f"Menjalankan {fn_name}…")
+def _describe_tool(fn_name, args, language="id"):
+    strings = _agent_strings(language)
+    label = strings["tools"].get(fn_name, f"{strings['running_tool']} {fn_name}…")
     detail = ""
     if fn_name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
         p = str(args.get("path") or "")
@@ -939,7 +992,10 @@ def _append_missing_markers(answer, before):
 
 
 def _llm_call(api_url, history, with_tools=True):
-    payload = {"messages": history, "max_tokens": -1, "temperature": 0.25, "stream": False}
+    # repeat_penalty menahan model mengulang kata/kalimat yang sama; tanpa ini
+    # suhu rendah (0.25) membuatnya terus memilih token yang sama.
+    payload = {"messages": history, "max_tokens": -1, "temperature": 0.25,
+               "repeat_penalty": 1.1, "stream": False}
     if with_tools:
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"
@@ -961,7 +1017,8 @@ def _fallback_summary(ran_tools):
     return "\n".join(lines)
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX_STEPS, on_activity=None, on_step=None):
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id"):
+    strings = _agent_strings(language)
     def _act(msg):
         if on_activity:
             try:
@@ -984,39 +1041,38 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
 
     out_before = _snapshot_out()
     history.append({"role": "user", "content": user_content})
-    seen_calls = {}
+    # Ingatan kerja, bukan hitungan: panggilan apa yang sudah dicoba dan apa hasilnya,
+    # supaya pengulangan bisa dikenali dari polanya, bukan dari angkanya.
+    seen_calls = {}       # signature panggilan identik -> hasil terakhirnya
+    warned_repeats = set()  # signature yang sudah sekali diperingatkan karena diulang
     ran_tools = []        # (nama tool, detail, ok, preview)
-    fail_streak = 0
-    nudged = False
+    last_error = None     # signature error terakhir, untuk mengenali jalan buntu yang sama
     empty_retry = False
-    stalled = False
+    stuck_reason = None
 
-    for step_idx in range(max_steps):
-        if max_steps - step_idx == 3 and not nudged:
-            nudged = True
-            history.append({"role": "user", "content": (
-                "[SISTEM] Sisa 3 langkah tool. Berhenti menjelajah, selesaikan yang bisa diselesaikan, "
-                "lalu beri jawaban akhir berisi hasil nyata dan marker [[file:...]] bila ada file.")})
+    # Loop jalan sampai model sendiri memutuskan menjawab — seperti manusia yang
+    # berhenti saat merasa sudah cukup, bukan karena kuota langkah habis.
+    while True:
         think_id = _new_id()
-        _act("Sedang berpikir…")
-        _step(think_id, kind="thinking", title="Sedang berpikir…", status="running")
+        _act(strings["thinking"])
+        _step(think_id, kind="thinking", title=strings["thinking"], status="running")
         try:
             message = _llm_call(api_url, history, with_tools=True)
         except Exception as exc:
-            _step(think_id, status="error", title="Model gagal menjawab", output=_short(_clean_err(exc)))
+            _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
         visible, thought = _split_thinking(message)
         tool_calls = message.get("tool_calls") or []
 
         if not tool_calls:
-            _step(think_id, status="done", title="Berpikir", output=_short(thought, 1200))
+            _step(think_id, status="done", title=strings["thought_done"], output=_short(thought, 1200))
             if not visible and not empty_retry:
                 empty_retry = True
                 history.append({"role": "assistant", "content": ""})
                 history.append({"role": "user", "content": "[SISTEM] Jawabanmu kosong. Tulis jawaban akhir sekarang."})
                 continue
             history.append({"role": "assistant", "content": visible})
-            _act("Menyusun jawaban…")
+            _act(strings["composing"])
             return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before)
 
         # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
@@ -1027,7 +1083,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
             if not isinstance(fn.get("arguments"), str):
                 fn["arguments"] = json.dumps(fn.get("arguments") or {}, ensure_ascii=False)
         history.append({"role": "assistant", "content": visible, "tool_calls": tool_calls})
-        _step(think_id, status="done", title="Berpikir", output=_short(thought or visible, 1200))
+        _step(think_id, status="done", title=strings["thought_done"], output=_short(thought or visible, 1200))
 
         pending_images = []
         for tc in tool_calls:
@@ -1040,22 +1096,33 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
             if not isinstance(parsed_args, dict):
                 parsed_args, parse_error = {}, "argumen harus berupa objek JSON"
 
-            label, detail = _describe_tool(fn_name, parsed_args)
+            label, detail = _describe_tool(fn_name, parsed_args, language)
             sid = _new_id()
             _act(label + detail)
             _step(sid, kind="tool", tool=fn_name, title=label.rstrip("…"), detail=detail.strip(), status="running")
 
             sig = fn_name + ":" + json.dumps(parsed_args, sort_keys=True, ensure_ascii=False)[:2000]
-            seen_calls[sig] = seen_calls.get(sig, 0) + 1
+            repeat_after_warning = False
             if parse_error:
                 result = (f"Error: argumen tool '{fn_name}' bukan JSON valid ({parse_error}). "
                           "Kirim ulang dengan JSON valid. Untuk file panjang, tulis per bagian kecil.")
-            elif seen_calls[sig] > _REPEAT_LIMIT:
-                result = (f"Error: panggilan '{fn_name}' dengan argumen identik sudah dijalankan {seen_calls[sig] - 1} kali "
-                          "dan hasilnya tidak akan berubah. JANGAN ulangi. Ganti pendekatan, atau beri jawaban akhir "
-                          "yang jujur berisi hasil dan error aslinya.")
+            elif sig in warned_repeats:
+                # Sudah sekali diperingatkan tapi tetap mengulang hal yang sama persis:
+                # otaknya muter, sudahi putaran ini dengan jawaban akhir.
+                repeat_after_warning = True
+                result = (f"Panggilan '{fn_name}' ini sudah kamu coba sebelumnya dan hasilnya tidak berubah. "
+                          "Berhenti mengulang hal yang sama.")
+            elif sig in seen_calls:
+                # Pertama kali mengulang: ingatkan bahwa hasilnya sudah diketahui,
+                # jangan jalankan ulang — kasih hasil lamanya supaya model bisa lanjut
+                # dengan cara lain, atau langsung menjawab.
+                warned_repeats.add(sig)
+                result = (f"Kamu sudah menjalankan panggilan ini sebelumnya dan hasilnya sama seperti dulu, "
+                          "tidak akan berubah kalau diulang. Jangan ulangi. Coba cara lain, atau beri jawaban "
+                          f"akhir dari apa yang sudah kamu ketahui. Hasil sebelumnya: {_short(seen_calls[sig], 400)}")
             else:
                 result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
+                seen_calls[sig] = str(result)
 
             if isinstance(result, dict) and "__image_payload__" in result:
                 img_fp, q_img = result["__image_payload__"], result["question"]
@@ -1070,7 +1137,18 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
 
             _step(sid, status="done" if ok else "error", output=_short(text_result))
             ran_tools.append((fn_name, detail, ok, text_result))
-            fail_streak = 0 if ok else fail_streak + 1
+            if repeat_after_warning:
+                stuck_reason = f"panggilan '{fn_name}' yang sama diulang setelah diperingatkan"
+            elif not ok:
+                # Gagal itu wajar — yang menandakan mentok adalah gagal dengan CARA YANG SAMA.
+                # Selama errornya berubah-ubah, berarti model sedang mencoba metode lain.
+                err_sig = fn_name + ":" + (text_result.splitlines()[0][:200] if text_result.splitlines() else "")
+                if err_sig == last_error:
+                    stuck_reason = f"tool '{fn_name}' gagal dengan cara yang sama berulang kali"
+                else:
+                    last_error = err_sig
+            else:
+                last_error = None
 
         for img_fp, q_img in pending_images:
             history.append({"role": "user", "content": [
@@ -1078,17 +1156,18 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
                 {"type": "image_url", "image_url": {"url": encode_image_b64(img_fp)}},
             ]})
 
-        if fail_streak >= _FAIL_STREAK_LIMIT:
-            stalled = True
+        if stuck_reason:
             break
 
-    # Langkah habis / macet: minta jawaban akhir TANPA tool, jangan berhenti dengan pesan kosong.
+    # Mentok (mengulang hal yang sama / gagal dengan cara yang sama): minta jawaban
+    # akhir TANPA tool, jangan berhenti dengan pesan kosong.
     final_id = _new_id()
-    _act("Menyusun jawaban akhir…")
-    _step(final_id, kind="thinking", title="Menyusun jawaban akhir…", status="running")
+    _act(strings["final"])
+    _step(final_id, kind="thinking", title=strings["final"], status="running")
     history.append({"role": "user", "content": (
-        "[SISTEM] " + ("Pekerjaan macet karena tool gagal berulang. " if stalled else "Batas langkah tool tercapai. ") +
-        "JANGAN panggil tool lagi. Tulis jawaban akhir sekarang dalam bahasa pengguna: apa yang sudah berhasil, "
+        "[SISTEM] Kamu terlihat berputar di tempat yang sama"
+        + (f" ({stuck_reason})" if stuck_reason else "") +
+        ". Berhenti mencoba hal baru. Tulis jawaban akhir sekarang dalam bahasa pengguna: apa yang sudah berhasil, "
         "apa yang gagal beserta error aslinya, dan saran langkah berikutnya. Jika ada file jadi di "
         "/kaggle/working/out, sertakan marker [[file:...]].")})
     try:
@@ -1098,7 +1177,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, max_steps=AGENT_MAX
     if not final_visible:
         final_visible = _fallback_summary(ran_tools)
     history.append({"role": "assistant", "content": final_visible})
-    _step(final_id, status="done", title="Menyusun jawaban akhir")
+    _step(final_id, status="done", title=strings["final_done"])
     return _append_missing_markers(final_visible, out_before)
 
 
@@ -1302,10 +1381,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             pass
                     def _report_step(step):
                         _post("/agent/local/kaggle-activity", {"activity": step.get("title"), "step": step}, timeout=5)
-                    _post("/agent/local/kaggle-activity", {"activity": "Memahami permintaan…", "reset": True}, timeout=5)
+                    job_strings = _agent_strings(payload.get("language"))
+                    _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
                     answer = run_agent_turn(history, api_url, base_dir, content,
-                                            on_activity=lambda _m: None, on_step=_report_step)
-                    _report_activity("Menyiapkan file dan jawaban…")
+                                            on_activity=lambda _m: None, on_step=_report_step,
+                                            language=payload.get("language"))
+                    _report_activity(job_strings["preparing"])
                     cleaned, attachments = extract_and_deliver(answer or "", session_id)
                     try:
                         _post("/agent/local/kaggle-activity", {"activity": None}, timeout=5)
