@@ -149,8 +149,13 @@ RULES = {
             "'...' or a bare gerund phrase. Never use a card to announce what you are "
             "about to do; do the work first, then show the result. "
             "Rules: one ui block per structure, valid JSON, short text, at most 12 items per "
-            "list. Ordinary prose, explanations, and code still use markdown/code blocks. Do "
-            "not use a ui block for something a single paragraph can explain."
+            "list. Fence rule: put ```ui on its own line, then the JSON on the following "
+            "lines, then ``` on its own line. Never use ```json or any other fence for a ui "
+            "block, and never put the JSON on the same line as ```ui. Inside the JSON, use "
+            "plain text only — never markdown formatting such as **bold**, __underline__, "
+            "`code`, or [links](url). Ordinary prose, explanations, and code still use "
+            "markdown/code blocks. Do not use a ui block for something a single paragraph "
+            "can explain."
         ),
         "id": (
             "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — "
@@ -171,9 +176,13 @@ RULES = {
             "frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan "
             "kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\n"
             "Aturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 "
-            "item per daftar. Prosa biasa, penjelasan, dan kode tetap pakai markdown/code "
-            "block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan "
-            "satu paragraf."
+            "item per daftar. Aturan pagar: tulis ```ui di barisnya sendiri, lalu JSON di "
+            "baris-baris berikutnya, lalu ``` di barisnya sendiri. Jangan pernah pakai "
+            "```json atau pagar lain untuk blok ui, dan jangan taruh JSON di baris yang sama "
+            "dengan ```ui. Di dalam JSON, pakai teks polos saja — jangan pakai format markdown "
+            "seperti **tebal**, __garis bawah__, `kode`, atau [tautan](url). Prosa biasa, "
+            "penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai "
+            "blok ui untuk hal yang cukup dijelaskan dengan satu paragraf."
         ),
     },
     "anti_loop": {
@@ -417,8 +426,8 @@ TOOL_DEFS = [
     {
         "name": "web_image_search",
         "description": {
-            "en": "Search the web for images of something. Returns thumbnail URLs with their source pages. The thumbnails are shown to the user as a strip automatically — describe the results in your answer, do not paste the raw URLs.",
-            "id": "Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya.",
+            "en": "Search the web for images of something. Returns thumbnail URLs with their source pages. The thumbnails are shown to the user as a strip automatically — describe the results in your answer, do not paste the raw URLs. Only say images were found if this tool actually returned thumbnails; if it returned nothing, say no images were found instead of claiming they were.",
+            "id": "Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya. Hanya bilang gambar ditemukan kalau tool ini benar-benar mengembalikan thumbnail; kalau tidak ada hasil, bilang tidak ada gambar yang ditemukan, jangan mengaku sudah menemukannya.",
         },
         "params": {
             "query": _param("string"),
