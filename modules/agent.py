@@ -773,7 +773,7 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             for call in tool_calls:
                 name = str(call["name"])
                 args = call["args"] if isinstance(call["args"], dict) else {}
-                yield f"data: {json.dumps({'type': 'tool_call', 'name': name})}\n\n"
+                yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'detail': agent_shared.tool_detail(name, args)})}\n\n"
                 signature = agent_shared.tool_call_signature(name, args)
                 repeat_after_warning = False
                 if call.get("parse_error"):
@@ -808,7 +808,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                 ok = not agent_shared.is_error_result(result_text)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
                 ran_tools.append((name, "", ok, result_text))
-                yield f"data: {json.dumps({'type': 'tool_result', 'name': name})}\n\n"
+                preview = result_text if len(result_text) <= 1500 else result_text[:1500] + "…"
+                yield f"data: {json.dumps({'type': 'tool_result', 'name': name, 'output': preview})}\n\n"
                 if repeat_after_warning:
                     stuck_reason = f"the same '{name}' call repeated after a warning"
                 elif not ok:

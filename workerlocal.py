@@ -161,7 +161,7 @@ TOOL_CALL_SIG_LIMIT = 2000
 TOOL_REPEAT_PREVIEW_CHARS = 400
 TOOL_ERROR_SIG_CHARS = 200
 
-SHARED_RULES_ID = {'how_you_talk': 'CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.', 'know_user': 'KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.', 'greet_first': 'SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.', 'topic': 'TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya.', 'typos': 'TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: "saya anggap maksudmu X"). Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, kirim sesuatu, ubah data).', 'rich_ui': 'RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.', 'anti_loop': 'ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — jangan memeriksa berulang-ulang.', 'deliver_files': "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). Jangan menempelkan isi file besar ke chat sebagai gantinya.\nATURAN KERAS SOAL PENGIRIMAN FILE:\n- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu marker folder untuk semuanya sekaligus).\n- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'.\n- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\nJika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan dari titik itu di jawaban berikutnya."}
+SHARED_RULES_ID = {'how_you_talk': 'CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.', 'know_user': 'KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.', 'greet_first': 'SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.', 'topic': "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya. Kalau pesan terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', 'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan apa selanjutnya. Kalau jawabannya sudah ada di percakapan ini, jawab dari situ, jangan menjalankan tool yang sama lagi.", 'typos': 'TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: "saya anggap maksudmu X"). Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, kirim sesuatu, ubah data).', 'rich_ui': 'RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nPilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi nyata, jangan status \'lagi mengerjakan\', jangan body yang berakhir \'...\' atau frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.', 'anti_loop': 'ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — jangan memeriksa berulang-ulang. Kalau kamu bilang akan menjalankan perintah, panggil tool-nya dulu sebelum menjawab — jangan mengganti hasil dengan kartu status.', 'deliver_files': "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). Jangan menempelkan isi file besar ke chat sebagai gantinya.\nATURAN KERAS SOAL PENGIRIMAN FILE:\n- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu marker folder untuk semuanya sekaligus).\n- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'.\n- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\nJika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan dari titik itu di jawaban berikutnya."}
 SHARED_RULE_ORDER_ID = ['topic', 'how_you_talk', 'greet_first', 'typos', 'know_user', 'rich_ui', 'anti_loop', 'deliver_files']
 
 def _shared_rules_text():
@@ -275,6 +275,31 @@ def clip_tool_result(text, lang):
         note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
         return text[:TOOL_RESULT_LIMIT] + note
     return text
+
+def tool_detail(name, args):
+    """Short human-readable detail for one tool call, shown in the Process
+    block next to the step title (and as the terminal line for run_bash).
+    Only the argument that identifies the call — never file contents.
+    Kept to 200 chars: the frontend keeps at most 200 chars of detail."""
+    if not isinstance(args, dict):
+        args = {}
+    if name == "run_bash":
+        cmd = str(args.get("command") or "")
+        if not cmd:
+            return ""
+        return f" ({cmd[:200]}…)" if len(cmd) > 200 else f" ({cmd})"
+    if name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
+        p = str(args.get("path") or "")
+        if p:
+            return f" ({p.rsplit('/', 1)[-1] or p})"
+        return ""
+    if name in ("web_search", "web_image_search"):
+        q = str(args.get("query") or "")[:60]
+        return f" “{q}”" if q else ""
+    if name == "web_fetch":
+        u = str(args.get("url") or "")[:70]
+        return f" ({u})" if u else ""
+    return ""
 
 def search_image_urls(text, limit=6):
     """Pull thumbnail URLs out of a web_image_search result. The worker emits
@@ -1179,24 +1204,9 @@ def _split_thinking(message):
 def _describe_tool(fn_name, args, language="id"):
     strings = _agent_strings(language)
     label = strings["tools"].get(fn_name, f"{strings['running_tool']} {fn_name}…")
-    detail = ""
-    if fn_name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
-        p = str(args.get("path") or "")
-        if p:
-            detail = f" ({p.rsplit('/', 1)[-1] or p})"
-    elif fn_name == "run_bash":
-        full = str(args.get("command") or "")
-        if full:
-            detail = f" ({full[:60]}…)" if len(full) > 60 else f" ({full})"
-    elif fn_name == "web_search":
-        q = str(args.get("query") or "")[:60]
-        if q:
-            detail = f" “{q}”"
-    elif fn_name == "web_fetch":
-        u = str(args.get("url") or "")[:70]
-        if u:
-            detail = f" ({u})"
-    return label, detail
+    # Detail-nya dari helper shared (agent_shared.tool_detail) supaya cloud
+    # dan worker menampilkan perintah yang sama persis.
+    return label, tool_detail(fn_name, args)
 
 
 def _snapshot_out():
@@ -1502,7 +1512,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
                 ok = not is_error_result(text_result)
 
-            _step(sid, status="done" if ok else "error", output=_short(text_result))
+            _step(sid, status="done" if ok else "error", output=_short(text_result, 2000))
             ran_tools.append((fn_name, detail, ok, text_result))
             if repeat_after_warning:
                 stuck_reason = f"panggilan '{fn_name}' yang sama diulang setelah diperingatkan"

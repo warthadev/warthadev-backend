@@ -92,14 +92,24 @@ RULES = {
         "en": (
             "TOPIC: the latest user message is the active topic. If the user switches "
             "topic, follow the new topic and do not return to the old one unless asked. "
-            "Earlier messages are only context. Do not repeat words or phrases."
+            "Earlier messages are only context. Do not repeat words or phrases. If the "
+            "latest message has no new request at all (a greeting, 'take your time', "
+            "'ok', 'go on', or similar filler), do NOT resume the previous task and do "
+            "NOT run any tool again — answer with one short sentence, or ask what is "
+            "next. If the answer is already in this conversation, answer from it "
+            "instead of running the same tool again."
         ),
         "id": (
             "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau "
             "user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke "
             "topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, "
             "bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; "
-            "kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya."
+            "kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya. Kalau pesan "
+            "terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', "
+            "'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN "
+            "menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan "
+            "apa selanjutnya. Kalau jawabannya sudah ada di percakapan ini, jawab dari "
+            "situ, jangan menjalankan tool yang sama lagi."
         ),
     },
     "typos": {
@@ -124,7 +134,7 @@ RULES = {
             "RICH UI: for structure, flows, comparisons, timelines, data, or steps, do not "
             "rely on markdown alone. Send a ```ui fenced block containing ONE valid JSON "
             "object (nothing else inside the block). Available types: card "
-            "{\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap\",\"title\":\"..\",\"body\":\"..\"}; "
+            "{\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server\",\"title\":\"..\",\"body\":\"..\"}; "
             "steps {\"type\":\"steps\",\"title\":\"..\",\"items\":[{\"title\":\"..\",\"text\":\"..\"}]}; "
             "flow {\"type\":\"flow\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"text\":\"..\"}]}; "
             "timeline {\"type\":\"timeline\",\"title\":\"..\",\"items\":[{\"date\":\"..\",\"title\":\"..\",\"text\":\"..\"}]}; "
@@ -132,6 +142,12 @@ RULES = {
             "chart {\"type\":\"chart\",\"title\":\"..\",\"labels\":[\"..\"],\"values\":[numbers]}; "
             "checklist {\"type\":\"checklist\",\"title\":\"..\",\"items\":[{\"text\":\"..\",\"done\":true}]}; "
             "stats {\"type\":\"stats\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"value\":\"..\",\"note\":\"..\"}]}. "
+            "Choose the type by content: numbers and measurements go in stats or chart, "
+            "never as plain text in a card body; step-by-step procedures go in steps; a "
+            "card is ONE complete highlight — its body must be a finished sentence with "
+            "real information, never a 'working on it' status, never a body that ends in "
+            "'...' or a bare gerund phrase. Never use a card to announce what you are "
+            "about to do; do the work first, then show the result. "
             "Rules: one ui block per structure, valid JSON, short text, at most 12 items per "
             "list. Ordinary prose, explanations, and code still use markdown/code blocks. Do "
             "not use a ui block for something a single paragraph can explain."
@@ -140,7 +156,7 @@ RULES = {
             "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — "
             "jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks "
             "lain di dalam blok). Jenis yang tersedia:\n"
-            "- card: {\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap\",\"title\":\"..\",\"body\":\"..\"} — sorotan/penting/peringatan.\n"
+            "- card: {\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server\",\"title\":\"..\",\"body\":\"..\"} — sorotan/penting/peringatan.\n"
             "- steps: {\"type\":\"steps\",\"title\":\"..\",\"items\":[{\"title\":\"..\",\"text\":\"..\"}]} — langkah berurutan.\n"
             "- flow: {\"type\":\"flow\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"text\":\"..\"}]} — alur/diagram bentuk.\n"
             "- timeline: {\"type\":\"timeline\",\"title\":\"..\",\"items\":[{\"date\":\"..\",\"title\":\"..\",\"text\":\"..\"}]} — urutan waktu.\n"
@@ -148,6 +164,12 @@ RULES = {
             "- chart: {\"type\":\"chart\",\"title\":\"..\",\"labels\":[\"..\"],\"values\":[angka]} — grafik batang data.\n"
             "- checklist: {\"type\":\"checklist\",\"title\":\"..\",\"items\":[{\"text\":\"..\",\"done\":true}]} — daftar centang.\n"
             "- stats: {\"type\":\"stats\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"value\":\"..\",\"note\":\"..\"}]} — angka penting.\n"
+            "Pilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi "
+            "teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card "
+            "adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi "
+            "nyata, jangan status 'lagi mengerjakan', jangan body yang berakhir '...' atau "
+            "frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan "
+            "kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\n"
             "Aturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 "
             "item per daftar. Prosa biasa, penjelasan, dan kode tetap pakai markdown/code "
             "block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan "
@@ -159,13 +181,17 @@ RULES = {
             "ANTI-LOOP: never repeat the exact same tool call. If an approach fails, change "
             "approach or report the original error as the final answer. Once a file is "
             "written, give the final answer with the [[file:...]] marker right away — do "
-            "not keep checking it over and over."
+            "not keep checking it over and over. If you told the user you will run a "
+            "command, call the tool before answering — never answer with a status card "
+            "instead of the result."
         ),
         "id": (
             "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, "
             "ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file "
             "selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — "
-            "jangan memeriksa berulang-ulang."
+            "jangan memeriksa berulang-ulang. Kalau kamu bilang akan menjalankan perintah, "
+            "panggil tool-nya dulu sebelum menjawab — jangan mengganti hasil dengan kartu "
+            "status."
         ),
     },
     "deliver_files": {
@@ -585,6 +611,32 @@ def clip_tool_result(text, lang):
         note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
         return text[:TOOL_RESULT_LIMIT] + note
     return text
+
+
+def tool_detail(name, args):
+    """Short human-readable detail for one tool call, shown in the Process
+    block next to the step title (and as the terminal line for run_bash).
+    Only the argument that identifies the call — never file contents.
+    Kept to 200 chars: the frontend keeps at most 200 chars of detail."""
+    if not isinstance(args, dict):
+        args = {}
+    if name == "run_bash":
+        cmd = str(args.get("command") or "")
+        if not cmd:
+            return ""
+        return f" ({cmd[:200]}…)" if len(cmd) > 200 else f" ({cmd})"
+    if name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
+        p = str(args.get("path") or "")
+        if p:
+            return f" ({p.rsplit('/', 1)[-1] or p})"
+        return ""
+    if name in ("web_search", "web_image_search"):
+        q = str(args.get("query") or "")[:60]
+        return f" “{q}”" if q else ""
+    if name == "web_fetch":
+        u = str(args.get("url") or "")[:70]
+        return f" ({u})" if u else ""
+    return ""
 
 
 def search_image_urls(text, limit=6):

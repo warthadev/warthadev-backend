@@ -42,6 +42,7 @@ HELPER_NAMES = [
     "stuck_final_message",
     "empty_retry_message",
     "clip_tool_result",
+    "tool_detail",
     "search_image_urls",
     "fallback_summary",
     "build_context_note",
