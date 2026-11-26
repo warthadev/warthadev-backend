@@ -192,7 +192,9 @@ RULES = {
             "written, give the final answer with the [[file:...]] marker right away — do "
             "not keep checking it over and over. If you told the user you will run a "
             "command, call the tool before answering — never answer with a status card "
-            "instead of the result."
+            "instead of the result. If the user asked you to DO something, your first "
+            "response must include the tool call — greet briefly if you like, but never "
+            "answer with only a promise to act."
         ),
         "id": (
             "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, "
@@ -200,7 +202,9 @@ RULES = {
             "selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — "
             "jangan memeriksa berulang-ulang. Kalau kamu bilang akan menjalankan perintah, "
             "panggil tool-nya dulu sebelum menjawab — jangan mengganti hasil dengan kartu "
-            "status."
+            "status. Kalau user meminta sesuatu DIKERJAKAN, jawaban pertamamu HARUS "
+            "memanggil tool — boleh sapa sebentar, tapi jangan pernah menjawab hanya dengan "
+            "janji."
         ),
     },
     "deliver_files": {

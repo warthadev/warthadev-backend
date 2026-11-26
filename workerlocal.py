@@ -161,7 +161,7 @@ TOOL_CALL_SIG_LIMIT = 2000
 TOOL_REPEAT_PREVIEW_CHARS = 400
 TOOL_ERROR_SIG_CHARS = 200
 
-SHARED_RULES_ID = {'how_you_talk': 'CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.', 'know_user': 'KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.', 'greet_first': 'SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.', 'topic': "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya. Kalau pesan terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', 'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan apa selanjutnya. Kalau jawabannya sudah ada di percakapan ini, jawab dari situ, jangan menjalankan tool yang sama lagi.", 'typos': 'TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: "saya anggap maksudmu X"). Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, kirim sesuatu, ubah data).', 'rich_ui': 'RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nPilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi nyata, jangan status \'lagi mengerjakan\', jangan body yang berakhir \'...\' atau frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Aturan pagar: tulis ```ui di barisnya sendiri, lalu JSON di baris-baris berikutnya, lalu ``` di barisnya sendiri. Jangan pernah pakai ```json atau pagar lain untuk blok ui, dan jangan taruh JSON di baris yang sama dengan ```ui. Di dalam JSON, pakai teks polos saja — jangan pakai format markdown seperti **tebal**, __garis bawah__, `kode`, atau [tautan](url). Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.', 'anti_loop': 'ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — jangan memeriksa berulang-ulang. Kalau kamu bilang akan menjalankan perintah, panggil tool-nya dulu sebelum menjawab — jangan mengganti hasil dengan kartu status.', 'deliver_files': "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). Jangan menempelkan isi file besar ke chat sebagai gantinya.\nATURAN KERAS SOAL PENGIRIMAN FILE:\n- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu marker folder untuk semuanya sekaligus).\n- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'.\n- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\nJika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan dari titik itu di jawaban berikutnya.", 'manage_files': 'KELOLA FILE — AKSES KOMPUTER PENUH: kamu berjalan di komputer Linux beneran (worker GPU Kaggle). Workspace kamu /kaggle/working — semua kerja file di sana, dan kamu bisa memakai seluruh mesin lewat run_bash (shell, python, zip, cek disk, install yang tidak butuh password). Operasi file: delete_path menghapus file atau seluruh folder, move_path memindah atau me-rename, write_file/patch_file membuat atau mengedit, list_dir memeriksa. SEBELUM menghapus, memindah, atau menyebut isi sebuah folder, SELALU panggil list_dir dulu dan tunjukkan hasil list beneran — jangan pernah mengarang nama file dari riwayat chat. Hapus dan pindah hanya berlaku di dalam workspace; jangan pernah menghapus atau memindah apa pun di luar itu, dan jangan pernah menghapus workspace itu sendiri. Kalau target user ambigu (file yang mana? folder yang mana?), tanya sekali; begitu user menyebut targetnya, langsung kerjakan — jangan tanya lagi. Setelah berubah, laporkan persis apa yang dihapus, dipindah, atau dibuat. Untuk hal lain di komputer (kompres folder, cek ruang disk, jalanin script, install paket), pakai run_bash dengan perintah yang tepat dan tunjukkan outputnya.'}
+SHARED_RULES_ID = {'how_you_talk': 'CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.', 'know_user': 'KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.', 'greet_first': 'SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.', 'topic': "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya. Kalau pesan terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', 'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan apa selanjutnya. Kalau jawabannya sudah ada di percakapan ini, jawab dari situ, jangan menjalankan tool yang sama lagi.", 'typos': 'TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: "saya anggap maksudmu X"). Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, kirim sesuatu, ubah data).', 'rich_ui': 'RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nPilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi nyata, jangan status \'lagi mengerjakan\', jangan body yang berakhir \'...\' atau frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Aturan pagar: tulis ```ui di barisnya sendiri, lalu JSON di baris-baris berikutnya, lalu ``` di barisnya sendiri. Jangan pernah pakai ```json atau pagar lain untuk blok ui, dan jangan taruh JSON di baris yang sama dengan ```ui. Di dalam JSON, pakai teks polos saja — jangan pakai format markdown seperti **tebal**, __garis bawah__, `kode`, atau [tautan](url). Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.', 'anti_loop': 'ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — jangan memeriksa berulang-ulang. Kalau kamu bilang akan menjalankan perintah, panggil tool-nya dulu sebelum menjawab — jangan mengganti hasil dengan kartu status. Kalau user meminta sesuatu DIKERJAKAN, jawaban pertamamu HARUS memanggil tool — boleh sapa sebentar, tapi jangan pernah menjawab hanya dengan janji.', 'deliver_files': "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). Jangan menempelkan isi file besar ke chat sebagai gantinya.\nATURAN KERAS SOAL PENGIRIMAN FILE:\n- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu marker folder untuk semuanya sekaligus).\n- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'.\n- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\nJika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan dari titik itu di jawaban berikutnya.", 'manage_files': 'KELOLA FILE — AKSES KOMPUTER PENUH: kamu berjalan di komputer Linux beneran (worker GPU Kaggle). Workspace kamu /kaggle/working — semua kerja file di sana, dan kamu bisa memakai seluruh mesin lewat run_bash (shell, python, zip, cek disk, install yang tidak butuh password). Operasi file: delete_path menghapus file atau seluruh folder, move_path memindah atau me-rename, write_file/patch_file membuat atau mengedit, list_dir memeriksa. SEBELUM menghapus, memindah, atau menyebut isi sebuah folder, SELALU panggil list_dir dulu dan tunjukkan hasil list beneran — jangan pernah mengarang nama file dari riwayat chat. Hapus dan pindah hanya berlaku di dalam workspace; jangan pernah menghapus atau memindah apa pun di luar itu, dan jangan pernah menghapus workspace itu sendiri. Kalau target user ambigu (file yang mana? folder yang mana?), tanya sekali; begitu user menyebut targetnya, langsung kerjakan — jangan tanya lagi. Setelah berubah, laporkan persis apa yang dihapus, dipindah, atau dibuat. Untuk hal lain di komputer (kompres folder, cek ruang disk, jalanin script, install paket), pakai run_bash dengan perintah yang tepat dan tunjukkan outputnya.'}
 SHARED_RULE_ORDER_ID = ['topic', 'how_you_talk', 'greet_first', 'typos', 'know_user', 'rich_ui', 'anti_loop', 'deliver_files', 'manage_files']
 
 def _shared_rules_text():
@@ -1454,60 +1454,17 @@ def _fallback_summary(ran_tools):
     return fallback_summary(ran_tools, "id")
 
 
-# Janji tanpa aksi: model kadang menjawab hanya dengan sapaan/kartu "saya akan
-# mencari/menulis..." tanpa memanggil tool sama sekali — lalu giliran dianggap
-# selesai. Nudge sekali per giliran supaya janji itu benar-benar dijalankan.
-# Model 9B lebih sering memakai kata sehari-hari (cari, buat, tulis, cek,
-# "Mari saya...", "Siap, saya...") daripada bentuk formal "akan mencari..." —
-# kedua bentuk harus ketangkap, kalau tidak nudge-nya bolong (kasus Windah:
-# "Mari saya cari gambar..." lolos tanpa nudge).
-_ACTION_VERBS = (
-    "buatkan|buatlah|buatin|bikinin|tampilkan|tampilin|tunjukin|tunjukkan|"
-    "carikan|cariin|cari|cek|cekin|periksa|kirim|kirimin|kirimkan|tuliskan|"
-    "tulis|tulisin|hitung|itung|jalankan|jalanin|buka|bukain|unduh|download|"
-    "list|hapus|hapusin|hapuskan|pindah|pindahin|pindahkan|rename|ubah|edit|"
-    "simpan|simpanin|ambil|ambilin|kompres|zip"
+# Self-check giliran tanpa tool: bukan pola kata — model sendiri yang menilai
+# apakah permintaan user sudah selesai. Sekali per giliran; ronde cek tidak
+# di-stream ke user (isinya cuma vonis singkat, bukan jawaban akhir).
+_SELF_CHECK_MESSAGE = (
+    "Periksa sebentar: apakah permintaan user di atas sudah benar-benar selesai? "
+    "Kalau ada aksi yang diminta user tapi belum kamu jalankan — mencari, menulis "
+    "file, mengecek folder, menghapus, memindah, atau menjalankan perintah — "
+    "jalankan tool yang dibutuhkan SEKARANG, jangan hanya menjawab. Jangan "
+    "melanjutkan tugas lama; periksa HANYA permintaan terakhir user. Kalau memang "
+    "tidak ada aksi yang dibutuhkan, jawab singkat bahwa sudah selesai."
 )
-_ACTION_USER_RE = re.compile(rf"\b({_ACTION_VERBS})\b", re.IGNORECASE)
-# Minta gambar/file/foto tanpa kata kerja ("gambar Prabowo dong") tetap
-# dihitung sebagai permintaan aksi — sisi janji tetap harus cocok juga.
-_ACTION_NOUN_RE = re.compile(
-    r"\b(gambar|foto|file|video)\b.{0,20}\b(dong|tolong|coba|nih|aja)\b"
-    r"|\b(dong|tolong|coba)\b.{0,20}\b(gambar|foto|file|video)\b",
-    re.IGNORECASE,
-)
-_PROMISE_VERBS = (
-    "cari|mencari|carikan|cariin|buat|membuat|buatin|bikin|bikinin|tulis|menulis|"
-    "tulisin|cek|mengecek|cekin|kirim|mengirim|kirimin|hapus|menghapus|hapusin|"
-    "tampil|tampilkan|menampilkan|tampilin|lihat|melihat|liat|unduh|mengunduh|"
-    "hitung|menghitung|itung|jalanin|menjalankan|buka|membuka|bukain|periksa|"
-    "memeriksa|tunjukin|ambil|mengambil|ambilin|simpan|menyimpan|simpanin|"
-    "ubah|mengubah|edit|mengerjakan|kerjain|kerjakan|proses|pindah|memindah|pindahin"
-)
-_PROMISE_INTRO_RE = re.compile(
-    rf"\b(akan|mau|mari|siap|oke|baik)\b.{{0,40}}?\b({_PROMISE_VERBS})\b",
-    re.IGNORECASE,
-)
-_PROMISE_OBJECT_RE = re.compile(
-    rf"\b({_PROMISE_VERBS})\s+(gambar|foto|file|informasi|data|hasil|folder|video|lagu)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_unkept_promise(visible, user_content):
-    """Benar kalau user meminta aksi DAN jawaban model hanya janji untuk
-    melakukannya — tanpa tool apa pun yang jalan di giliran ini. Janji bisa
-    berbentuk formal ("akan mencari...") atau sehari-hari ("Mari saya cari...",
-    "Siap, saya buatin..."). Pola kata-kerja + objek ("Menulis file ...") hanya
-    dicek di awal jawaban — sapaan/janji selalu di depan, sedangkan isi jawaban
-    yang beneran (langkah, tabel) boleh menyebut kata yang sama di belakang."""
-    if not visible or not user_content:
-        return False
-    if not (_ACTION_USER_RE.search(user_content) or _ACTION_NOUN_RE.search(user_content)):
-        return False
-    if _PROMISE_INTRO_RE.search(visible):
-        return True
-    return bool(_PROMISE_OBJECT_RE.search(visible[:300]))
 
 
 def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None):
@@ -1537,7 +1494,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     def _stream_call(with_tools):
         segment["n"] += 1
         seg = segment["n"]
-        if on_token is None:
+        if on_token is None or check_round:
             return _llm_call(api_url, history, with_tools=with_tools)
         return _llm_call(api_url, history, with_tools=with_tools,
                          on_token=lambda d: on_token(d, seg))
@@ -1555,7 +1512,9 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     ran_tools = []        # (nama tool, detail, ok, preview)
     last_error = None     # signature error terakhir, untuk mengenali jalan buntu yang sama
     empty_retry = False
-    promise_retry = False  # nudge janji-tanpa-aksi, sekali per giliran
+    self_check_done = False  # self-check giliran tanpa tool, sekali per giliran
+    pending_first_visible = None  # jawaban pertama yang ditahan selama self-check
+    check_round = False  # ronde saat ini adalah ronde self-check (jangan di-stream)
     stuck_reason = None
     opening_sent = False  # sapaan pembuka dikirim sekali, sebelum tool pertama jalan
     total_tokens = 0       # akumulasi total_tokens dari semua panggilan model di jawaban ini
@@ -1599,8 +1558,20 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
+        check_round = False
         visible, thought = _split_thinking(message)
         tool_calls = message.get("tool_calls") or []
+
+        if tool_calls and pending_first_visible and not opening_sent:
+            # Jawaban pertama tadi adalah sapaannya — kirim sebagai opening,
+            # baru tool jalan. Vonis ronde cek sendiri bukan sapaan.
+            opening_sent = True
+            if on_opening:
+                try:
+                    on_opening(pending_first_visible.strip()[:600])
+                except Exception:
+                    pass
+            pending_first_visible = None
 
         if tool_calls and visible and not opening_sent:
             # Sapa dulu sebelum bertindak: kirim isi jawaban pertama model sebagai
@@ -1619,29 +1590,21 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 history.append({"role": "assistant", "content": ""})
                 history.append({"role": "user", "content": empty_retry_message("id")})
                 continue
-            if (
-                not ran_tools
-                and not promise_retry
-                and _looks_like_unkept_promise(visible, user_content)
-            ):
-                # Janji tanpa aksi: jangan jadikan ini jawaban akhir. Kirim
-                # sapaan seperti biasa, lalu dorong model satu ronde lagi
-                # untuk benar-benar memanggil tool-nya.
-                promise_retry = True
-                if visible and not opening_sent:
-                    opening_sent = True
-                    if on_opening:
-                        try:
-                            on_opening(visible.strip()[:600])
-                        except Exception:
-                            pass
+            if pending_first_visible is not None:
+                # Ronde self-check selesai tanpa tool: model menilai permintaan
+                # sudah selesai — jawaban pertama tadi yang jadi jawaban akhir,
+                # bukan vonis singkatnya.
+                visible = pending_first_visible
+                pending_first_visible = None
+            elif not ran_tools and not self_check_done and visible:
+                # Giliran ini belum menjalankan tool sama sekali. Tahan jawaban
+                # pertama, tanya model sekali apakah permintaan user sudah
+                # benar-benar selesai — vonisnya yang menentukan, bukan pola kata.
+                self_check_done = True
+                pending_first_visible = visible
+                check_round = True
                 history.append({"role": "assistant", "content": visible})
-                history.append({"role": "user", "content": (
-                    "Lanjutkan sekarang juga: jalankan tool yang kamu janjikan "
-                    "(cari di web, tulis file, cek folder, atau jalankan perintah) "
-                    "— jangan hanya mengumumkannya sebagai kartu atau langkah. "
-                    "Kalau kamu masih butuh info dari user dulu, tanyakan saja."
-                )})
+                history.append({"role": "user", "content": _SELF_CHECK_MESSAGE})
                 continue
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
