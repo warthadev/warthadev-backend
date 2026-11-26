@@ -417,17 +417,37 @@ def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | li
 
 def _build_context_note(context: dict[str, Any] | None) -> str | None:
     """[CURRENT CONTEXT] note — the cloud twin of the Kaggle worker's
-    [KONTEKS SAAT INI]: the user's own time/zone plus where this backend runs,
-    so the cloud agent knows its own region and the user's region, time, date."""
+    [KONTEKS SAAT INI]: who the user is, where they are, and their real
+    time/date right now, plus where this backend runs, so the cloud agent
+    knows the user from the start and can answer time, date, and place
+    questions. The user asked for this explicitly: the agent must know
+    their name and location from the first message."""
     if not isinstance(context, dict):
         return None
     local_time = str(context.get("local_time") or "").strip()
     timezone = str(context.get("timezone") or "").strip()
-    if not local_time and not timezone:
+    date_str = str(context.get("date") or "").strip()
+    time_str = str(context.get("time") or "").strip()
+    user_name = str(context.get("user_name") or "").strip()
+    user_location = str(context.get("user_location") or "").strip()
+    if not local_time and not timezone and not date_str and not time_str and not user_name and not user_location:
         return None
     parts = ["[CURRENT CONTEXT]"]
-    if local_time:
-        parts.append(f"User's local time right now: {local_time}" + (f" ({timezone})" if timezone else "") + ".")
+    if user_name:
+        parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
+    if user_location:
+        parts.append(f"The user is in {user_location}.")
+    if date_str or time_str or local_time:
+        when = "Right now it is "
+        if date_str:
+            when += date_str
+        if time_str:
+            when += (", " if date_str else "") + time_str
+        elif local_time:
+            when += local_time
+        if timezone:
+            when += f" ({timezone})"
+        parts.append(when + ".")
     elif timezone:
         parts.append(f"User's timezone: {timezone}.")
     parts.append("Backend runs in Oregon, USA. Use this for time, date, and place questions; do not guess the user's city from the timezone alone.")
