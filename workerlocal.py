@@ -495,12 +495,19 @@ def _search_openverse_images(query, max_results=6):
         data = json.loads(r.read().decode("utf-8", errors="ignore"))
     out = []
     for item in (data.get("results") or [])[:max_results]:
-        thumb = (item.get("thumbnail") or "").strip()
+        # JANGAN pakai `thumbnail` Openverse: itu URL proxy
+        # api.openverse.org/.../thumb/ yang merender ulang lewat i0.wp.com —
+        # terbukti 2026-11-26: 6/6 balikin HTTP 424 "Failed to render
+        # thumbnail", jadi strip gambar di chat kosong total (frontend
+        # menyembunyikan tiap <img> yang gagal load). URL gambar langsung
+        # (`url`, mis. upload.wikimedia.org) dicek langsung: HTTP 200.
+        direct = (item.get("url") or "").strip()
+        thumb = direct or (item.get("thumbnail") or "").strip()
         if not thumb:
             continue
         out.append({"title": (item.get("title") or "").strip(),
                     "thumbnail": thumb,
-                    "image": (item.get("url") or "").strip(),
+                    "image": direct,
                     "url": (item.get("foreign_landing_url") or "").strip()})
     return out
 
@@ -1227,12 +1234,43 @@ def _snapshot_out():
     return snap
 
 
-def _append_missing_markers(answer, before):
-    """File baru/berubah di /kaggle/working/out yang lupa diberi marker tetap dikirim ke chat."""
-    answer = answer or ""
+_TOOL_CALL_TAG_RE = re.compile(r"</?(?:tool_call|function|parameter)(?:\s[^>]*|=[^>]*)?>", re.IGNORECASE)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL | re.IGNORECASE)
+_JUNK_FENCE_RE = re.compile(r"```(?:\w+)?[ \t]*\r?\n?\s*(?:undefined|null|None)\s*```", re.IGNORECASE)
+
+
+def _clean_final_text(answer):
+    """Bersihkan jawaban akhir dari sampah yang model Local selipkan di tiap
+    giliran (terbukti di screenshot 2026-11-26: blok hitam ```undefined```
+    + bubble `</parameter> </function> </tool_call>` muncul di SEMUA jawaban
+    Local — gambar kucing, bikin file, kirim file). Dipakai di semua jalur
+    return run_agent_turn supaya teks yang tersimpan di chat sudah bersih;
+    token yang sudah ter-streaming live tidak bisa ditarik lagi, tapi pesan
+    final yang menetap di riwayat jadi benar."""
+    text = answer or ""
+    text = _TOOL_CALL_BLOCK_RE.sub("", text)
+    text = _TOOL_CALL_TAG_RE.sub("", text)
+    text = _JUNK_FENCE_RE.sub("", text)
+    # Baris yang isinya hanya "undefined" (di luar pagar) juga bukan jawaban.
+    lines = [ln for ln in text.split("\n") if ln.strip().lower() != "undefined"]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _append_missing_markers(answer, before, written=None):
+    """File baru/berubah di /kaggle/working/out yang lupa diberi marker tetap dikirim ke chat.
+    `written`: file yang ditulis tool write_file di giliran ini (di luar out/,
+    mis. /kaggle/working/file1.txt saat user minta file di workspace) — ikut
+    ditempeli marker supaya "kirim 4 file" benar-benar mengirim, bukan cuma
+    kartu yang mengklaim sudah siap."""
+    answer = _clean_final_text(answer or "")
     after = _snapshot_out()
     changed = [p for p, mtime in after.items() if before.get(p) != mtime]
     missing = [p for p in changed if p not in answer]
+    for p in written or []:
+        if p not in answer and p not in missing and os.path.isfile(p):
+            missing.append(p)
     if not missing:
         return answer
     if len(missing) > 8:
@@ -1379,6 +1417,9 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     # supaya pengulangan bisa dikenali dari polanya, bukan dari angkanya.
     seen_calls = {}       # signature panggilan identik -> hasil terakhirnya
     warned_repeats = set()  # signature yang sudah sekali diperingatkan karena diulang
+    last_tool_sig = None  # signature tool terakhir — anti-ulang hanya berlaku
+    # untuk panggilan identik yang BERURUTAN (lihat di bawah).
+    written_files: list[str] = []  # file yang ditulis write_file di giliran ini
     ran_tools = []        # (nama tool, detail, ok, preview)
     last_error = None     # signature error terakhir, untuk mengenali jalan buntu yang sama
     empty_retry = False
@@ -1448,7 +1489,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
             _report_tokens()
-            return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before)
+            return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before, written_files)
 
         # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
         for tc in tool_calls:
@@ -1480,18 +1521,23 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             repeat_after_warning = False
             if parse_error:
                 result = invalid_args_message(fn_name, parse_error, "id")
-            elif sig in warned_repeats:
+            elif sig == last_tool_sig and sig in warned_repeats:
                 # Sudah sekali diperingatkan tapi tetap mengulang hal yang sama persis:
                 # otaknya muter, sudahi putaran ini dengan jawaban akhir.
                 repeat_after_warning = True
                 result = repeat_stop_message(fn_name, "id")
-            elif sig in seen_calls:
+            elif sig == last_tool_sig and sig in seen_calls:
                 # Pertama kali mengulang: ingatkan bahwa hasilnya sudah diketahui,
                 # jangan jalankan ulang — kasih hasil lamanya supaya model bisa lanjut
                 # dengan cara lain, atau langsung menjawab.
                 warned_repeats.add(sig)
                 result = repeat_warning(seen_calls[sig], "id")
             else:
+                # Anti-ulang hanya untuk panggilan identik BERURUTAN. Panggilan
+                # sama yang muncul lagi SETELAH tool lain (mis. list_dir sesudah
+                # write_file) adalah pengecekan ulang yang sah dan harus
+                # mengembalikan hasil segar — terbukti 2026-11-26: turn "cek apa
+                # ada 4 file" malah dapat teks peringatan, bukan isi folder.
                 result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
                 seen_calls[sig] = str(result)
                 # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
@@ -1500,6 +1546,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                     for url in search_image_urls(str(result)):
                         if url not in search_images_out and len(search_images_out) < 6:
                             search_images_out.append(url)
+            last_tool_sig = sig
 
             if isinstance(result, dict) and "__image_payload__" in result:
                 img_fp, q_img = result["__image_payload__"], result["question"]
@@ -1514,6 +1561,13 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
 
             _step(sid, status="done" if ok else "error", output=_short(text_result, 2000))
             ran_tools.append((fn_name, detail, ok, text_result))
+            if fn_name == "write_file" and ok:
+                _wp = parsed_args.get("path") if isinstance(parsed_args, dict) else None
+                if isinstance(_wp, str) and _wp.strip():
+                    _ap = os.path.normpath(_wp if os.path.isabs(_wp)
+                                           else os.path.join(base_dir, _wp))
+                    if _ap not in written_files:
+                        written_files.append(_ap)
             if repeat_after_warning:
                 stuck_reason = f"panggilan '{fn_name}' yang sama diulang setelah diperingatkan"
             elif not ok:
@@ -1560,7 +1614,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     history.append({"role": "assistant", "content": final_visible})
     _step(final_id, status="done", title=strings["final_done"])
     _report_tokens()
-    return _append_missing_markers(final_visible, out_before)
+    return _append_missing_markers(final_visible, out_before, written_files)
 
 
 def run_workspace_job(op, payload, base_dir):
