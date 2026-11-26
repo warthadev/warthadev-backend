@@ -1378,6 +1378,31 @@ def _fallback_summary(ran_tools):
     return fallback_summary(ran_tools, "id")
 
 
+# Janji tanpa aksi: model kadang menjawab hanya dengan sapaan/kartu "saya akan
+# mencari/menulis..." tanpa memanggil tool sama sekali — lalu giliran dianggap
+# selesai. Nudge sekali per giliran supaya janji itu benar-benar dijalankan.
+_ACTION_USER_RE = re.compile(
+    r"\b(buatkan|buatlah|buatin|tampilkan|tunjukin|tunjukkan|carikan|cari|cek|periksa|"
+    r"kirim|kirimkan|tuliskan|tulis|hitung|jalankan|buka|unduh|download|list)\b",
+    re.IGNORECASE,
+)
+_PROMISE_RE = re.compile(
+    r"\b(akan|mau)\s+\w*\s*(mencari|membuat|menulis|mengecek|menampilkan|mengirim|"
+    r"menghitung|menjalankan|memeriksa|membuka|mengunduh)\b"
+    r"|\b(menulis|membuat|mencari|mengirim|mengecek|menampilkan)\s+"
+    r"(file|gambar|informasi|data|hasil)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unkept_promise(visible, user_content):
+    """Benar kalau user meminta aksi DAN jawaban model hanya janji untuk
+    melakukannya — tanpa tool apa pun yang jalan di giliran ini."""
+    if not visible or not user_content:
+        return False
+    return bool(_ACTION_USER_RE.search(user_content) and _PROMISE_RE.search(visible))
+
+
 def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None):
     strings = _agent_strings(language)
     def _act(msg):
@@ -1423,6 +1448,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     ran_tools = []        # (nama tool, detail, ok, preview)
     last_error = None     # signature error terakhir, untuk mengenali jalan buntu yang sama
     empty_retry = False
+    promise_retry = False  # nudge janji-tanpa-aksi, sekali per giliran
     stuck_reason = None
     opening_sent = False  # sapaan pembuka dikirim sekali, sebelum tool pertama jalan
     total_tokens = 0       # akumulasi total_tokens dari semua panggilan model di jawaban ini
@@ -1485,6 +1511,30 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 empty_retry = True
                 history.append({"role": "assistant", "content": ""})
                 history.append({"role": "user", "content": empty_retry_message("id")})
+                continue
+            if (
+                not ran_tools
+                and not promise_retry
+                and _looks_like_unkept_promise(visible, user_content)
+            ):
+                # Janji tanpa aksi: jangan jadikan ini jawaban akhir. Kirim
+                # sapaan seperti biasa, lalu dorong model satu ronde lagi
+                # untuk benar-benar memanggil tool-nya.
+                promise_retry = True
+                if visible and not opening_sent:
+                    opening_sent = True
+                    if on_opening:
+                        try:
+                            on_opening(visible.strip()[:600])
+                        except Exception:
+                            pass
+                history.append({"role": "assistant", "content": visible})
+                history.append({"role": "user", "content": (
+                    "Lanjutkan sekarang juga: jalankan tool yang kamu janjikan "
+                    "(cari di web, tulis file, cek folder, atau jalankan perintah) "
+                    "— jangan hanya mengumumkannya sebagai kartu atau langkah. "
+                    "Kalau kamu masih butuh info dari user dulu, tanyakan saja."
+                )})
                 continue
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
