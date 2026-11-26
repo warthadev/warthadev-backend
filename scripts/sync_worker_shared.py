@@ -27,7 +27,7 @@ WORKER_PATH = os.path.join(REPO, "workerlocal.py")
 
 # Worker's rule order in build_system_prompt (same rules as the cloud, the
 # order the worker's prompt was already built in).
-WORKER_RULE_ORDER = ["topic", "how_you_talk", "greet_first", "typos", "know_user", "rich_ui", "anti_loop", "deliver_files"]
+WORKER_RULE_ORDER = ["topic", "how_you_talk", "greet_first", "typos", "know_user", "rich_ui", "anti_loop", "deliver_files", "manage_files"]
 
 # Policy helpers copied verbatim (source) from agent_shared — they only use
 # json/re/time plus the constants below, so they run standalone in the worker.

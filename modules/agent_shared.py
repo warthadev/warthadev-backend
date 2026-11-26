@@ -258,10 +258,46 @@ RULES = {
             "berhenti lalu lanjutkan dari titik itu di jawaban berikutnya."
         ),
     },
+    "manage_files": {
+        "en": (
+            "MANAGE FILES — FULL COMPUTER ACCESS: you run on a real Linux computer (a Kaggle "
+            "GPU worker). Your workspace is /kaggle/working — all file work happens there, "
+            "and you can use the whole machine through run_bash (shell, python, zip, disk "
+            "checks, installs that need no password). File operations: delete_path deletes "
+            "a file or a whole folder, move_path moves or renames, write_file/patch_file "
+            "create or edit, list_dir inspects. BEFORE deleting, moving, or claiming what a "
+            "folder contains, ALWAYS call list_dir on it first and show the real listing — "
+            "never invent file names from conversation history. Deletions and moves only "
+            "work inside the workspace; never delete or move anything outside it, and never "
+            "delete the workspace itself. If the user's target is ambiguous (which files? "
+            "which folder?), ask once; once the user names the target, act immediately — do "
+            "not ask again. After the change, report exactly what was deleted, moved, or "
+            "created. For anything else on the computer (compress a folder, check disk "
+            "space, run a script, install a package), use run_bash with the exact command "
+            "and show its output."
+        ),
+        "id": (
+            "KELOLA FILE — AKSES KOMPUTER PENUH: kamu berjalan di komputer Linux beneran "
+            "(worker GPU Kaggle). Workspace kamu /kaggle/working — semua kerja file di sana, "
+            "dan kamu bisa memakai seluruh mesin lewat run_bash (shell, python, zip, cek disk, "
+            "install yang tidak butuh password). Operasi file: delete_path menghapus file atau "
+            "seluruh folder, move_path memindah atau me-rename, write_file/patch_file membuat "
+            "atau mengedit, list_dir memeriksa. SEBELUM menghapus, memindah, atau menyebut isi "
+            "sebuah folder, SELALU panggil list_dir dulu dan tunjukkan hasil list beneran — "
+            "jangan pernah mengarang nama file dari riwayat chat. Hapus dan pindah hanya "
+            "berlaku di dalam workspace; jangan pernah menghapus atau memindah apa pun di luar "
+            "itu, dan jangan pernah menghapus workspace itu sendiri. Kalau target user ambigu "
+            "(file yang mana? folder yang mana?), tanya sekali; begitu user menyebut targetnya, "
+            "langsung kerjakan — jangan tanya lagi. Setelah berubah, laporkan persis apa yang "
+            "dihapus, dipindah, atau dibuat. Untuk hal lain di komputer (kompres folder, cek "
+            "ruang disk, jalanin script, install paket), pakai run_bash dengan perintah yang "
+            "tepat dan tunjukkan outputnya."
+        ),
+    },
 }
 
 # Order the rules appear in each side's system prompt (same rules, same order).
-RULE_ORDER = ["how_you_talk", "know_user", "greet_first", "topic", "typos", "rich_ui", "anti_loop", "deliver_files"]
+RULE_ORDER = ["how_you_talk", "know_user", "greet_first", "topic", "typos", "rich_ui", "anti_loop", "deliver_files", "manage_files"]
 
 
 def rules_text(lang, order=RULE_ORDER, sep="\n\n"):
@@ -401,6 +437,29 @@ TOOL_DEFS = [
         "required": ["path", "content"],
     },
     {
+        "name": "delete_path",
+        "description": {
+            "en": "Delete a file or an entire folder on the Kaggle worker disk. Only works inside the workspace (/kaggle/working); the workspace itself cannot be deleted. Always call list_dir on the target first.",
+            "id": "Menghapus file atau seluruh folder di disk worker Kaggle. Hanya berlaku di dalam workspace (/kaggle/working); workspace itu sendiri tidak bisa dihapus. Selalu panggil list_dir dulu ke targetnya.",
+        },
+        "params": {
+            "path": _param("string", "File or folder to delete, e.g. /kaggle/working/out/old.txt", "File atau folder yang dihapus, misal /kaggle/working/out/lama.txt"),
+        },
+        "required": ["path"],
+    },
+    {
+        "name": "move_path",
+        "description": {
+            "en": "Move or rename a file or folder on the Kaggle worker disk. Source and destination must both be inside the workspace (/kaggle/working).",
+            "id": "Memindah atau me-rename file atau folder di disk worker Kaggle. Sumber dan tujuan harus di dalam workspace (/kaggle/working).",
+        },
+        "params": {
+            "path": _param("string", "File or folder to move, e.g. /kaggle/working/out/a.txt", "File atau folder yang dipindah, misal /kaggle/working/out/a.txt"),
+            "destination": _param("string", "New location, e.g. /kaggle/working/archive/a.txt", "Lokasi baru, misal /kaggle/working/arsip/a.txt"),
+        },
+        "required": ["path", "destination"],
+    },
+    {
         "name": "run_bash",
         "description": {
             "en": "Run a non-interactive shell command on this Kaggle kernel.",
@@ -483,7 +542,7 @@ TOOL_DEFS = [
 
 
 def tools_for(lang):
-    """The 9 tool schemas in OpenAI function-call shape, in the given language."""
+    """The 12 tool schemas in OpenAI function-call shape, in the given language."""
     out = []
     for tool in TOOL_DEFS:
         properties = {}
@@ -634,7 +693,15 @@ def tool_detail(name, args):
         if not cmd:
             return ""
         return f" ({cmd[:200]}…)" if len(cmd) > 200 else f" ({cmd})"
-    if name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image"):
+    if name == "move_path":
+        src = str(args.get("path") or "").rsplit("/", 1)[-1]
+        dst = str(args.get("destination") or "").rsplit("/", 1)[-1]
+        if src and dst:
+            return f" ({src} → {dst})"
+        if src:
+            return f" ({src})"
+        return ""
+    if name in ("list_dir", "read_file", "write_file", "patch_file", "read_document", "inspect_image", "delete_path"):
         p = str(args.get("path") or "")
         if p:
             return f" ({p.rsplit('/', 1)[-1] or p})"
