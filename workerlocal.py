@@ -169,7 +169,7 @@ def _shared_rules_text():
     separator — exactly how the worker prompt was already built."""
     return "\n".join(SHARED_RULES_ID[name] for name in SHARED_RULE_ORDER_ID)
 
-TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}]
+TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_image_search', 'description': 'Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}]
 
 def _short_preview(text, limit, lang):
     """Truncate a preview the way the worker's _short does: strip, then cap with
@@ -275,6 +275,24 @@ def clip_tool_result(text, lang):
         note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
         return text[:TOOL_RESULT_LIMIT] + note
     return text
+
+def search_image_urls(text, limit=6):
+    """Pull thumbnail URLs out of a web_image_search result. The worker emits
+    one line per image as ``- title | gambar: <thumbnail url> | sumber: <page
+    url>``; the ``gambar:`` marker is the stable handle, whatever the page
+    language is. Deduped, in order, capped — the strip shows at most 6."""
+    if not isinstance(text, str):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in re.findall(r"gambar:\s*(https?://\S+)", text):
+        url = url.rstrip(").,")
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
 
 def fallback_summary(ran_tools, lang):
     """Last resort when the model produces no final text: summarize what the
@@ -406,6 +424,81 @@ def perform_web_search(query, max_results=6):
     if not items:
         return "[PENCARIAN WEB TIDAK MENGHASILKAN DATA VALID]"
     return "\n".join(items[:max_results])
+
+
+def _search_ddg_images(query, max_results=6):
+    """DuckDuckGo image search: ambil token vqd dari halaman hasil, lalu
+    panggil endpoint i.js (JSON). Mengembalikan list dict {title, thumbnail,
+    image, url}. Thumbnail-nya dari CDN Bing (tse*.mm.bing.net) — stabil
+    untuk di-embed langsung di chat."""
+    encoded_q = urllib.parse.urlencode({"q": query, "iax": "images", "ia": "images"})
+    req = urllib.request.Request(f"https://duckduckgo.com/?{encoded_q}", headers=BROWSER_HEADERS)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        page = r.read().decode("utf-8", errors="ignore")
+    m = re.search(r"vqd=['\"]([\d-]+)['\"]", page) or re.search(r"vqd=([\d-]+)", page)
+    if not m:
+        return []
+    params = {"l": "us-en", "o": "json", "q": query, "vqd": m.group(1), "f": ",,,,,", "p": "1", "s": "0"}
+    req2 = urllib.request.Request("https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params),
+                                  headers={**BROWSER_HEADERS,
+                                           "Accept": "application/json, text/javascript, */*; q=0.01",
+                                           "Referer": "https://duckduckgo.com/"})
+    with urllib.request.urlopen(req2, timeout=15) as r2:
+        data = json.loads(r2.read().decode("utf-8", errors="ignore"))
+    out = []
+    for item in (data.get("results") or [])[:max_results]:
+        thumb = (item.get("thumbnail") or "").strip()
+        if not thumb:
+            continue
+        out.append({"title": (item.get("title") or "").strip(),
+                    "thumbnail": thumb,
+                    "image": (item.get("image") or "").strip(),
+                    "url": (item.get("url") or "").strip()})
+    return out
+
+
+def _search_openverse_images(query, max_results=6):
+    """Fallback kalau DuckDuckGo menantang (challenge 202): API resmi
+    Openverse (tanpa key, batas anonim 20/menit) — gambar berlisensi terbuka,
+    thumbnail disajikan langsung oleh api.openverse.org."""
+    url = "https://api.openverse.org/v1/images/?" + urllib.parse.urlencode(
+        {"q": query, "page_size": max_results})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "WarthaSensei/1.0 (personal AI agent)",
+        "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    out = []
+    for item in (data.get("results") or [])[:max_results]:
+        thumb = (item.get("thumbnail") or "").strip()
+        if not thumb:
+            continue
+        out.append({"title": (item.get("title") or "").strip(),
+                    "thumbnail": thumb,
+                    "image": (item.get("url") or "").strip(),
+                    "url": (item.get("foreign_landing_url") or "").strip()})
+    return out
+
+
+def perform_web_image_search(query, max_results=6):
+    try:
+        items = _search_ddg_images(query, max_results=max_results)
+    except Exception as e:
+        items = []
+    if not items:
+        # DuckDuckGo sering menantang IP datacenter (challenge 202, 0 hasil)
+        # — jangan pulang dengan tangan kosong, coba Openverse.
+        try:
+            items = _search_openverse_images(query, max_results=max_results)
+        except Exception as e:
+            items = []
+    if not items:
+        return "[PENCARIAN GAMBAR TIDAK MENGHASILKAN DATA VALID]"
+    lines = []
+    for item in items[:max_results]:
+        title = re.sub(r"\s+", " ", item["title"]).strip() or "(tanpa judul)"
+        lines.append(f"- {title} | gambar: {item['thumbnail']} | sumber: {item['url']}")
+    return "\n".join(lines)
 
 
 # Paket dari dataset media-offline-pkgs. Dipasang ke folder terpisah dengan
@@ -847,6 +940,10 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             q = args["query"]
             return f"HASIL PENCARIAN UNTUK '{q}':\n\n{perform_web_search(q)}"
 
+        if name == "web_image_search":
+            q = args["query"]
+            return f"HASIL PENCARIAN GAMBAR UNTUK '{q}':\n\n{perform_web_image_search(q)}"
+
         if name == "web_fetch":
             req = urllib.request.Request(args["url"], headers=BROWSER_HEADERS)
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -996,6 +1093,7 @@ AGENT_STRINGS = {
             "write_file": "Menulis file…",
             "run_bash": "Menjalankan perintah…",
             "web_search": "Mencari di web…",
+            "web_image_search": "Mencari gambar…",
             "web_fetch": "Mengambil halaman web…",
             "inspect_image": "Menganalisis gambar…",
             "read_document": "Membaca dokumen…",
@@ -1020,6 +1118,7 @@ AGENT_STRINGS = {
             "write_file": "Writing file…",
             "run_bash": "Running command…",
             "web_search": "Searching the web…",
+            "web_image_search": "Searching images…",
             "web_fetch": "Fetching web page…",
             "inspect_image": "Analyzing image…",
             "read_document": "Reading document…",
@@ -1231,7 +1330,7 @@ def _fallback_summary(ran_tools):
     return fallback_summary(ran_tools, "id")
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None):
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None):
     strings = _agent_strings(language)
     def _act(msg):
         if on_activity:
@@ -1385,6 +1484,12 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             else:
                 result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
                 seen_calls[sig] = str(result)
+                # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
+                # di chat (dikirim balik lewat result_body, bukan ditempel di teks).
+                if fn_name == "web_image_search" and search_images_out is not None:
+                    for url in search_image_urls(str(result)):
+                        if url not in search_images_out and len(search_images_out) < 6:
+                            search_images_out.append(url)
 
             if isinstance(result, dict) and "__image_payload__" in result:
                 img_fp, q_img = result["__image_payload__"], result["question"]
@@ -1697,11 +1802,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         history = synced
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
                     _cancel_event.clear()
+                    search_images: list[str] = []
                     answer = run_agent_turn(history, api_url, base_dir, content,
                                             on_activity=lambda _m: None, on_step=_report_step,
                                             language=payload.get("language"), on_opening=_report_opening,
                                             cancelled=_cancel_event.is_set, context=payload.get("context"),
-                                            on_token=_report_stream)
+                                            on_token=_report_stream, search_images_out=search_images)
                     if _stream_state["buf"]:
                         try:
                             _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": _stream_state["seg"], "delta": _stream_state["buf"]}, timeout=5)
@@ -1716,6 +1822,8 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     result_body = {"content": cleaned}
                     if attachments:
                         result_body["attachments"] = attachments
+                    if search_images:
+                        result_body["search_images"] = search_images
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": result_body})
                 elif job_type == "workspace":
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)

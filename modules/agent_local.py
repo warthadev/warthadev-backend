@@ -615,6 +615,8 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
     if attachments:
         payload_out["attachments"] = attachments
+    if isinstance(inner.get("search_images"), list) and inner["search_images"]:
+        payload_out["search_images"] = inner["search_images"]
     return {"success": True, "data": {"result": payload_out}}
 
 
@@ -658,6 +660,8 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                                                "usage": {}, "sources": []}
                         if isinstance(inner.get("attachments"), list) and inner["attachments"]:
                             out["attachments"] = inner["attachments"]
+                        if isinstance(inner.get("search_images"), list) and inner["search_images"]:
+                            out["search_images"] = inner["search_images"]
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
                     break
                 if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":

@@ -564,6 +564,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
                 "model": result.get("model") if isinstance(result.get("model"), str) and result.get("model") else selected_model,
                 "usage": result.get("usage") or {},
                 "sources": [],
+                "search_images": result.get("search_images") if isinstance(result.get("search_images"), list) else [],
             }
         },
     }
@@ -646,6 +647,7 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
     warned_repeats: set[str] = set()
     last_error: str | None = None
     ran_tools: list[tuple[str, str, bool, str]] = []
+    search_images: list[str] = []
     empty_retry = False
     stuck_reason: str | None = None
     timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
@@ -797,6 +799,12 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                             result_text = str(raw_result)
                     seen_calls[signature] = result_text
                 result_text = agent_shared.clip_tool_result(result_text, "en")
+                # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
+                # di chat (dikirim di event final, bukan ditempel di teks).
+                if name == "web_image_search":
+                    for url in agent_shared.search_image_urls(result_text):
+                        if url not in search_images and len(search_images) < 6:
+                            search_images.append(url)
                 ok = not agent_shared.is_error_result(result_text)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
                 ran_tools.append((name, "", ok, result_text))
@@ -841,6 +849,7 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             "model": result_model or selected_model,
             "usage": accumulated_usage if any(accumulated_usage.values()) else {},
             "sources": [],
+            "search_images": search_images,
         },
     }
     yield f"data: {json.dumps(final_event)}\n\n"

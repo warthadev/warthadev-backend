@@ -389,6 +389,17 @@ TOOL_DEFS = [
         "required": ["query"],
     },
     {
+        "name": "web_image_search",
+        "description": {
+            "en": "Search the web for images of something. Returns thumbnail URLs with their source pages. The thumbnails are shown to the user as a strip automatically — describe the results in your answer, do not paste the raw URLs.",
+            "id": "Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya.",
+        },
+        "params": {
+            "query": _param("string"),
+        },
+        "required": ["query"],
+    },
+    {
         "name": "web_fetch",
         "description": {
             "en": "Fetch the full content of a web page from a specific URL.",
@@ -574,6 +585,25 @@ def clip_tool_result(text, lang):
         note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
         return text[:TOOL_RESULT_LIMIT] + note
     return text
+
+
+def search_image_urls(text, limit=6):
+    """Pull thumbnail URLs out of a web_image_search result. The worker emits
+    one line per image as ``- title | gambar: <thumbnail url> | sumber: <page
+    url>``; the ``gambar:`` marker is the stable handle, whatever the page
+    language is. Deduped, in order, capped — the strip shows at most 6."""
+    if not isinstance(text, str):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in re.findall(r"gambar:\s*(https?://\S+)", text):
+        url = url.rstrip(").,")
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def fallback_summary(ran_tools, lang):
