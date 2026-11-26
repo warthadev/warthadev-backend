@@ -150,115 +150,214 @@ def extract_and_deliver(text, session_id=""):
     return cleaned, attachments
 
 
-_DELIVER_SYSTEM_HINT = (
-    "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file "
-    "di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — "
-    "ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). "
-    "Jangan menempelkan isi file besar ke chat sebagai gantinya.\n"
-    "ATURAN KERAS SOAL PENGIRIMAN FILE:\n"
-    "- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. "
-    "Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', "
-    "atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n"
-    "- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa "
-    "kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai "
-    "semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu "
-    "marker folder untuk semuanya sekaligus).\n"
-    "- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan "
-    "atau placeholder seperti '# TODO: lengkapi sisanya'.\n"
-    "- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file "
-    "yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih "
-    "akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\n"
-    "Jika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur "
-    "LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. "
-    "Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. "
-    "Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan "
-    "dari titik itu di jawaban berikutnya."
-)
+# SHARED-BEGIN
+# Generated from modules/agent_shared.py by scripts/sync_worker_shared.py.
+# DO NOT EDIT BY HAND — edit agent_shared.py and re-run the script.
+# The worker is pushed to Kaggle as one file and cannot import backend modules,
+# so the shared definitions live here as generated literals.
 
+TOOL_RESULT_LIMIT = 12000
+TOOL_CALL_SIG_LIMIT = 2000
+TOOL_REPEAT_PREVIEW_CHARS = 400
+TOOL_ERROR_SIG_CHARS = 200
 
-# ---------------------------------------------------------------------------
-# Tool schema exposed to the local model (same shape as codekaggle.py so the
-# gguf model's tool-calling behaviour doesn't need to be retrained/adjusted).
-# ---------------------------------------------------------------------------
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "list_dir",
-        "description": "Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Path direktori target, misal /kaggle/working atau /"}
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "patch_file",
-        "description": "Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "new_code": {"type": "string"},
-        }, "required": ["path", "start_line", "end_line", "new_code"]},
-    }},
-    {"type": "function", "function": {
-        "name": "write_file",
-        "description": "Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"},
-        }, "required": ["path", "content"]},
-    }},
-    {"type": "function", "function": {
-        "name": "run_bash",
-        "description": "Menjalankan perintah shell non-interaktif di kernel Kaggle ini.",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"},
-            "cwd": {"type": "string"},
-        }, "required": ["command"]},
-    }},
-    {"type": "function", "function": {
-        "name": "web_search",
-        "description": "Mencari informasi terkini di internet.",
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string"}
-        }, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "web_fetch",
-        "description": "Mengambil isi lengkap halaman web dari URL spesifik.",
-        "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}
-        }, "required": ["url"]},
-    }},
-    {"type": "function", "function": {
-        "name": "inspect_image",
-        "description": "Memuat file gambar dari disk agar dapat dianalisis secara visual.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "question": {"type": "string"},
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_document",
-        "description": (
-            "Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: "
-            "PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), "
-            "gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. "
-            "Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner."
-        ),
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Path absolut file, misal /kaggle/working/uploads/nama.pdf"},
-            "max_chars": {"type": "integer", "description": "Batas karakter hasil, default 12000"},
-        }, "required": ["path"]},
-    }},
-]
+SHARED_RULES_ID = {'how_you_talk': 'CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.', 'know_user': 'KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.', 'greet_first': 'SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.', 'topic': 'TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah menyampaikan sesuatu, lanjut ke hal berikutnya.', 'typos': 'TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: "saya anggap maksudmu X"). Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, kirim sesuatu, ubah data).', 'rich_ui': 'RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.', 'anti_loop': 'ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker [[file:...]] — jangan memeriksa berulang-ulang.', 'deliver_files': "Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna. Folder juga boleh (akan otomatis di-zip). Jangan menempelkan isi file besar ke chat sebagai gantinya.\nATURAN KERAS SOAL PENGIRIMAN FILE:\n- Pengguna TIDAK bisa membuka Kaggle sendiri dan TIDAK punya akses ke notebook/kernel ini. Jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', 'buka notebook', atau instruksi sejenis — itu mustahil dilakukan pengguna dan merupakan kegagalan tugas.\n- Jangan berhenti di tengah pembuatan kode dengan alasan 'lanjutkan sendiri' atau 'sisanya bisa kamu generate'. Jika tugas berisi banyak file, kerjakan SATU PER SATU dengan write_file sampai semua selesai sebelum menjawab, baru sertakan marker [[file:...]] untuk tiap file (atau satu marker folder untuk semuanya sekaligus).\n- Kode yang kamu tulis lewat write_file harus lengkap dan bisa langsung dipakai, bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'.\n- Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai lewat marker [[file:...]], lalu katakan dengan jelas file/bagian apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.\nJika user meminta struktur folder/file tree/arsip/daftar lengkap, SELALU berikan struktur LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisa item. Jangan malas: jangan berhenti di tengah. Prefer kelengkapan daripada singkat. Jika output terlalu panjang dan terpaksa dipotong, sebutkan titik berhenti lalu lanjutkan dari titik itu di jawaban berikutnya."}
+SHARED_RULE_ORDER_ID = ['topic', 'how_you_talk', 'greet_first', 'typos', 'know_user', 'rich_ui', 'anti_loop', 'deliver_files']
+
+def _shared_rules_text():
+    """The shared rules as one prompt block, worker order, single-newline
+    separator — exactly how the worker prompt was already built."""
+    return "\n".join(SHARED_RULES_ID[name] for name in SHARED_RULE_ORDER_ID)
+
+TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}]
+
+def _short_preview(text, limit, lang):
+    """Truncate a preview the way the worker's _short does: strip, then cap with
+    a "+N characters" suffix when it overflows."""
+    text = str(text if text is not None else "").strip()
+    if len(text) <= limit:
+        return text
+    suffix = f"… [+{len(text) - limit} karakter]" if lang == "id" else f"… [+{len(text) - limit} characters]"
+    return text[:limit] + suffix
+
+def tool_call_signature(name, args):
+    """Identical-call signature: name + args JSON, truncated so a giant argument
+    cannot blow up the loop's memory."""
+    return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)[:TOOL_CALL_SIG_LIMIT]}"
+
+def is_error_result(text):
+    """True when a tool result means failure: an "Error..." string, or a shell
+    run that exited non-zero. Judged from the result content, not from whether
+    the transport raised — a tool that returns an error string failed."""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.startswith("Error") or re.match(r"EXIT CODE: (?!0\b)", text) is not None
+
+def error_signature(name, text):
+    """Same-failure signature: tool name + first line of the error, truncated."""
+    if not isinstance(text, str):
+        text = str(text)
+    first = text.splitlines()[0][:TOOL_ERROR_SIG_CHARS] if text.splitlines() else ""
+    return f"{name}:{first}"
+
+def invalid_args_message(name, parse_error, lang):
+    """A tool call arrived with arguments that are not valid JSON: do not run
+    it — tell the model to resend valid JSON."""
+    if lang == "id":
+        return (
+            f"Error: argumen tool '{name}' bukan JSON valid ({parse_error}). "
+            "Kirim ulang dengan JSON valid. Untuk file panjang, tulis per bagian kecil."
+        )
+    return (
+        f"Error: tool '{name}' arguments are not valid JSON ({parse_error}). "
+        "Send them again as valid JSON. For long files, write in small parts."
+    )
+
+def repeat_stop_message(name, lang):
+    """Second repeat of an identical call after one warning: the loop is stuck
+    on the same call — stop and answer from what is already known."""
+    if lang == "id":
+        return (
+            f"Panggilan '{name}' ini sudah kamu coba sebelumnya dan hasilnya tidak berubah. "
+            "Berhenti mengulang hal yang sama."
+        )
+    return (
+        f"This '{name}' call was already tried before and the result did not change. "
+        "Stop repeating the same thing."
+    )
+
+def repeat_warning(cached_result, lang):
+    """First repeat of an identical call: do not re-run it — hand the model the
+    cached result (short preview) plus a warning not to call it again."""
+    preview = _short_preview(cached_result, TOOL_REPEAT_PREVIEW_CHARS, lang)
+    if lang == "id":
+        return (
+            "Kamu sudah menjalankan panggilan ini sebelumnya dan hasilnya sama seperti dulu, "
+            "tidak akan berubah kalau diulang. Jangan ulangi. Coba cara lain, atau beri jawaban "
+            f"akhir dari apa yang sudah kamu ketahui. Hasil sebelumnya: {preview}"
+        )
+    return (
+        "This exact tool call was already made. Do not call it again — use the result above. "
+        f"Previous result: {preview}"
+    )
+
+def stuck_final_message(stuck_reason, lang):
+    """System message for the forced final text-only round after the loop
+    recognizes it is stuck (same call repeated after a warning, or the same
+    failure twice)."""
+    if lang == "id":
+        return (
+            "[SISTEM] Kamu terlihat berputar di tempat yang sama"
+            + (f" ({stuck_reason})" if stuck_reason else "") +
+            ". Berhenti mencoba hal baru. Tulis jawaban akhir sekarang dalam bahasa pengguna: apa yang sudah berhasil, "
+            "apa yang gagal beserta error aslinya, dan saran langkah berikutnya. Jika ada file jadi di "
+            "/kaggle/working/out, sertakan marker [[file:...]]."
+        )
+    return (
+        "[SYSTEM] You look stuck going around in circles"
+        + (f" ({stuck_reason})" if stuck_reason else "") +
+        ". Stop trying new things. Write the final answer now in the user's language: what worked, "
+        "what failed with its original error, and suggested next steps. If there is a finished file in "
+        "/kaggle/working/out, include a [[file:...]] marker."
+    )
+
+def empty_retry_message(lang):
+    """One retry when a round returns no tool calls and no visible text."""
+    if lang == "id":
+        return "[SISTEM] Jawabanmu kosong. Tulis jawaban akhir sekarang."
+    return "[SYSTEM] Your response was empty. Write the final answer now."
+
+def clip_tool_result(text, lang):
+    """Cap one tool result before it enters model context."""
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) > TOOL_RESULT_LIMIT:
+        note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
+        return text[:TOOL_RESULT_LIMIT] + note
+    return text
+
+def fallback_summary(ran_tools, lang):
+    """Last resort when the model produces no final text: summarize what the
+    tools did. ``ran_tools`` is a list of (name, detail, ok, preview) tuples —
+    the same shape the worker's run_agent_turn records."""
+    if not ran_tools:
+        if lang == "id":
+            return "Maaf, model tidak menghasilkan jawaban. Coba kirim ulang permintaannya dengan lebih spesifik."
+        return "Sorry, the model did not produce an answer. Try sending your request again, more specifically."
+    if lang == "id":
+        lines = ["Aku sudah menjalankan beberapa langkah tapi belum sampai ke hasil akhir. Langkah terakhir:"]
+        for name, detail, ok, preview in ran_tools[-5:]:
+            mark = "OK" if ok else "GAGAL"
+            lines.append(f"- [{mark}] {name}{detail}: {_short_preview(preview, 160, lang)}")
+        lines.append("Kirim pesan lagi (misalnya “lanjutkan”) atau minta format file yang lebih sederhana.")
+        return "\n".join(lines)
+    lines = ["I ran a few steps but did not reach a final result yet. Last steps:"]
+    for name, detail, ok, preview in ran_tools[-5:]:
+        mark = "OK" if ok else "FAILED"
+        lines.append(f"- [{mark}] {name}{detail}: {_short_preview(preview, 160, lang)}")
+    lines.append("Send another message (for example “continue”) or ask for a simpler file format.")
+    return "\n".join(lines)
+
+def build_context_note(context, lang="en", side="cloud"):
+    """[CURRENT CONTEXT] (cloud, en) / [KONTEKS SAAT INI] (worker, id): who the
+    user is, where they are, and their real time/date right now, plus where the
+    agent itself runs. Cloud returns None when the context carries nothing at
+    all; the worker always returns the note (it also carries its own clock)."""
+    ctx = context if isinstance(context, dict) else {}
+    tz = str(ctx.get("timezone") or "").strip()
+    local_time = str(ctx.get("local_time") or "").strip()
+    date_str = str(ctx.get("date") or "").strip()
+    time_str = str(ctx.get("time") or "").strip()
+    user_name = str(ctx.get("user_name") or "").strip()
+    user_location = str(ctx.get("user_location") or "").strip()
+    if side == "worker":
+        now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+        lines = ["[KONTEKS SAAT INI]"]
+        if user_name:
+            lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
+        if user_location:
+            lines.append(f"- Lokasi user: {user_location}.")
+        if tz or local_time or date_str or time_str:
+            when = "- Waktu user sekarang: "
+            if date_str:
+                when += date_str
+            if time_str:
+                when += (", " if date_str else "") + time_str
+            elif local_time:
+                when += local_time
+            when += f" (zona waktu {tz or 'tidak diketahui'})."
+            lines.append(when)
+        lines.append(f"- Waktumu sekarang (worker Kaggle, UTC): {now_utc} UTC.")
+        lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat. Kamu TIDAK berada di lokasi user.")
+        if tz and not user_location:
+            lines.append(f"- Wilayah user: zona waktu {tz}.")
+        lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
+                     "Jangan menebak kota user dari zona waktu saja.")
+        return "\n".join(lines)
+    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location:
+        return None
+    parts = ["[CURRENT CONTEXT]"]
+    if user_name:
+        parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
+    if user_location:
+        parts.append(f"The user is in {user_location}.")
+    if date_str or time_str or local_time:
+        when = "Right now it is "
+        if date_str:
+            when += date_str
+        if time_str:
+            when += (", " if date_str else "") + time_str
+        elif local_time:
+            when += local_time
+        if tz:
+            when += f" ({tz})"
+        parts.append(when + ".")
+    elif tz:
+        parts.append(f"User's timezone: {tz}.")
+    parts.append("Backend runs in Oregon, USA. Use this for time, date, and place questions; do not guess the user's city from the timezone alone.")
+    return "\n".join(parts)
+
+# SHARED-END
 
 
 def _clean_err(e):
@@ -795,39 +894,7 @@ def build_system_prompt(base_dir):
         ".txt/.md/.html/.csv dengan write_file. PDF: pakai pymupdf (`import fitz`) yang sudah terpasang; JANGAN pip install "
         "(internet bisa mati). Cek sekali dengan run_bash `python -c \"import fitz\"`; jika gagal, pakai format lain "
         "dan beri tahu pengguna.\n"
-        "TOPIK: pesan user yang terbaru adalah pembahasan yang sedang berjalan. Kalau user mengganti pembahasan, "
-        "ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Riwayat sebelumnya "
-        "hanya konteks, bukan topik aktif. Jangan mengulang kata atau kalimat yang sama berulang kali; kalau sudah "
-        "menyampaikan sesuatu, lanjut ke hal berikutnya.\n"        "CARA BICARA: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, "
-        "to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user.\n"
-        "SAPA DULU: setiap ada chat masuk, sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat "
-        "(1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan "
-        "pertama. Pesan ini dikirim langsung ke user sebagai sapaan, jadi harus natural seperti manusia yang menyapa, "
-        "bukan seperti log mesin. Ini berlaku untuk proses berat maupun ringan — selalu sapa dulu, baru bertindak.\n"        "TYPO: kalau pesan user kemungkinan mengandung typo, jangan langsung berasumsi. Kalau maksudnya jelas dari "
-        "konteks, kerjakan langsung sambil menyebutkan singkat asumsi kamu (misal: \"saya anggap maksudmu X\"). "
-        "Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — "
-        "tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, "
-        "kirim sesuatu, ubah data).\n"
-        "KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta "
-        "wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; "
-        "kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.\n"        "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. "
-        "Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n"
-        "- card: {\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap\",\"title\":\"..\",\"body\":\"..\"} — sorotan/penting/peringatan.\n"
-        "- steps: {\"type\":\"steps\",\"title\":\"..\",\"items\":[{\"title\":\"..\",\"text\":\"..\"}]} — langkah berurutan.\n"
-        "- flow: {\"type\":\"flow\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"text\":\"..\"}]} — alur/diagram bentuk.\n"
-        "- timeline: {\"type\":\"timeline\",\"title\":\"..\",\"items\":[{\"date\":\"..\",\"title\":\"..\",\"text\":\"..\"}]} — urutan waktu.\n"
-        "- compare: {\"type\":\"compare\",\"title\":\"..\",\"columns\":[{\"title\":\"..\",\"tone\":\"good|bad|neutral\",\"items\":[\"..\"]}]} — perbandingan.\n"
-        "- chart: {\"type\":\"chart\",\"title\":\"..\",\"labels\":[\"..\"],\"values\":[angka]} — grafik batang data.\n"
-        "- checklist: {\"type\":\"checklist\",\"title\":\"..\",\"items\":[{\"text\":\"..\",\"done\":true}]} — daftar centang.\n"
-        "- stats: {\"type\":\"stats\",\"title\":\"..\",\"items\":[{\"label\":\"..\",\"value\":\"..\",\"note\":\"..\"}]} — angka penting.\n"
-        "Aturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Prosa biasa, "
-        "penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup "
-        "dijelaskan dengan satu paragraf.\n"
-        "ANTI-LOOP: jangan mengulang tool call yang sama persis. Jika sebuah cara gagal, ganti pendekatan atau laporkan "
-        "error aslinya sebagai jawaban akhir. Begitu file selesai ditulis, langsung beri jawaban akhir dengan marker "
-        "[[file:...]] — jangan memeriksa berulang-ulang.\n"
-        + _DELIVER_SYSTEM_HINT
-    )
+    ) + _shared_rules_text()
 
 
 # ---------------------------------------------------------------------------
@@ -1071,40 +1138,10 @@ def _fmt_tokens(n, language):
 
 
 def _build_context_note(context):
-    """Catatan [KONTEKS SAAT INI] di tiap giliran: siapa user (nama + lokasi),
-    waktu & tanggal user saat ini (real time, dari browser), dan wilayah worker
-    sendiri, supaya AI tahu nama, waktu, tanggal, dan tempat — dan tetap tahu
-    bahwa dirinya TIDAK berada di lokasi user."""
-    ctx = context if isinstance(context, dict) else {}
-    tz = str(ctx.get("timezone") or "").strip()
-    local_time = str(ctx.get("local_time") or "").strip()
-    date_str = str(ctx.get("date") or "").strip()
-    time_str = str(ctx.get("time") or "").strip()
-    user_name = str(ctx.get("user_name") or "").strip()
-    user_location = str(ctx.get("user_location") or "").strip()
-    now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
-    lines = ["[KONTEKS SAAT INI]"]
-    if user_name:
-        lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
-    if user_location:
-        lines.append(f"- Lokasi user: {user_location}.")
-    if tz or local_time or date_str or time_str:
-        when = "- Waktu user sekarang: "
-        if date_str:
-            when += date_str
-        if time_str:
-            when += (", " if date_str else "") + time_str
-        elif local_time:
-            when += local_time
-        when += f" (zona waktu {tz or 'tidak diketahui'})."
-        lines.append(when)
-    lines.append(f"- Waktumu sekarang (worker Kaggle, UTC): {now_utc} UTC.")
-    lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat. Kamu TIDAK berada di lokasi user.")
-    if tz and not user_location:
-        lines.append(f"- Wilayah user: zona waktu {tz}.")
-    lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
-                 "Jangan menebak kota user dari zona waktu saja.")
-    return "\n".join(lines)
+    """Catatan [KONTEKS SAAT INI] di tiap giliran — built by the shared builder
+    (see the SHARED block, generated from modules/agent_shared.py), the same
+    one the Cloud agent uses for its [CURRENT CONTEXT] note."""
+    return build_context_note(context, lang="id", side="worker")
 
 
 def _llm_call(api_url, history, with_tools=True, on_token=None):
@@ -1189,14 +1226,9 @@ def _llm_call(api_url, history, with_tools=True, on_token=None):
 
 
 def _fallback_summary(ran_tools):
-    if not ran_tools:
-        return "Maaf, model tidak menghasilkan jawaban. Coba kirim ulang permintaannya dengan lebih spesifik."
-    lines = ["Aku sudah menjalankan beberapa langkah tapi belum sampai ke hasil akhir. Langkah terakhir:"]
-    for name, detail, ok, preview in ran_tools[-5:]:
-        mark = "OK" if ok else "GAGAL"
-        lines.append(f"- [{mark}] {name}{detail}: {_short(preview, 160)}")
-    lines.append("Kirim pesan lagi (misalnya “lanjutkan”) atau minta format file yang lebih sederhana.")
-    return "\n".join(lines)
+    # Shared definition (see the SHARED block, generated from agent_shared.py):
+    # same summary the Cloud agent falls back to when a turn ends empty.
+    return fallback_summary(ran_tools, "id")
 
 
 def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None):
@@ -1302,7 +1334,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             if not visible and not empty_retry:
                 empty_retry = True
                 history.append({"role": "assistant", "content": ""})
-                history.append({"role": "user", "content": "[SISTEM] Jawabanmu kosong. Tulis jawaban akhir sekarang."})
+                history.append({"role": "user", "content": empty_retry_message("id")})
                 continue
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
@@ -1335,25 +1367,21 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             _act(label + detail)
             _step(sid, kind="tool", tool=fn_name, title=label.rstrip("…"), detail=detail.strip(), status="running")
 
-            sig = fn_name + ":" + json.dumps(parsed_args, sort_keys=True, ensure_ascii=False)[:2000]
+            sig = tool_call_signature(fn_name, parsed_args)
             repeat_after_warning = False
             if parse_error:
-                result = (f"Error: argumen tool '{fn_name}' bukan JSON valid ({parse_error}). "
-                          "Kirim ulang dengan JSON valid. Untuk file panjang, tulis per bagian kecil.")
+                result = invalid_args_message(fn_name, parse_error, "id")
             elif sig in warned_repeats:
                 # Sudah sekali diperingatkan tapi tetap mengulang hal yang sama persis:
                 # otaknya muter, sudahi putaran ini dengan jawaban akhir.
                 repeat_after_warning = True
-                result = (f"Panggilan '{fn_name}' ini sudah kamu coba sebelumnya dan hasilnya tidak berubah. "
-                          "Berhenti mengulang hal yang sama.")
+                result = repeat_stop_message(fn_name, "id")
             elif sig in seen_calls:
                 # Pertama kali mengulang: ingatkan bahwa hasilnya sudah diketahui,
                 # jangan jalankan ulang — kasih hasil lamanya supaya model bisa lanjut
                 # dengan cara lain, atau langsung menjawab.
                 warned_repeats.add(sig)
-                result = (f"Kamu sudah menjalankan panggilan ini sebelumnya dan hasilnya sama seperti dulu, "
-                          "tidak akan berubah kalau diulang. Jangan ulangi. Coba cara lain, atau beri jawaban "
-                          f"akhir dari apa yang sudah kamu ketahui. Hasil sebelumnya: {_short(seen_calls[sig], 400)}")
+                result = repeat_warning(seen_calls[sig], "id")
             else:
                 result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
                 seen_calls[sig] = str(result)
@@ -1365,9 +1393,9 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 pending_images.append((img_fp, q_img))
                 ok = True
             else:
-                text_result = str(result)
+                text_result = clip_tool_result(str(result), "id")
                 history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
-                ok = not (text_result.startswith("Error") or re.match(r"EXIT CODE: (?!0\b)", text_result))
+                ok = not is_error_result(text_result)
 
             _step(sid, status="done" if ok else "error", output=_short(text_result))
             ran_tools.append((fn_name, detail, ok, text_result))
@@ -1376,7 +1404,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             elif not ok:
                 # Gagal itu wajar — yang menandakan mentok adalah gagal dengan CARA YANG SAMA.
                 # Selama errornya berubah-ubah, berarti model sedang mencoba metode lain.
-                err_sig = fn_name + ":" + (text_result.splitlines()[0][:200] if text_result.splitlines() else "")
+                err_sig = error_signature(fn_name, text_result)
                 if err_sig == last_error:
                     stuck_reason = f"tool '{fn_name}' gagal dengan cara yang sama berulang kali"
                 else:
@@ -1403,12 +1431,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     final_id = _new_id()
     _act(strings["final"])
     _step(final_id, kind="thinking", title=strings["final"], status="running")
-    history.append({"role": "user", "content": (
-        "[SISTEM] Kamu terlihat berputar di tempat yang sama"
-        + (f" ({stuck_reason})" if stuck_reason else "") +
-        ". Berhenti mencoba hal baru. Tulis jawaban akhir sekarang dalam bahasa pengguna: apa yang sudah berhasil, "
-        "apa yang gagal beserta error aslinya, dan saran langkah berikutnya. Jika ada file jadi di "
-        "/kaggle/working/out, sertakan marker [[file:...]].")})
+    history.append({"role": "user", "content": stuck_final_message(stuck_reason, "id")})
     try:
         final_message, final_usage = _stream_call(with_tools=False)
         total_tokens += int((final_usage or {}).get("total_tokens") or 0)
@@ -1702,7 +1725,22 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     # giliran agen. Tidak masuk ke history percakapan worker —
                     # cloud yang memegang pembahasannya dan menerima hasilnya.
                     result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
-                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": result_text}})
+                    if isinstance(result_text, dict) and "__image_payload__" in result_text:
+                        # inspect_image: hand the cloud model the image itself
+                        # (base64), not the dict repr — otherwise the image never
+                        # reaches it. run_kaggle_tool passes the image through.
+                        img_fp = result_text["__image_payload__"]
+                        img_q = result_text.get("question") or ""
+                        try:
+                            img_size = os.path.getsize(img_fp)
+                        except OSError:
+                            img_size = 0
+                        if img_size > 3 * 1024 * 1024:
+                            _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": f"Error: image '{img_fp}' is too large for cloud inspection ({img_size // 1024 // 1024} MB, limit 3 MB)."}})
+                        else:
+                            _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": f"Image '{img_fp}' loaded for visual inspection.", "image": {"url": encode_image_b64(img_fp), "question": img_q, "path": img_fp}}})
+                    else:
+                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": result_text}})
                 else:
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": f"unknown job type {job_type}"})
             except Exception as exc:

@@ -579,14 +579,20 @@ async def local_tools_available(uid: str) -> bool:
     return kaggle_local_runner.worker_snapshot(uid).get("status") == "ready"
 
 
-async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: float = 300.0) -> str:
+async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: float = 300.0) -> str | dict[str, Any]:
     """Jalankan SATU tool di worker Kaggle user dan kembalikan hasil teksnya.
     Error (worker mati / timeout) dilempar sebagai exception supaya pemanggil
-    bisa memberikannya ke model sebagai hasil tool yang gagal, bukan mematikan turn."""
+    bisa memberikannya ke model sebagai hasil tool yang gagal, bukan mematikan turn.
+    Satu pengecualian: inspect_image mengembalikan dict {"content": ..., "image": {...}}
+    supaya gambarnya bisa diteruskan ke model sebagai pesan visual, bukan sebagai
+    teks mentah — sebelumnya cloud hanya menerima repr dict-nya dan gambar tidak
+    pernah sampai ke model."""
     result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args}, timeout)
     if isinstance(result, dict) and result.get("ok"):
         inner = result.get("result") or {}
         if isinstance(inner, dict):
+            if isinstance(inner.get("image"), dict):
+                return {"content": str(inner.get("content") or ""), "image": inner["image"]}
             return str(inner.get("content") or "")
         return str(inner)
     err = result.get("error") if isinstance(result, dict) else None

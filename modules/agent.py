@@ -18,6 +18,7 @@ from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
 from . import agent_local
+from . import agent_shared
 from .agent_prompt import DEFAULT_SYSTEM_INSTRUCTION
 from .agent_ssrf import RouterTarget, make_pinned_connector, validate_router_base_url
 from .firestore_storage import init_firestore
@@ -416,42 +417,11 @@ def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | li
 
 
 def _build_context_note(context: dict[str, Any] | None) -> str | None:
-    """[CURRENT CONTEXT] note — the cloud twin of the Kaggle worker's
-    [KONTEKS SAAT INI]: who the user is, where they are, and their real
-    time/date right now, plus where this backend runs, so the cloud agent
-    knows the user from the start and can answer time, date, and place
-    questions. The user asked for this explicitly: the agent must know
-    their name and location from the first message."""
-    if not isinstance(context, dict):
-        return None
-    local_time = str(context.get("local_time") or "").strip()
-    timezone = str(context.get("timezone") or "").strip()
-    date_str = str(context.get("date") or "").strip()
-    time_str = str(context.get("time") or "").strip()
-    user_name = str(context.get("user_name") or "").strip()
-    user_location = str(context.get("user_location") or "").strip()
-    if not local_time and not timezone and not date_str and not time_str and not user_name and not user_location:
-        return None
-    parts = ["[CURRENT CONTEXT]"]
-    if user_name:
-        parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
-    if user_location:
-        parts.append(f"The user is in {user_location}.")
-    if date_str or time_str or local_time:
-        when = "Right now it is "
-        if date_str:
-            when += date_str
-        if time_str:
-            when += (", " if date_str else "") + time_str
-        elif local_time:
-            when += local_time
-        if timezone:
-            when += f" ({timezone})"
-        parts.append(when + ".")
-    elif timezone:
-        parts.append(f"User's timezone: {timezone}.")
-    parts.append("Backend runs in Oregon, USA. Use this for time, date, and place questions; do not guess the user's city from the timezone alone.")
-    return "\n".join(parts)
+    """[CURRENT CONTEXT] note — built by the shared builder in agent_shared,
+    the same one the Kaggle worker uses for its [KONTEKS SAAT INI] note, so
+    both agents get the user's name, location, and real time/date from the
+    same definition."""
+    return agent_shared.build_context_note(context, lang="en", side="cloud")
 
 
 def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -468,26 +438,6 @@ def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> l
     return messages
 
 
-def _completion_text(payload: Any) -> tuple[str, dict[str, Any]]:
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="OpenRouter returned an invalid chat response")
-    choices = payload.get("choices")
-    choice = choices[0] if isinstance(choices, list) and choices else None
-    message = choice.get("message") if isinstance(choice, dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        text = "\n".join(
-            part["text"] for part in content
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        ).strip()
-    else:
-        text = ""
-    if not text:
-        raise HTTPException(status_code=502, detail="OpenRouter returned an empty chat response")
-    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-    return text, usage
 
 
 @router.put("/keys")
@@ -601,120 +551,57 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
     if selected_model not in {model["id"] for model in available_models}:
         raise HTTPException(status_code=403, detail="Model is not available as a free model to this account's OpenRouter key")
 
-    request_body = {
-        "model": selected_model,
-        "messages": _chat_messages(payload, images),
-        "temperature": 0.2,
-        "stream": False,
-    }
-    response = await _router_request("POST", OPENROUTER_API_BASE_URL, "chat/completions", api_key, request_body)
-    _raise_router_http_error(response, "chat")
-    try:
-        upstream_payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="OpenRouter returned an invalid chat response") from exc
-    content, usage = _completion_text(upstream_payload)
-    result_model = upstream_payload.get("model") if isinstance(upstream_payload, dict) else None
+    # Same tool-capable loop as the stream endpoint, drained to one result:
+    # the non-stream fallback used to be a plain chat with no tools at all.
+    result = await _drain_plain_chat_events(payload, images, api_key, selected_model, user_id)
     return {
         "success": True,
         "userId": user_id,
         "provider": provider,
         "data": {
             "result": {
-                "content": content,
-                "model": result_model if isinstance(result_model, str) and result_model else selected_model,
-                "usage": usage,
+                "content": result.get("content") or "",
+                "model": result.get("model") if isinstance(result.get("model"), str) and result.get("model") else selected_model,
+                "usage": result.get("usage") or {},
                 "sources": [],
             }
         },
     }
 
 
-# Tool Kaggle yang bisa dipakai model cloud saat worker lokal user sedang ready.
-# Dijalankan di kernel Kaggle user (/kaggle/working), bukan di komputer user.
-# Skema ini cerminan TOOLS di workerlocal.py, diterjemahkan ke Inggris karena
-# prompt cloud berbahasa Inggris.
-_KAGGLE_TOOLS = [
-    {"type": "function", "function": {
-        "name": "list_dir",
-        "description": "List folders, files, and sizes in a directory on the Kaggle GPU worker (default workspace: /kaggle/working).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Target directory, e.g. /kaggle/working or /"}
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Read a file with line numbers (up to 7,500 lines at a time) from the Kaggle worker disk.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "patch_file",
-        "description": "Replace specific lines in a large file without rewriting the whole file (automatic .bak backup).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "new_code": {"type": "string"},
-        }, "required": ["path", "start_line", "end_line", "new_code"]},
-    }},
-    {"type": "function", "function": {
-        "name": "write_file",
-        "description": "Create a new file or overwrite a small/medium file with complete content on the Kaggle worker disk.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"},
-        }, "required": ["path", "content"]},
-    }},
-    {"type": "function", "function": {
-        "name": "run_bash",
-        "description": "Run a non-interactive shell command on this Kaggle kernel.",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"},
-            "cwd": {"type": "string"},
-        }, "required": ["command"]},
-    }},
-    {"type": "function", "function": {
-        "name": "web_search",
-        "description": "Search the internet for current information.",
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string"}
-        }, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "web_fetch",
-        "description": "Fetch the full content of a web page from a specific URL.",
-        "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}
-        }, "required": ["url"]},
-    }},
-    {"type": "function", "function": {
-        "name": "inspect_image",
-        "description": "Load an image file from the Kaggle worker disk so it can be analyzed visually.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "question": {"type": "string"},
-        }, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "read_document",
-        "description": (
-            "Read a file on the Kaggle worker disk without pasting its whole content into context: "
-            "PDF (text, or OCR if scanned), DOCX, PPTX, XLSX/CSV (built-in pandas), "
-            "images (OCR), audio/video (ffmpeg + faster-whisper), and zip/tar/gz archives. "
-            "Use this for files in /kaggle/working/uploads. Do not use read_file for PDF/binary files."
-        ),
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "Absolute file path, e.g. /kaggle/working/uploads/name.pdf"},
-            "max_chars": {"type": "integer", "description": "Result character limit, default 12000"},
-        }, "required": ["path"]},
-    }},
-]
+async def _drain_plain_chat_events(payload: AgentChatPayload, images: list[dict[str, str]], api_key: str, selected_model: str, user_id: str) -> dict[str, Any]:
+    """Run the tool-capable plain chat stream and return its final result dict.
+    Lets the non-stream /agent/chat endpoint reuse the same loop (and the same
+    stuck policy, usage accounting, and fallback summary) as the stream."""
+    final: dict[str, Any] | None = None
+    async for chunk in _plain_chat_stream_events(payload, images, api_key, selected_model, user_id):
+        if not chunk.startswith("data:"):
+            continue
+        raw = chunk[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "final":
+            final = event.get("result") or {}
+        elif event.get("type") == "error":
+            raise HTTPException(status_code=int(event.get("status") or 502), detail=str(event.get("message") or "OpenRouter chat request failed"))
+    if final is None:
+        raise HTTPException(status_code=502, detail="OpenRouter returned an empty chat response")
+    return final
 
-_TOOL_RESULT_LIMIT = 12000
+
+# Tools the cloud model can use when the user's local worker is ready.
+# One canonical definition in agent_shared (the same 9 tools the worker offers,
+# English descriptions because the cloud prompt is in English). The worker's
+# copy is generated from the same definition by scripts/sync_worker_shared.py.
+_KAGGLE_TOOLS = agent_shared.tools_for("en")
+
+_TOOL_RESULT_LIMIT = agent_shared.TOOL_RESULT_LIMIT
 
 
 class _OpenRouterError(Exception):
@@ -736,30 +623,38 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
     offered the Kaggle tools: cloud thinks, the worker executes. Each tool call
     runs on the Kaggle kernel via agent_local.run_kaggle_tool, its result comes
     back into the model's context, and tool_call/tool_result events flow to the
-    frontend so the Process block shows the work. Stopping is human-like, same
-    idea as the worker: no fixed step count — the loop runs until the model
-    answers, and only forces a final text-only answer when it recognizes a stuck
-    pattern (same identical tool call after one warning, or the same tool failing
-    with the same error twice in a row)."""
+    frontend so the Process block shows the work.
+
+    The tool loop follows the same policy as the worker's run_agent_turn, from
+    the shared definitions in agent_shared: no fixed step count — the loop runs
+    until the model answers, and only forces a final text-only answer when it
+    recognizes a stuck pattern (same identical tool call after one warning, or
+    the same tool failing with the same error twice in a row). Usage is
+    accumulated across rounds (like the worker), an empty round is retried once,
+    and a turn that still ends empty falls back to a summary of the tools run —
+    never an empty error to the user."""
     messages: list[dict[str, Any]] = _chat_messages(payload, images)
     try:
         use_tools = await agent_local.local_tools_available(user_id)
     except Exception:
         use_tools = False
     tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else None
-    force_text_only = False
     accumulated_text = ""
-    accumulated_usage: dict[str, Any] = {}
+    accumulated_usage: dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     result_model = selected_model
     seen_calls: dict[str, str] = {}
     warned_repeats: set[str] = set()
     last_error: str | None = None
+    ran_tools: list[tuple[str, str, bool, str]] = []
+    empty_retry = False
+    stuck_reason: str | None = None
     timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
 
-    async def one_round(holder: dict[str, Any]):
+    async def one_round(holder: dict[str, Any], with_tools: bool = True):
         """One streamed OpenRouter call. Yields token events live as they arrive
         and stores (text, tool_calls) in holder. Tool calls are accumulated by
-        index, like the worker's _llm_call."""
+        index, like the worker's _llm_call. Invalid JSON arguments are kept as a
+        parse error on the call so the loop can tell the model to resend them."""
         nonlocal accumulated_usage, result_model
         body: dict[str, Any] = {
             "model": selected_model,
@@ -768,7 +663,7 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tools and not force_text_only:
+        if tools and with_tools:
             body["tools"] = tools
         target: RouterTarget = await validate_router_base_url(OPENROUTER_API_BASE_URL)
         url = f"{target.base_url}/chat/completions"
@@ -810,7 +705,7 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                                 continue
                             result_model = chunk.get("model") or result_model
                             if isinstance(chunk.get("usage"), dict):
-                                accumulated_usage = chunk["usage"]
+                                agent_shared.add_usage(accumulated_usage, chunk["usage"])
                             choices = chunk.get("choices")
                             choice = choices[0] if isinstance(choices, list) and choices else None
                             delta = choice.get("delta") if isinstance(choice, dict) else None
@@ -839,78 +734,112 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             entry = calls[idx]
             if not entry["name"]:
                 continue
+            parse_error = None
             try:
                 args = json.loads(entry["arguments"] or "{}")
                 if not isinstance(args, dict):
                     args = {}
-            except ValueError:
+            except ValueError as exc:
                 args = {}
-            tool_calls.append({"id": entry["id"] or f"call-{idx}", "name": entry["name"], "args": args})
+                parse_error = str(exc)
+            call: dict[str, Any] = {"id": entry["id"] or f"call-{idx}", "name": entry["name"], "args": args}
+            if parse_error:
+                call["parse_error"] = parse_error
+            tool_calls.append(call)
         holder["text"] = text
         holder["tool_calls"] = tool_calls
 
     try:
         while True:
             holder: dict[str, Any] = {}
-            async for event in one_round(holder):
+            async for event in one_round(holder, with_tools=True):
                 yield event
             text = str(holder.get("text") or "")
             tool_calls = holder.get("tool_calls") or []
             if not tool_calls:
+                if not text and not empty_retry:
+                    empty_retry = True
+                    messages.append({"role": "assistant", "content": ""})
+                    messages.append({"role": "user", "content": agent_shared.empty_retry_message("en")})
+                    continue
                 accumulated_text = text
                 break
             messages.append({"role": "assistant", "content": text or None,
                              "tool_calls": [{"id": c["id"], "type": "function",
                                             "function": {"name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}} for c in tool_calls]})
+            pending_images: list[dict[str, Any]] = []
             for call in tool_calls:
                 name = str(call["name"])
                 args = call["args"] if isinstance(call["args"], dict) else {}
                 yield f"data: {json.dumps({'type': 'tool_call', 'name': name})}\n\n"
-                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-                if signature in seen_calls:
-                    if signature in warned_repeats:
-                        force_text_only = True
-                        result_text = seen_calls[signature]
-                    else:
-                        warned_repeats.add(signature)
-                        result_text = seen_calls[signature] + "\n[Note: this exact tool call was already made. Do not call it again — use the result above.]"
+                signature = agent_shared.tool_call_signature(name, args)
+                repeat_after_warning = False
+                if call.get("parse_error"):
+                    result_text = agent_shared.invalid_args_message(name, call["parse_error"], "en")
+                elif signature in warned_repeats:
+                    repeat_after_warning = True
+                    result_text = agent_shared.repeat_stop_message(name, "en")
+                elif signature in seen_calls:
+                    warned_repeats.add(signature)
+                    result_text = agent_shared.repeat_warning(seen_calls[signature], "en")
                 else:
                     try:
-                        result_text = await agent_local.run_kaggle_tool(user_id, name, args)
-                        last_error = None
+                        raw_result = await agent_local.run_kaggle_tool(user_id, name, args)
                     except Exception as exc:
-                        err_text = str(exc)[:500]
-                        first_line = err_text.splitlines()[0] if err_text.splitlines() else ""
-                        error_sig = f"{name}:{first_line}"
-                        if last_error is not None and error_sig == last_error:
-                            force_text_only = True
-                        last_error = error_sig
-                        result_text = f"Error: {err_text}"
+                        result_text = f"Error: {str(exc)[:500]}"
+                    else:
+                        if isinstance(raw_result, dict) and isinstance(raw_result.get("image"), dict):
+                            pending_images.append(raw_result["image"])
+                            result_text = str(raw_result.get("content") or "")
+                        elif isinstance(raw_result, str):
+                            result_text = raw_result
+                        else:
+                            result_text = str(raw_result)
                     seen_calls[signature] = result_text
-                if len(result_text) > _TOOL_RESULT_LIMIT:
-                    result_text = result_text[:_TOOL_RESULT_LIMIT] + "\n[...dipotong, hasil tool dibatasi 12000 karakter...]"
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_text})
+                result_text = agent_shared.clip_tool_result(result_text, "en")
+                ok = not agent_shared.is_error_result(result_text)
+                messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
+                ran_tools.append((name, "", ok, result_text))
                 yield f"data: {json.dumps({'type': 'tool_result', 'name': name})}\n\n"
-            if force_text_only:
-                holder2: dict[str, Any] = {}
-                async for event in one_round(holder2):
-                    yield event
-                accumulated_text = str(holder2.get("text") or "")
+                if repeat_after_warning:
+                    stuck_reason = f"the same '{name}' call repeated after a warning"
+                elif not ok:
+                    err_sig = agent_shared.error_signature(name, result_text)
+                    if last_error is not None and err_sig == last_error:
+                        stuck_reason = f"tool '{name}' failed the same way repeatedly"
+                    else:
+                        last_error = err_sig
+                else:
+                    last_error = None
+            for image in pending_images:
+                img_url = str(image.get("url") or "")
+                if img_url:
+                    img_path = str(image.get("path") or "inspect_image")
+                    img_q = str(image.get("question") or "")
+                    messages.append({"role": "user", "content": [
+                        {"type": "text", "text": f"[Visual inspection: {img_path}] {img_q}"},
+                        {"type": "image_url", "image_url": {"url": img_url}},
+                    ]})
+            if stuck_reason:
                 break
+        if stuck_reason:
+            messages.append({"role": "user", "content": agent_shared.stuck_final_message(stuck_reason, "en")})
+            holder2: dict[str, Any] = {}
+            async for event in one_round(holder2, with_tools=False):
+                yield event
+            accumulated_text = str(holder2.get("text") or "")
     except _OpenRouterError as exc:
         yield f"data: {json.dumps({'type': 'error', 'status': exc.status, 'message': exc.message})}\n\n"
         yield "data: [DONE]\n\n"
         return
     if not accumulated_text.strip():
-        yield f"data: {json.dumps({'type': 'error', 'status': 502, 'message': 'OpenRouter returned an empty chat response'})}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+        accumulated_text = agent_shared.fallback_summary(ran_tools, "en")
     final_event = {
         "type": "final",
         "result": {
             "content": accumulated_text,
             "model": result_model or selected_model,
-            "usage": accumulated_usage,
+            "usage": accumulated_usage if any(accumulated_usage.values()) else {},
             "sources": [],
         },
     }
