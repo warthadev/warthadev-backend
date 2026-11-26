@@ -553,11 +553,7 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
             async with _sessions_lock:
                 if sess.get("pending_job", {}).get("job_id") == job_id:
                     sess["pending_job"] = None
-            snap = kaggle_local_runner.worker_snapshot(uid)
-            msg = "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."
-            if snap.get("raw_status") == "error" and snap.get("error"):
-                msg += f" System log: {snap['error']}"
-            raise HTTPException(503, msg)
+            raise HTTPException(503, "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab.")
         await asyncio.sleep(0.5)
 
     async with _sessions_lock:
@@ -591,17 +587,13 @@ async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: fl
     Satu pengecualian: inspect_image mengembalikan dict {"content": ..., "image": {...}}
     supaya gambarnya bisa diteruskan ke model sebagai pesan visual, bukan sebagai
     teks mentah — sebelumnya cloud hanya menerima repr dict-nya dan gambar tidak
-    pernah sampai ke model. Pengecualian kedua: request_access mengembalikan
-    {"content": ..., "pending_request": {...}} supaya permintaan ke user tidak
-    hilang di jalan."""
+    pernah sampai ke model."""
     result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args}, timeout)
     if isinstance(result, dict) and result.get("ok"):
         inner = result.get("result") or {}
         if isinstance(inner, dict):
             if isinstance(inner.get("image"), dict):
                 return {"content": str(inner.get("content") or ""), "image": inner["image"]}
-            if isinstance(inner.get("pending_request"), dict):
-                return {"content": str(inner.get("content") or ""), "pending_request": inner["pending_request"]}
             return str(inner.get("content") or "")
         return str(inner)
     err = result.get("error") if isinstance(result, dict) else None
@@ -627,13 +619,6 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
             agent_memory.save_memory(uid, str(mem), source="ai")
         except Exception:
             pass
-    # Plans the worker saved via the update_plan tool: persist them now
-    # (the worker has no Firestore access). Best-effort — never fail the chat.
-    if isinstance(inner.get("plans_saved"), list):
-        try:
-            agent_memory.save_plan(uid, inner["plans_saved"])
-        except Exception:
-            pass
     content = inner.get("content") or ""
     attachments = inner.get("attachments") if isinstance(inner.get("attachments"), list) else []
     payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
@@ -641,8 +626,6 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
         payload_out["attachments"] = attachments
     if isinstance(inner.get("search_images"), list) and inner["search_images"]:
         payload_out["search_images"] = inner["search_images"]
-    if isinstance(inner.get("pending_request"), dict) and inner["pending_request"]:
-        payload_out["pending_request"] = inner["pending_request"]
     return {"success": True, "data": {"result": payload_out}}
 
 
@@ -689,8 +672,6 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                             out["attachments"] = inner["attachments"]
                         if isinstance(inner.get("search_images"), list) and inner["search_images"]:
                             out["search_images"] = inner["search_images"]
-                        if isinstance(inner.get("pending_request"), dict) and inner["pending_request"]:
-                            out["pending_request"] = inner["pending_request"]
                         # Memories the worker collected via remember: persist
                         # them now (best-effort, never fail the chat).
                         for mem in (inner.get("memories_saved") or []):
@@ -698,26 +679,12 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                                 agent_memory.save_memory(uid, str(mem), source="ai")
                             except Exception:
                                 pass
-                        # Plans the worker saved via update_plan: same.
-                        if isinstance(inner.get("plans_saved"), list):
-                            try:
-                                agent_memory.save_plan(uid, inner["plans_saved"])
-                            except Exception:
-                                pass
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
                     break
-                snap = kaggle_local_runner.worker_snapshot(uid)
-                if snap.get("status") != "ready":
-                    err_event: dict[str, Any] = {"type": "error",
-                                                 "message": "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."}
-                    # Worker sempat melaporkan penyebab matinya (FATAL / ekor log
-                    # llama-server): sertakan supaya aplikasi bisa menampilkannya
-                    # sebagai System log, bukan cuma pesan generik. Kalau kernel
-                    # mati diam-diam tanpa laporan, tidak ada detail yang bisa
-                    # ditampilkan — pesannya tetap generik seperti sebelumnya.
-                    if snap.get("raw_status") == "error" and snap.get("error"):
-                        err_event["detail"] = str(snap["error"])
-                    yield ("data: " + json.dumps(err_event, ensure_ascii=False) + "\n\n")
+                if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":
+                    yield ("data: " + json.dumps({"type": "error",
+                                                  "message": "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."},
+                                                 ensure_ascii=False) + "\n\n")
                     break
                 if time.time() >= deadline:
                     yield ("data: " + json.dumps({"type": "error", "message": "AI Local did not reply in time."},
