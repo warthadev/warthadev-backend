@@ -24,9 +24,17 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 WORKER_VERSION = "2026-11-25-ai-local-cloud-bridge"
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
-BASE_DIR = "/kaggle/working"
+# Colab: runtime kedua selain Kaggle. Worker yang sama, polling backend yang
+# sama (tanpa ngrok); bedanya cuma dari mana model + binary diambil dan di
+# mana file kerja disimpan — semuanya lewat env supaya perilaku Kaggle tidak
+# berubah kalau env tidak di-set.
+IS_COLAB = os.path.isdir("/content") or "COLAB_GPU" in os.environ
+BASE_DIR = os.environ.get("WARTHA_BASE_DIR") or "/kaggle/working"
 DEFAULT_PORT = 8080
-DEFAULT_MAX_CTX = 131072
+try:
+    DEFAULT_MAX_CTX = int(os.environ.get("WARTHA_MAX_CTX") or 131072)
+except ValueError:
+    DEFAULT_MAX_CTX = 131072
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -1189,9 +1197,13 @@ def build_system_prompt(base_dir):
 # model ikut di-copy (GB-an) di tiap boot; itu yang bikin boot lama.
 # ---------------------------------------------------------------------------
 def _stage_model_assets(base_dir):
+    """Cari llama_bin + model GGUF. Di Kaggle dari /kaggle/input (dataset,
+    mmap — tidak disalin). Di Colab dari folder dataset yang di-download cell
+    (WARTHA_DATASET_DIR); binary tetap disalin ke Working supaya bisa dieksekusi."""
+    dataset_root = os.environ.get("WARTHA_DATASET_DIR") or "/kaggle/input"
     bin_dst = os.path.join(base_dir, "llama_bin")
     if not os.path.isdir(bin_dst):
-        src_bin = next(iter(glob.glob("/kaggle/input/**/llama_bin", recursive=True)), None)
+        src_bin = next(iter(glob.glob(f"{dataset_root}/**/llama_bin", recursive=True)), None)
         if not src_bin:
             raise FileNotFoundError("The dataset has no llama_bin folder")
         shutil.copytree(src_bin, bin_dst)
@@ -1201,7 +1213,7 @@ def _stage_model_assets(base_dir):
                     os.chmod(os.path.join(root, fn), 0o755)
                 except Exception:
                     pass
-    src_model = next(iter(glob.glob("/kaggle/input/**/model_gguf", recursive=True)), None)
+    src_model = next(iter(glob.glob(f"{dataset_root}/**/model_gguf", recursive=True)), None)
     if not src_model:
         raise FileNotFoundError("The dataset has no model_gguf folder")
     return bin_dst, src_model
@@ -1221,7 +1233,9 @@ def start_llama_server(base_dir, port, max_ctx):
         raise FileNotFoundError(f"File model GGUF tidak ditemukan di {model_dir}")
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    # Kaggle punya 2 GPU, Colab gratis cuma 1 — cell Colab mengeset
+    # WARTHA_CUDA_DEVICES=0 supaya server tidak mencari GPU kedua.
+    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("WARTHA_CUDA_DEVICES", "0,1")
     env["LD_LIBRARY_PATH"] = d + ":" + env.get("LD_LIBRARY_PATH", "")
     subprocess.run(["pkill", "-x", "llama-server"], stderr=subprocess.DEVNULL)
     time.sleep(1)
@@ -1897,8 +1911,8 @@ def run_workspace_job(op, payload, base_dir):
 # Headless backend polling loop (this replaces codekaggle.py's input() loop)
 # ---------------------------------------------------------------------------
 def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
-    if not IS_KAGGLE:
-        raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
+    if not IS_KAGGLE and not IS_COLAB:
+        raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle atau Colab.")
     print(f"[ai-local] worker version: {WORKER_VERSION}", flush=True)
 
     session_id = (session_id or os.environ.get("WORKER_SESSION_ID") or "").strip()
@@ -2006,7 +2020,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         print(f"[ai-local] ready, model={model_id}", flush=True)
 
         history = [{"role": "system", "content": build_system_prompt(base_dir)}]
-        print("[ai-local] worker hidup sampai Stop ditekan atau Kaggle mengakhiri kernel.", flush=True)
+        print("[ai-local] worker hidup sampai Stop ditekan atau runtime mengakhiri sesi.", flush=True)
 
         while True:
             job_res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": False}, timeout=10)
@@ -2206,3 +2220,9 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
         if log_file:
             log_file.close()
         print("[ai-local] worker selesai.", flush=True)
+
+
+# Entry point Colab: fungsi yang sama dengan worker Kaggle (polling backend,
+# tanpa ngrok). Cell Colab memanggil ini setelah menukar kode pairing dengan
+# kredensial sesi.
+run_colab_worker = run_kaggle_worker
