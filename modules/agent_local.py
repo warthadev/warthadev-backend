@@ -46,7 +46,7 @@ UPLOAD_DIR = "/kaggle/working/uploads"
 
 _sessions: dict[str, dict[str, Any]] = {}
 _sessions_lock = asyncio.Lock()
-_PERSIST_FIELDS = ("session_id", "owner_uid", "worker_token", "created_at", "expires_at", "control", "runtime")
+_PERSIST_FIELDS = ("session_id", "owner_uid", "worker_token", "created_at", "expires_at", "control")
 _last_persist_at = 0.0
 
 
@@ -238,7 +238,6 @@ async def _start_or_reuse(request: Request, uid: str, credentials: dict[str, str
         "session_id": sid, "owner_uid": uid, "worker_token": worker_token,
         "created_at": now, "expires_at": now + SESSION_TTL_SECONDS, "control": None,
         "pending_job": None, "job_results": {}, "job_streams": {},
-        "runtime": "kaggle",
     }
     async with _sessions_lock:
         _sessions[sid] = sess
@@ -499,17 +498,6 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
 
     steps = _build_boot_steps(state, snapshot, kaggle_state) if state in ("booting", "ready") else []
     last_push = float(snapshot.get("last_push") or 0)
-    # Runtime worker yang sedang heartbeat (Kaggle atau Colab). Diambil dari
-    # sesi yang dimiliki snapshot, bukan sesi terbaru — supaya label tidak
-    # salah saat user pairing Colab sementara worker Kaggle masih hidup.
-    runtime = None
-    snap_sid = snapshot.get("session_id")
-    if snap_sid:
-        async with _sessions_lock:
-            snap_sess = _sessions.get(str(snap_sid))
-            runtime = snap_sess.get("runtime") if snap_sess else None
-    if runtime is None and sess:
-        runtime = sess.get("runtime")
     return {
         "ok": True,
         "steps": steps,
@@ -524,121 +512,7 @@ async def status(deep: bool = Query(default=False), authorization: str | None = 
         "kaggle_state": kaggle_state,
         "activity": snapshot.get("activity") if state == "ready" else None,
         "resumable": state in ("offline", "error"),
-        "runtime": runtime,
     }
-
-
-# --- Colab pairing: satu worker Colab per user, tanpa ngrok ---
-# Colab tidak bisa di-start backend lewat API (tidak seperti kernel Kaggle),
-# jadi alurnya dibalik: aplikasi membuat sesi + kode pairing 6 huruf, user
-# menjalankan satu cell notebook Colab yang menukarkan kode itu dengan
-# kredensial sesi, lalu worker Colab polling backend sama seperti worker Kaggle.
-_COLAB_NOTEBOOK_URL = "https://colab.research.google.com/github/warthadev/warthadev-backend/blob/main/colab/wartha-colab.ipynb"
-_PAIRINGS_FILE = os.environ.get("AGENT_LOCAL_PAIRINGS_FILE", "/tmp/wartha-agent-local-pairings.json")
-_PAIR_CODE_TTL_SECONDS = 15 * 60
-_PAIR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-_pairings: dict[str, dict[str, Any]] = {}
-
-
-def _persist_pairings_unlocked() -> None:
-    """Tulis pairing aktif ke disk (berisi worker_token -> hanya owner proses)."""
-    try:
-        tmp = _PAIRINGS_FILE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(_pairings, handle)
-        os.replace(tmp, _PAIRINGS_FILE)
-    except Exception as exc:
-        logger.warning("Failed to persist AI Local pairings: %s", exc)
-
-
-def _load_pairings() -> None:
-    if not os.path.exists(_PAIRINGS_FILE):
-        return
-    try:
-        with open(_PAIRINGS_FILE, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        now = time.time()
-        for code, saved in (data or {}).items():
-            if not isinstance(saved, dict) or float(saved.get("expires_at") or 0) <= now:
-                continue
-            _pairings[str(code)] = saved
-        logger.info("Restored %d AI Local pairing(s) from disk", len(_pairings))
-    except Exception as exc:
-        logger.warning("Failed to load AI Local pairings: %s", exc)
-
-
-_load_pairings()
-
-
-def _new_pair_code() -> str:
-    return "".join(secrets.choice(_PAIR_CODE_ALPHABET) for _ in range(6))
-
-
-class ColabClaimPayload(BaseModel):
-    code: str = Field(min_length=4, max_length=16)
-
-
-@router.post("/colab-pair")
-async def colab_pair(request: Request, authorization: str | None = Header(default=None)):
-    """Buat kode pairing untuk worker Colab. Sesi dibuat sekarang, tapi sesi
-    Kaggle yang sedang hidup TIDAK dijatuhkan dulu — itu baru terjadi saat
-    kode ditukar (claim), jadi pairing yang tidak jadi dipakai tidak membunuh
-    worker yang sedang jalan."""
-    uid = authenticate_user(authorization)
-    now = time.time()
-    async with _sessions_lock:
-        for code in [c for c, p in _pairings.items() if float(p.get("expires_at") or 0) <= now]:
-            _pairings.pop(code, None)
-        code = _new_pair_code()
-        while code in _pairings:
-            code = _new_pair_code()
-        worker_token = secrets.token_urlsafe(32)
-        sid = uuid.uuid4().hex[:16]
-        _sessions[sid] = {
-            "session_id": sid, "owner_uid": uid, "worker_token": worker_token,
-            "created_at": now, "expires_at": now + SESSION_TTL_SECONDS, "control": None,
-            "pending_job": None, "job_results": {}, "job_streams": {},
-            "runtime": "colab",
-        }
-        _pairings[code] = {
-            "code": code, "session_id": sid, "worker_token": worker_token,
-            "owner_uid": uid, "created_at": now,
-            "expires_at": now + _PAIR_CODE_TTL_SECONDS, "claimed": False,
-        }
-        _persist_sessions_unlocked()
-        _persist_pairings_unlocked()
-    return {"ok": True, "code": code, "expires_in_seconds": _PAIR_CODE_TTL_SECONDS,
-            "backend_url": kaggle_local_runner.resolve_backend_url(str(request.base_url)),
-            "notebook_url": _COLAB_NOTEBOOK_URL}
-
-
-@router.post("/colab-claim")
-async def colab_claim(request: Request, payload: ColabClaimPayload):
-    """Tukar kode pairing dengan kredensial sesi. Tanpa auth header — kodenya
-    sendiri yang jadi kredensial (6 huruf, sekali pakai, 15 menit). Saat klaim
-    berhasil, sesi lain milik user dijatuhkan supaya hanya ada satu worker
-    aktif; worker lama mati sendiri begitu check-in berikutnya dijawab 410."""
-    code = (payload.code or "").strip().upper()
-    now = time.time()
-    async with _sessions_lock:
-        pairing = _pairings.get(code)
-        if not pairing or pairing.get("claimed") or float(pairing.get("expires_at") or 0) <= now:
-            raise HTTPException(410, "Pairing code expired or invalid.")
-        pairing["claimed"] = True
-        _persist_pairings_unlocked()
-        sid = str(pairing["session_id"])
-        sess = _sessions.get(sid)
-        if not sess or sess.get("owner_uid") != pairing.get("owner_uid"):
-            raise HTTPException(410, "Pairing code expired or invalid.")
-        uid = str(pairing["owner_uid"])
-        for other_sid in [s for s, s2 in _sessions.items()
-                          if s2.get("owner_uid") == uid and s != sid]:
-            _sessions.pop(other_sid, None)
-        _persist_sessions_unlocked()
-    return {"ok": True, "session_id": sid,
-            "backend_url": kaggle_local_runner.resolve_backend_url(str(request.base_url)),
-            "worker_token": str(sess["worker_token"])}
 
 
 async def _enqueue_job(uid: str, job_type: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
