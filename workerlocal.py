@@ -1457,26 +1457,57 @@ def _fallback_summary(ran_tools):
 # Janji tanpa aksi: model kadang menjawab hanya dengan sapaan/kartu "saya akan
 # mencari/menulis..." tanpa memanggil tool sama sekali — lalu giliran dianggap
 # selesai. Nudge sekali per giliran supaya janji itu benar-benar dijalankan.
-_ACTION_USER_RE = re.compile(
-    r"\b(buatkan|buatlah|buatin|tampilkan|tunjukin|tunjukkan|carikan|cari|cek|periksa|"
-    r"kirim|kirimkan|tuliskan|tulis|hitung|jalankan|buka|unduh|download|list)\b",
+# Model 9B lebih sering memakai kata sehari-hari (cari, buat, tulis, cek,
+# "Mari saya...", "Siap, saya...") daripada bentuk formal "akan mencari..." —
+# kedua bentuk harus ketangkap, kalau tidak nudge-nya bolong (kasus Windah:
+# "Mari saya cari gambar..." lolos tanpa nudge).
+_ACTION_VERBS = (
+    "buatkan|buatlah|buatin|bikinin|tampilkan|tampilin|tunjukin|tunjukkan|"
+    "carikan|cariin|cari|cek|cekin|periksa|kirim|kirimin|kirimkan|tuliskan|"
+    "tulis|tulisin|hitung|itung|jalankan|jalanin|buka|bukain|unduh|download|"
+    "list|hapus|hapusin|hapuskan|pindah|pindahin|pindahkan|rename|ubah|edit|"
+    "simpan|simpanin|ambil|ambilin|kompres|zip"
+)
+_ACTION_USER_RE = re.compile(rf"\b({_ACTION_VERBS})\b", re.IGNORECASE)
+# Minta gambar/file/foto tanpa kata kerja ("gambar Prabowo dong") tetap
+# dihitung sebagai permintaan aksi — sisi janji tetap harus cocok juga.
+_ACTION_NOUN_RE = re.compile(
+    r"\b(gambar|foto|file|video)\b.{0,20}\b(dong|tolong|coba|nih|aja)\b"
+    r"|\b(dong|tolong|coba)\b.{0,20}\b(gambar|foto|file|video)\b",
     re.IGNORECASE,
 )
-_PROMISE_RE = re.compile(
-    r"\b(akan|mau)\s+\w*\s*(mencari|membuat|menulis|mengecek|menampilkan|mengirim|"
-    r"menghitung|menjalankan|memeriksa|membuka|mengunduh)\b"
-    r"|\b(menulis|membuat|mencari|mengirim|mengecek|menampilkan)\s+"
-    r"(file|gambar|informasi|data|hasil)\b",
+_PROMISE_VERBS = (
+    "cari|mencari|carikan|cariin|buat|membuat|buatin|bikin|bikinin|tulis|menulis|"
+    "tulisin|cek|mengecek|cekin|kirim|mengirim|kirimin|hapus|menghapus|hapusin|"
+    "tampil|tampilkan|menampilkan|tampilin|lihat|melihat|liat|unduh|mengunduh|"
+    "hitung|menghitung|itung|jalanin|menjalankan|buka|membuka|bukain|periksa|"
+    "memeriksa|tunjukin|ambil|mengambil|ambilin|simpan|menyimpan|simpanin|"
+    "ubah|mengubah|edit|mengerjakan|kerjain|kerjakan|proses|pindah|memindah|pindahin"
+)
+_PROMISE_INTRO_RE = re.compile(
+    rf"\b(akan|mau|mari|siap|oke|baik)\b.{{0,40}}?\b({_PROMISE_VERBS})\b",
+    re.IGNORECASE,
+)
+_PROMISE_OBJECT_RE = re.compile(
+    rf"\b({_PROMISE_VERBS})\s+(gambar|foto|file|informasi|data|hasil|folder|video|lagu)\b",
     re.IGNORECASE,
 )
 
 
 def _looks_like_unkept_promise(visible, user_content):
     """Benar kalau user meminta aksi DAN jawaban model hanya janji untuk
-    melakukannya — tanpa tool apa pun yang jalan di giliran ini."""
+    melakukannya — tanpa tool apa pun yang jalan di giliran ini. Janji bisa
+    berbentuk formal ("akan mencari...") atau sehari-hari ("Mari saya cari...",
+    "Siap, saya buatin..."). Pola kata-kerja + objek ("Menulis file ...") hanya
+    dicek di awal jawaban — sapaan/janji selalu di depan, sedangkan isi jawaban
+    yang beneran (langkah, tabel) boleh menyebut kata yang sama di belakang."""
     if not visible or not user_content:
         return False
-    return bool(_ACTION_USER_RE.search(user_content) and _PROMISE_RE.search(visible))
+    if not (_ACTION_USER_RE.search(user_content) or _ACTION_NOUN_RE.search(user_content)):
+        return False
+    if _PROMISE_INTRO_RE.search(visible):
+        return True
+    return bool(_PROMISE_OBJECT_RE.search(visible[:300]))
 
 
 def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None):
