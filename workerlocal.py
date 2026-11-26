@@ -1224,12 +1224,26 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     empty_retry = False
     stuck_reason = None
     opening_sent = False  # sapaan pembuka dikirim sekali, sebelum tool pertama jalan
-    total_tokens = 0    # akumulasi usage dari semua panggilan model di jawaban ini
+    total_tokens = 0       # akumulasi total_tokens dari semua panggilan model di jawaban ini
+    prompt_tokens = 0      # akumulasi prompt_tokens (input) dari semua panggilan model
+    completion_tokens = 0  # akumulasi completion_tokens (output) dari semua panggilan model
 
     def _report_tokens():
-        if total_tokens > 0:
-            _step(_new_id(), kind="info",
-                  title=f"{strings['tokens_used']}: {_fmt_tokens(total_tokens, language)}", status="done")
+        total = total_tokens if total_tokens > 0 else prompt_tokens + completion_tokens
+        if total <= 0:
+            return
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            # llama-server tidak mengembalikan rincian input/output: tampilkan total saja seperti dulu.
+            title = f"{strings['tokens_used']}: {_fmt_tokens(total, language)}"
+        else:
+            parts = []
+            if prompt_tokens > 0:
+                parts.append(f"{_fmt_tokens(prompt_tokens, language)} input")
+            if completion_tokens > 0:
+                parts.append(f"{_fmt_tokens(completion_tokens, language)} output")
+            parts.append(f"{_fmt_tokens(total, language)} total")
+            title = f"{strings['tokens_used']}: {' · '.join(parts)}"
+        _step(_new_id(), kind="info", title=title, status="done")
 
     # Loop jalan sampai model sendiri memutuskan menjawab — seperti manusia yang
     # berhenti saat merasa sudah cukup, bukan karena kuota langkah habis.
@@ -1246,6 +1260,8 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         try:
             message, usage = _stream_call(with_tools=True)
             total_tokens += int((usage or {}).get("total_tokens") or 0)
+            prompt_tokens += int((usage or {}).get("prompt_tokens") or 0)
+            completion_tokens += int((usage or {}).get("completion_tokens") or 0)
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
@@ -1377,6 +1393,8 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     try:
         final_message, final_usage = _stream_call(with_tools=False)
         total_tokens += int((final_usage or {}).get("total_tokens") or 0)
+        prompt_tokens += int((final_usage or {}).get("prompt_tokens") or 0)
+        completion_tokens += int((final_usage or {}).get("completion_tokens") or 0)
         final_visible, _ = _split_thinking(final_message)
     except Exception:
         final_visible = ""
