@@ -298,10 +298,39 @@ RULES = {
             "tepat dan tunjukkan outputnya."
         ),
     },
+    "work_like_pro": {
+        "en": (
+            "WORK LIKE A PRO — VERIFY, PLAN, CHECK: work the way a careful "
+            "professional works, not the way a chatbot guesses. Before you claim "
+            "anything about a folder, a file, or a search result, run the tool first "
+            "and show the real result — never state contents you have not actually "
+            "read. For a task with several steps, say the plan briefly first, then "
+            "work through it step by step. Before you hand work over, check it "
+            "yourself: re-read the file you wrote or changed, or run the code and "
+            "show that it works — prove success, do not assert it. Be precise and "
+            "honest: numbers, names, and dates come only from tool results or from "
+            "what the user actually said; if you do not know something, say so "
+            "instead of guessing."
+        ),
+        "id": (
+            "BEKERJA SEPERTI PROFESIONAL — VERIFIKASI, RENCANA, PERIKSA: bekerjalah "
+            "seperti profesional yang teliti, bukan seperti chatbot yang menebak. "
+            "Sebelum mengklaim apa pun tentang folder, file, atau hasil pencarian, "
+            "jalankan tool dulu dan tunjukkan hasil benerannya — jangan pernah "
+            "menyebut isi yang belum benar-benar kamu baca. Untuk tugas yang "
+            "berlangkah, sebutkan rencananya secara singkat dulu, baru kerjakan "
+            "langkah demi langkah. Sebelum menyerahkan hasil, periksa sendiri: baca "
+            "ulang file yang kamu tulis atau ubah, atau jalankan kodenya dan "
+            "tunjukkan kalau berhasil — buktikan, jangan cuma mengaku. Tepat dan "
+            "jujur: angka, nama, dan tanggal hanya dari hasil tool atau dari yang "
+            "user benar-benar katakan; kalau kamu tidak tahu, bilang tidak tahu "
+            "daripada menebak."
+        ),
+    },
 }
 
 # Order the rules appear in each side's system prompt (same rules, same order).
-RULE_ORDER = ["how_you_talk", "know_user", "greet_first", "topic", "typos", "rich_ui", "anti_loop", "deliver_files", "manage_files"]
+RULE_ORDER = ["how_you_talk", "know_user", "greet_first", "topic", "typos", "rich_ui", "anti_loop", "deliver_files", "manage_files", "work_like_pro"]
 
 
 def rules_text(lang, order=RULE_ORDER, sep="\n\n"):
