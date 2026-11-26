@@ -23,6 +23,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import agent_memory
 from . import kaggle_local_runner
 from .kaggle_settings import authenticate_user, get_user_credentials
 
@@ -601,15 +602,23 @@ async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: fl
 
 async def local_chat(payload: LocalChatPayload, authorization: str | None = Header(default=None)):
     uid = authenticate_user(authorization)
+    base_context = payload.context if isinstance(payload.context, dict) else {}
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
                    "language": _normalize_agent_language(payload.language),
-                   "context": payload.context if isinstance(payload.context, dict) else {},
+                   "context": {**base_context, **agent_memory.load_memory_context(uid)},
                    "history": payload.history if isinstance(payload.history, list) else []}
     kaggle_local_runner.reset_activity_log(uid)
     result = await _enqueue_and_wait(uid, "chat", job_payload, CHAT_JOB_TIMEOUT_SECONDS)
     if not result.get("ok"):
         raise HTTPException(502, result.get("error") or "AI Local failed to process the message.")
     inner = result.get("result") or {}
+    # Memories the worker collected via the remember tool: persist them now
+    # (the worker has no Firestore access). Best-effort — never fail the chat.
+    for mem in (inner.get("memories_saved") or []):
+        try:
+            agent_memory.save_memory(uid, str(mem), source="ai")
+        except Exception:
+            pass
     content = inner.get("content") or ""
     attachments = inner.get("attachments") if isinstance(inner.get("attachments"), list) else []
     payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
@@ -626,9 +635,10 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
     lalu satu event final berisi jawaban lengkap + lampiran. Sama seperti /chat,
     hanya saja jawabannya tidak menunggu sampai selesai."""
     uid = authenticate_user(authorization)
+    base_context = payload.context if isinstance(payload.context, dict) else {}
     job_payload = {"prompt": payload.prompt, "images": [img.model_dump() for img in payload.images],
                    "language": _normalize_agent_language(payload.language),
-                   "context": payload.context if isinstance(payload.context, dict) else {},
+                   "context": {**base_context, **agent_memory.load_memory_context(uid)},
                    "history": payload.history if isinstance(payload.history, list) else []}
     kaggle_local_runner.reset_activity_log(uid)
     sess, job_id = await _enqueue_job(uid, "chat", job_payload)
@@ -662,6 +672,13 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                             out["attachments"] = inner["attachments"]
                         if isinstance(inner.get("search_images"), list) and inner["search_images"]:
                             out["search_images"] = inner["search_images"]
+                        # Memories the worker collected via remember: persist
+                        # them now (best-effort, never fail the chat).
+                        for mem in (inner.get("memories_saved") or []):
+                            try:
+                                agent_memory.save_memory(uid, str(mem), source="ai")
+                            except Exception:
+                                pass
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
                     break
                 if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":

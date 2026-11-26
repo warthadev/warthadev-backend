@@ -169,7 +169,7 @@ def _shared_rules_text():
     separator — exactly how the worker prompt was already built."""
     return "\n".join(SHARED_RULES_ID[name] for name in SHARED_RULE_ORDER_ID)
 
-TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'delete_path', 'description': 'Menghapus file atau seluruh folder di disk worker Kaggle. Hanya berlaku di dalam workspace (/kaggle/working); workspace itu sendiri tidak bisa dihapus. Selalu panggil list_dir dulu ke targetnya.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dihapus, misal /kaggle/working/out/lama.txt'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'move_path', 'description': 'Memindah atau me-rename file atau folder di disk worker Kaggle. Sumber dan tujuan harus di dalam workspace (/kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dipindah, misal /kaggle/working/out/a.txt'}, 'destination': {'type': 'string', 'description': 'Lokasi baru, misal /kaggle/working/arsip/a.txt'}}, 'required': ['path', 'destination']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_image_search', 'description': 'Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya. Hanya bilang gambar ditemukan kalau tool ini benar-benar mengembalikan thumbnail; kalau tidak ada hasil, bilang tidak ada gambar yang ditemukan, jangan mengaku sudah menemukannya.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}]
+TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'delete_path', 'description': 'Menghapus file atau seluruh folder di disk worker Kaggle. Hanya berlaku di dalam workspace (/kaggle/working); workspace itu sendiri tidak bisa dihapus. Selalu panggil list_dir dulu ke targetnya.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dihapus, misal /kaggle/working/out/lama.txt'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'move_path', 'description': 'Memindah atau me-rename file atau folder di disk worker Kaggle. Sumber dan tujuan harus di dalam workspace (/kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dipindah, misal /kaggle/working/out/a.txt'}, 'destination': {'type': 'string', 'description': 'Lokasi baru, misal /kaggle/working/arsip/a.txt'}}, 'required': ['path', 'destination']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_image_search', 'description': 'Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya. Hanya bilang gambar ditemukan kalau tool ini benar-benar mengembalikan thumbnail; kalau tidak ada hasil, bilang tidak ada gambar yang ditemukan, jangan mengaku sudah menemukannya.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'remember', 'description': 'Mengingat fakta awet tentang user untuk chat berikutnya: preferensi, detail proyek, nama, atau hal yang user minta diingat. Simpan HANYA fakta yang tetap benar antar chat — jangan pernah password, rahasia, API key, atau kode pribadi, jangan seluruh percakapan, dan jangan hal yang user sebut sekilas saja. Satu kalimat pendek per panggilan. User bisa melihat dan menghapus semua yang kamu simpan.', 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string', 'description': 'Satu fakta pendek yang diingat.'}}, 'required': ['text']}}}]
 
 def _short_preview(text, limit, lang):
     """Truncate a preview the way the worker's _short does: strip, then cap with
@@ -304,6 +304,9 @@ def tool_detail(name, args):
     if name in ("web_search", "web_image_search"):
         q = str(args.get("query") or "")[:60]
         return f" “{q}”" if q else ""
+    if name == "remember":
+        t = str(args.get("text") or "")[:60]
+        return f" “{t}”" if t else ""
     if name == "web_fetch":
         u = str(args.get("url") or "")[:70]
         return f" ({u})" if u else ""
@@ -361,6 +364,10 @@ def build_context_note(context, lang="en", side="cloud"):
     time_str = str(ctx.get("time") or "").strip()
     user_name = str(ctx.get("user_name") or "").strip()
     user_location = str(ctx.get("user_location") or "").strip()
+    instructions = str(ctx.get("ai_instructions") or "").strip()
+    raw_memories = ctx.get("ai_memory") or []
+    mem_lines = [str(m).strip() for m in raw_memories
+                 if isinstance(raw_memories, list) and str(m).strip()]
     if side == "worker":
         now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         lines = ["[KONTEKS SAAT INI]"]
@@ -368,6 +375,11 @@ def build_context_note(context, lang="en", side="cloud"):
             lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
         if user_location:
             lines.append(f"- Lokasi user: {user_location}.")
+        if instructions:
+            lines.append(f"- Instruksi khusus dari user (disimpan, selalu patuhi): {instructions}")
+        if mem_lines:
+            lines.append("- Ingatan tentang user (fakta tersimpan dari chat sebelumnya, pakai kalau relevan):")
+            lines.extend(f"  • {m}" for m in mem_lines)
         if tz or local_time or date_str or time_str:
             when = "- Waktu user sekarang: "
             if date_str:
@@ -385,13 +397,17 @@ def build_context_note(context, lang="en", side="cloud"):
         lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
                      "Jangan menebak kota user dari zona waktu saja.")
         return "\n".join(lines)
-    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location:
+    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location and not instructions and not mem_lines:
         return None
     parts = ["[CURRENT CONTEXT]"]
     if user_name:
         parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
     if user_location:
         parts.append(f"The user is in {user_location}.")
+    if instructions:
+        parts.append(f"Saved instructions from the user (always follow them): {instructions}")
+    if mem_lines:
+        parts.append("Saved memories about the user (facts from earlier chats, use when relevant):\n" + "\n".join(f"- {m}" for m in mem_lines))
     if date_str or time_str or local_time:
         when = "Right now it is "
         if date_str:
@@ -1065,6 +1081,15 @@ def exec_tool(name, args, base_dir=BASE_DIR):
         if name == "read_document":
             return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT)
 
+        if name == "remember":
+            # Tidak menulis ke Firestore dari worker (kredensial tidak ada di
+            # Kaggle): kembalikan marker, run_agent_turn mengumpulkannya dan
+            # backend yang menyimpan ke Firestore setelah giliran selesai.
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "Error: Tidak ada fakta yang disimpan (teks kosong)."
+            return {"__memory__": text[:500]}
+
         return f"Error: Tool '{name}' tidak dikenal."
     except Exception as ex:
         return f"Error eksekusi {name}: {ex}"
@@ -1077,7 +1102,7 @@ def build_system_prompt(base_dir):
         f"WORKSPACE UTAMA: `{base_dir}` (dan `/kaggle/input` untuk data read-only).\n"
         f"FILE UPLOAD PENGGUNA: `{base_dir}/uploads`. Untuk PDF, DOCX, PPTX, XLSX, CSV, gambar berisi teks, "
         "audio, video, dan arsip zip/tar gunakan tool read_document. Jangan memakai read_file pada file biner.\n"
-        "TOOLS: list_dir, read_file, patch_file, write_file, delete_path, move_path, run_bash, web_search, web_image_search, web_fetch, inspect_image, read_document.\n"
+        "TOOLS: list_dir, read_file, patch_file, write_file, delete_path, move_path, run_bash, web_search, web_image_search, web_fetch, inspect_image, read_document, remember.\n"
         "Cara kerja profesional:\n"
         "- Sebelum mengerjakan tugas besar, pahami dulu konteks: cek folder, baca file relevan, atau tanya user "
         "jika informasi penting kurang (nama proyek, API key, target deploy, kredensial, dsb).\n"
@@ -1203,6 +1228,7 @@ AGENT_STRINGS = {
             "web_fetch": "Mengambil halaman web…",
             "inspect_image": "Menganalisis gambar…",
             "read_document": "Membaca dokumen…",
+            "remember": "Mengingat…",
         },
         "thinking": "Sedang berpikir…",
         "thought_done": "Berpikir",
@@ -1230,6 +1256,7 @@ AGENT_STRINGS = {
             "web_fetch": "Fetching web page…",
             "inspect_image": "Analyzing image…",
             "read_document": "Reading document…",
+            "remember": "Remembering…",
         },
         "thinking": "Thinking…",
         "thought_done": "Thought",
@@ -1472,7 +1499,7 @@ _SELF_CHECK_MESSAGE = (
 )
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None):
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None):
     strings = _agent_strings(language)
     def _act(msg):
         if on_activity:
@@ -1678,6 +1705,15 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 text_result = f"Gambar '{img_fp}' dimuat untuk inspeksi visual."
                 history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
                 pending_images.append((img_fp, q_img))
+                ok = True
+            elif isinstance(result, dict) and "__memory__" in result:
+                # remember: kumpulkan faktanya untuk backend (disimpan ke
+                # Firestore setelah giliran selesai, bukan ditempel di teks).
+                mem_text = str(result["__memory__"]).strip()
+                if memories_out is not None and mem_text and mem_text not in memories_out and len(memories_out) < 50:
+                    memories_out.append(mem_text)
+                text_result = f"Ingatan tersimpan: {mem_text}"
+                history.append({"role": "tool", "tool_call_id": tc["id"], "name": fn_name, "content": text_result})
                 ok = True
             else:
                 text_result = clip_tool_result(str(result), "id")
@@ -1992,11 +2028,13 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
                     _cancel_event.clear()
                     search_images: list[str] = []
+                    memories: list[str] = []
                     answer = run_agent_turn(history, api_url, base_dir, content,
                                             on_activity=lambda _m: None, on_step=_report_step,
                                             language=payload.get("language"), on_opening=_report_opening,
                                             cancelled=_cancel_event.is_set, context=payload.get("context"),
-                                            on_token=_report_stream, search_images_out=search_images)
+                                            on_token=_report_stream, search_images_out=search_images,
+                                            memories_out=memories)
                     if _stream_state["buf"]:
                         try:
                             _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": _stream_state["seg"], "delta": _stream_state["buf"]}, timeout=5)
@@ -2013,6 +2051,8 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         result_body["attachments"] = attachments
                     if search_images:
                         result_body["search_images"] = search_images
+                    if memories:
+                        result_body["memories_saved"] = memories
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": result_body})
                 elif job_type == "workspace":
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)
@@ -2022,7 +2062,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     # giliran agen. Tidak masuk ke history percakapan worker —
                     # cloud yang memegang pembahasannya dan menerima hasilnya.
                     result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
-                    if isinstance(result_text, dict) and "__image_payload__" in result_text:
+                    if isinstance(result_text, dict) and "__memory__" in result_text:
+                        # remember via tool job langsung: cloud tidak pernah
+                        # mengirim ini (ditangani di backend), tapi jangan
+                        # kembalikan repr dict mentah kalau sampai terjadi.
+                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": f"Ingatan tersimpan: {result_text['__memory__']}"}})
+                    elif isinstance(result_text, dict) and "__image_payload__" in result_text:
                         # inspect_image: hand the cloud model the image itself
                         # (base64), not the dict repr — otherwise the image never
                         # reaches it. run_kaggle_tool passes the image through.

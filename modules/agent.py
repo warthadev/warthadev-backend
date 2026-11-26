@@ -18,6 +18,7 @@ from firebase_admin import auth, firestore
 from pydantic import BaseModel, Field
 
 from . import agent_local
+from . import agent_memory
 from . import agent_shared
 from .agent_prompt import DEFAULT_SYSTEM_INSTRUCTION
 from .agent_ssrf import RouterTarget, make_pinned_connector, validate_router_base_url
@@ -424,6 +425,14 @@ def _build_context_note(context: dict[str, Any] | None) -> str | None:
     return agent_shared.build_context_note(context, lang="en", side="cloud")
 
 
+def _with_memory_context(payload: AgentChatPayload, user_id: str) -> None:
+    """Merge the user's saved instructions + memories into the chat context
+    (one Firestore read per chat; never fails the chat). The frontend never
+    sends the ai_instructions/ai_memory keys, so the merge is additive."""
+    base = payload.context if isinstance(payload.context, dict) else {}
+    payload.context = {**base, **agent_memory.load_memory_context(user_id)}
+
+
 def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [{"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION}]
     for item in payload.history:
@@ -534,11 +543,51 @@ async def agent_models(authorization: str | None = Header(default=None)):
     return {"configured": True, "provider": OPENROUTER_PROVIDER, "models": models}
 
 
+class AgentMemoryInstructionsPayload(BaseModel):
+    instructions: str = Field(default="", max_length=2000)
+
+
+class AgentMemoryEntryPayload(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+@router.get("/memory")
+def get_agent_memory(authorization: str | None = Header(default=None)):
+    """Saved instructions + memories for the Settings page."""
+    user_id = str(_claims(authorization)["uid"])
+    return {"success": True, "data": agent_memory.get_all(user_id)}
+
+
+@router.put("/memory/instructions")
+def save_agent_memory_instructions(payload: AgentMemoryInstructionsPayload, authorization: str | None = Header(default=None)):
+    user_id = str(_claims(authorization)["uid"])
+    saved = agent_memory.save_instructions(user_id, payload.instructions)
+    return {"success": True, "instructions": saved}
+
+
+@router.post("/memory/memories")
+def add_agent_memory(payload: AgentMemoryEntryPayload, authorization: str | None = Header(default=None)):
+    user_id = str(_claims(authorization)["uid"])
+    saved = agent_memory.save_memory(user_id, payload.text, source="user")
+    if saved is None:
+        raise HTTPException(status_code=400, detail="Memory text is empty")
+    return {"success": True, "memory": saved}
+
+
+@router.delete("/memory/memories/{memory_id}")
+def delete_agent_memory(memory_id: str, authorization: str | None = Header(default=None)):
+    user_id = str(_claims(authorization)["uid"])
+    if not agent_memory.delete_memory(user_id, memory_id):
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"success": True, "deleted": True}
+
+
 @router.post("/chat")
 async def agent_chat(payload: AgentChatPayload, authorization: str | None = Header(default=None)):
     claims = _claims(authorization)
     images = _validate_chat_images(payload.images)
     user_id = str(claims["uid"])
+    _with_memory_context(payload, user_id)
     provider = _normalize_provider(payload.provider)
     selected_model = (payload.model or "").strip()
     if not selected_model:
@@ -597,9 +646,11 @@ async def _drain_plain_chat_events(payload: AgentChatPayload, images: list[dict[
 
 
 # Tools the cloud model can use when the user's local worker is ready.
-# One canonical definition in agent_shared (the same 9 tools the worker offers,
+# One canonical definition in agent_shared (the same 13 tools the worker offers,
 # English descriptions because the cloud prompt is in English). The worker's
 # copy is generated from the same definition by scripts/sync_worker_shared.py.
+# Exception: remember runs on this backend (Firestore), not on the worker,
+# so the loop offers it even when no worker is live.
 _KAGGLE_TOOLS = agent_shared.tools_for("en")
 
 _TOOL_RESULT_LIMIT = agent_shared.TOOL_RESULT_LIMIT
@@ -639,7 +690,11 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
         use_tools = await agent_local.local_tools_available(user_id)
     except Exception:
         use_tools = False
-    tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else None
+    # remember runs on this backend (Firestore), not on the Kaggle worker,
+    # so it is offered even when no worker is live — the user can build
+    # memory from Cloud-only chats too.
+    _remember_tool = [t for t in _KAGGLE_TOOLS if t["function"]["name"] == "remember"]
+    tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else (_remember_tool or None)
     accumulated_text = ""
     accumulated_usage: dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     result_model = selected_model
@@ -786,7 +841,13 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                     result_text = agent_shared.repeat_warning(seen_calls[signature], "en")
                 else:
                     try:
-                        raw_result = await agent_local.run_kaggle_tool(user_id, name, args)
+                        if name == "remember":
+                            # Runs here on the backend (Firestore), never on
+                            # the worker — the worker has no Firestore access.
+                            saved = agent_memory.save_memory(user_id, str(args.get("text") or ""), source="ai")
+                            raw_result = f"Saved memory: {saved['text']}" if saved else "Nothing saved (empty text)."
+                        else:
+                            raw_result = await agent_local.run_kaggle_tool(user_id, name, args)
                     except Exception as exc:
                         result_text = f"Error: {str(exc)[:500]}"
                     else:
@@ -870,6 +931,7 @@ async def agent_chat_stream(payload: AgentChatPayload, authorization: str | None
     claims = _claims(authorization)
     images = _validate_chat_images(payload.images)
     user_id = str(claims["uid"])
+    _with_memory_context(payload, user_id)
     _normalize_provider(payload.provider)
     selected_model = (payload.model or "").strip()
     if not selected_model:

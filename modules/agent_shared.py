@@ -357,6 +357,10 @@ def build_context_note(context, lang="en", side="cloud"):
     time_str = str(ctx.get("time") or "").strip()
     user_name = str(ctx.get("user_name") or "").strip()
     user_location = str(ctx.get("user_location") or "").strip()
+    instructions = str(ctx.get("ai_instructions") or "").strip()
+    raw_memories = ctx.get("ai_memory") or []
+    mem_lines = [str(m).strip() for m in raw_memories
+                 if isinstance(raw_memories, list) and str(m).strip()]
     if side == "worker":
         now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         lines = ["[KONTEKS SAAT INI]"]
@@ -364,6 +368,11 @@ def build_context_note(context, lang="en", side="cloud"):
             lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
         if user_location:
             lines.append(f"- Lokasi user: {user_location}.")
+        if instructions:
+            lines.append(f"- Instruksi khusus dari user (disimpan, selalu patuhi): {instructions}")
+        if mem_lines:
+            lines.append("- Ingatan tentang user (fakta tersimpan dari chat sebelumnya, pakai kalau relevan):")
+            lines.extend(f"  • {m}" for m in mem_lines)
         if tz or local_time or date_str or time_str:
             when = "- Waktu user sekarang: "
             if date_str:
@@ -381,13 +390,17 @@ def build_context_note(context, lang="en", side="cloud"):
         lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
                      "Jangan menebak kota user dari zona waktu saja.")
         return "\n".join(lines)
-    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location:
+    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location and not instructions and not mem_lines:
         return None
     parts = ["[CURRENT CONTEXT]"]
     if user_name:
         parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
     if user_location:
         parts.append(f"The user is in {user_location}.")
+    if instructions:
+        parts.append(f"Saved instructions from the user (always follow them): {instructions}")
+    if mem_lines:
+        parts.append("Saved memories about the user (facts from earlier chats, use when relevant):\n" + "\n".join(f"- {m}" for m in mem_lines))
     if date_str or time_str or local_time:
         when = "Right now it is "
         if date_str:
@@ -571,11 +584,36 @@ TOOL_DEFS = [
         },
         "required": ["path"],
     },
+    {
+        "name": "remember",
+        "description": {
+            "en": (
+                "Remember a durable fact about the user for future chats: a preference, "
+                "a project detail, a name, or something the user asked you to remember. "
+                "Save ONLY facts that stay true across chats — never passwords, secrets, "
+                "API keys, or private codes, never a whole conversation, and never "
+                "something the user only mentioned in passing. One short sentence per call. "
+                "The user can see and delete everything you save."
+            ),
+            "id": (
+                "Mengingat fakta awet tentang user untuk chat berikutnya: preferensi, "
+                "detail proyek, nama, atau hal yang user minta diingat. Simpan HANYA fakta "
+                "yang tetap benar antar chat — jangan pernah password, rahasia, API key, "
+                "atau kode pribadi, jangan seluruh percakapan, dan jangan hal yang user "
+                "sebut sekilas saja. Satu kalimat pendek per panggilan. User bisa melihat "
+                "dan menghapus semua yang kamu simpan."
+            ),
+        },
+        "params": {
+            "text": _param("string", "One short fact to remember.", "Satu fakta pendek yang diingat."),
+        },
+        "required": ["text"],
+    },
 ]
 
 
 def tools_for(lang):
-    """The 12 tool schemas in OpenAI function-call shape, in the given language."""
+    """The 13 tool schemas in OpenAI function-call shape, in the given language."""
     out = []
     for tool in TOOL_DEFS:
         properties = {}
@@ -742,6 +780,9 @@ def tool_detail(name, args):
     if name in ("web_search", "web_image_search"):
         q = str(args.get("query") or "")[:60]
         return f" “{q}”" if q else ""
+    if name == "remember":
+        t = str(args.get("text") or "")[:60]
+        return f" “{t}”" if t else ""
     if name == "web_fetch":
         u = str(args.get("url") or "")[:70]
         return f" ({u})" if u else ""
