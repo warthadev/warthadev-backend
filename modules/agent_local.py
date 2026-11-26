@@ -587,13 +587,17 @@ async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: fl
     Satu pengecualian: inspect_image mengembalikan dict {"content": ..., "image": {...}}
     supaya gambarnya bisa diteruskan ke model sebagai pesan visual, bukan sebagai
     teks mentah — sebelumnya cloud hanya menerima repr dict-nya dan gambar tidak
-    pernah sampai ke model."""
+    pernah sampai ke model. Pengecualian kedua: request_access mengembalikan
+    {"content": ..., "pending_request": {...}} supaya permintaan ke user tidak
+    hilang di jalan."""
     result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args}, timeout)
     if isinstance(result, dict) and result.get("ok"):
         inner = result.get("result") or {}
         if isinstance(inner, dict):
             if isinstance(inner.get("image"), dict):
                 return {"content": str(inner.get("content") or ""), "image": inner["image"]}
+            if isinstance(inner.get("pending_request"), dict):
+                return {"content": str(inner.get("content") or ""), "pending_request": inner["pending_request"]}
             return str(inner.get("content") or "")
         return str(inner)
     err = result.get("error") if isinstance(result, dict) else None
@@ -619,6 +623,13 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
             agent_memory.save_memory(uid, str(mem), source="ai")
         except Exception:
             pass
+    # Plans the worker saved via the update_plan tool: persist them now
+    # (the worker has no Firestore access). Best-effort — never fail the chat.
+    if isinstance(inner.get("plans_saved"), list):
+        try:
+            agent_memory.save_plan(uid, inner["plans_saved"])
+        except Exception:
+            pass
     content = inner.get("content") or ""
     attachments = inner.get("attachments") if isinstance(inner.get("attachments"), list) else []
     payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
@@ -626,6 +637,8 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
         payload_out["attachments"] = attachments
     if isinstance(inner.get("search_images"), list) and inner["search_images"]:
         payload_out["search_images"] = inner["search_images"]
+    if isinstance(inner.get("pending_request"), dict) and inner["pending_request"]:
+        payload_out["pending_request"] = inner["pending_request"]
     return {"success": True, "data": {"result": payload_out}}
 
 
@@ -672,11 +685,19 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                             out["attachments"] = inner["attachments"]
                         if isinstance(inner.get("search_images"), list) and inner["search_images"]:
                             out["search_images"] = inner["search_images"]
+                        if isinstance(inner.get("pending_request"), dict) and inner["pending_request"]:
+                            out["pending_request"] = inner["pending_request"]
                         # Memories the worker collected via remember: persist
                         # them now (best-effort, never fail the chat).
                         for mem in (inner.get("memories_saved") or []):
                             try:
                                 agent_memory.save_memory(uid, str(mem), source="ai")
+                            except Exception:
+                                pass
+                        # Plans the worker saved via update_plan: same.
+                        if isinstance(inner.get("plans_saved"), list):
+                            try:
+                                agent_memory.save_plan(uid, inner["plans_saved"])
                             except Exception:
                                 pass
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")

@@ -8,6 +8,11 @@ credentials and the OpenRouter key records):
 - ``aiMemories`` subcollection: one document per saved fact, each
   ``{text, source, createdAt}`` where source is "ai" (saved by the agent
   through the ``remember`` tool) or "user" (typed in Settings).
+- ``aiPlan``: the running plan for multi-step work, one list of
+  ``{text, done}`` steps (max 20, 200 chars each), saved by the agent
+  through the ``update_plan`` tool or edited in Settings. Shown in every
+  chat's context note so the agent can remind the user what is done and
+  what is left.
 
 Caps keep the injected context small: at most 50 entries, 500 chars each,
 4000 chars total injected into one chat; instructions at most 2000 chars.
@@ -30,6 +35,8 @@ MEMORY_MAX_ENTRIES = 50
 MEMORY_MAX_ENTRY_CHARS = 500
 MEMORY_INJECT_MAX_CHARS = 4000
 INSTRUCTIONS_MAX_CHARS = 2000
+PLAN_MAX_ITEMS = 20
+PLAN_MAX_ITEM_CHARS = 200
 
 _MEMORIES = "aiMemories"
 
@@ -92,9 +99,37 @@ def load_memory_context(user_id: str) -> dict[str, Any]:
             out["ai_instructions"] = instructions
         if memories:
             out["ai_memory"] = memories
+        plan = _clean_plan(data.get("aiPlan"))
+        if plan:
+            out["ai_plan"] = plan
         return out
     except Exception:
         return {}
+
+
+def _clean_plan(raw: Any) -> list[dict[str, Any]]:
+    """Normalize the stored plan to [{text, done}]: at most PLAN_MAX_ITEMS,
+    one short line each. Accepts dicts or plain strings (done=False)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw[:PLAN_MAX_ITEMS]:
+        if isinstance(item, dict):
+            text = _clean_text(item.get("text"), PLAN_MAX_ITEM_CHARS)
+            done = bool(item.get("done"))
+        else:
+            text = _clean_text(item, PLAN_MAX_ITEM_CHARS)
+            done = False
+        if text:
+            out.append({"text": text, "done": done})
+    return out
+
+
+def save_plan(user_id: str, items: Any) -> list[dict[str, Any]]:
+    """Replace the running plan with the given steps (empty clears it)."""
+    plan = _clean_plan(items)
+    _user_doc(user_id).set({"aiPlan": plan}, merge=True)
+    return plan
 
 
 def get_all(user_id: str) -> dict[str, Any]:
@@ -111,7 +146,7 @@ def get_all(user_id: str) -> dict[str, Any]:
         .limit(MEMORY_MAX_ENTRIES)
         .stream()
     ]
-    return {"instructions": instructions, "memories": memories}
+    return {"instructions": instructions, "memories": memories, "plan": _clean_plan(data.get("aiPlan"))}
 
 
 def save_instructions(user_id: str, text: Any) -> str:

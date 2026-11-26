@@ -551,6 +551,10 @@ class AgentMemoryEntryPayload(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
 
+class AgentMemoryPlanPayload(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
 @router.get("/memory")
 def get_agent_memory(authorization: str | None = Header(default=None)):
     """Saved instructions + memories for the Settings page."""
@@ -580,6 +584,14 @@ def delete_agent_memory(memory_id: str, authorization: str | None = Header(defau
     if not agent_memory.delete_memory(user_id, memory_id):
         raise HTTPException(status_code=404, detail="Memory not found")
     return {"success": True, "deleted": True}
+
+
+@router.put("/memory/plan")
+def save_agent_memory_plan(payload: AgentMemoryPlanPayload, authorization: str | None = Header(default=None)):
+    """Replace the running plan (empty list clears it)."""
+    user_id = str(_claims(authorization)["uid"])
+    saved = agent_memory.save_plan(user_id, payload.items)
+    return {"success": True, "plan": saved}
 
 
 @router.post("/chat")
@@ -614,6 +626,7 @@ async def agent_chat(payload: AgentChatPayload, authorization: str | None = Head
                 "usage": result.get("usage") or {},
                 "sources": [],
                 "search_images": result.get("search_images") if isinstance(result.get("search_images"), list) else [],
+                "pending_request": result.get("pending_request") if isinstance(result.get("pending_request"), dict) else None,
             }
         },
     }
@@ -649,8 +662,9 @@ async def _drain_plain_chat_events(payload: AgentChatPayload, images: list[dict[
 # One canonical definition in agent_shared (the same 13 tools the worker offers,
 # English descriptions because the cloud prompt is in English). The worker's
 # copy is generated from the same definition by scripts/sync_worker_shared.py.
-# Exception: remember runs on this backend (Firestore), not on the worker,
-# so the loop offers it even when no worker is live.
+# Exception: remember, update_plan, and request_access run on this backend
+# (Firestore / the frontend), not on the worker, so the loop offers them
+# even when no worker is live.
 _KAGGLE_TOOLS = agent_shared.tools_for("en")
 
 _TOOL_RESULT_LIMIT = agent_shared.TOOL_RESULT_LIMIT
@@ -690,14 +704,16 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
         use_tools = await agent_local.local_tools_available(user_id)
     except Exception:
         use_tools = False
-    # remember runs on this backend (Firestore), not on the Kaggle worker,
-    # so it is offered even when no worker is live — the user can build
-    # memory from Cloud-only chats too.
-    _remember_tool = [t for t in _KAGGLE_TOOLS if t["function"]["name"] == "remember"]
-    tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else (_remember_tool or None)
+    # remember, update_plan, and request_access run on this backend
+    # (Firestore / the frontend), not on the Kaggle worker, so they are
+    # offered even when no worker is live — the user can build memory and
+    # plans from Cloud-only chats too, and the agent can ask for things.
+    _local_tools = [t for t in _KAGGLE_TOOLS if t["function"]["name"] in ("remember", "update_plan", "request_access")]
+    tools: list[dict[str, Any]] | None = _KAGGLE_TOOLS if use_tools else (_local_tools or None)
     accumulated_text = ""
     accumulated_usage: dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     result_model = selected_model
+    pending_request: dict[str, Any] | None = None
     seen_calls: dict[str, str] = {}
     warned_repeats: set[str] = set()
     last_error: str | None = None
@@ -846,6 +862,21 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                             # the worker — the worker has no Firestore access.
                             saved = agent_memory.save_memory(user_id, str(args.get("text") or ""), source="ai")
                             raw_result = f"Saved memory: {saved['text']}" if saved else "Nothing saved (empty text)."
+                        elif name == "update_plan":
+                            # Runs here on the backend (Firestore), never on
+                            # the worker — same as remember.
+                            plan = agent_memory.save_plan(user_id, args.get("items") or [])
+                            raw_result = f"Plan saved ({len(plan)} steps)." if plan else "Plan cleared."
+                        elif name == "request_access":
+                            # Structured request for the user: the turn ends
+                            # here; the frontend shows the right screen and
+                            # the answer comes back as the next user message.
+                            pending_request = {
+                                "kind": str(args.get("kind") or ""),
+                                "question": str(args.get("question") or ""),
+                                "options": args.get("options") if isinstance(args.get("options"), list) else [],
+                            }
+                            raw_result = "Request sent to the user."
                         else:
                             raw_result = await agent_local.run_kaggle_tool(user_id, name, args)
                     except Exception as exc:
@@ -853,6 +884,9 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                     else:
                         if isinstance(raw_result, dict) and isinstance(raw_result.get("image"), dict):
                             pending_images.append(raw_result["image"])
+                            result_text = str(raw_result.get("content") or "")
+                        elif isinstance(raw_result, dict) and isinstance(raw_result.get("pending_request"), dict):
+                            pending_request = raw_result["pending_request"]
                             result_text = str(raw_result.get("content") or "")
                         elif isinstance(raw_result, str):
                             result_text = raw_result
@@ -892,6 +926,11 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                     ]})
             if stuck_reason:
                 break
+            if pending_request:
+                # The user must answer first — end the turn here, no
+                # forced-final round. The answer comes back as the next
+                # user message and the agent continues from history.
+                break
         if stuck_reason:
             messages.append({"role": "user", "content": agent_shared.stuck_final_message(stuck_reason, "en")})
             holder2: dict[str, Any] = {}
@@ -903,7 +942,10 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
         yield "data: [DONE]\n\n"
         return
     if not accumulated_text.strip():
-        accumulated_text = agent_shared.fallback_summary(ran_tools, "en")
+        if pending_request:
+            accumulated_text = pending_request.get("question") or "The agent needs something from you."
+        else:
+            accumulated_text = agent_shared.fallback_summary(ran_tools, "en")
     final_event = {
         "type": "final",
         "result": {
@@ -914,6 +956,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             "search_images": search_images,
         },
     }
+    if pending_request:
+        final_event["result"]["pending_request"] = pending_request
     yield f"data: {json.dumps(final_event)}\n\n"
     yield "data: [DONE]\n\n"
 
