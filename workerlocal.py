@@ -14,6 +14,7 @@ import mimetypes
 import shutil
 import subprocess
 import threading
+import traceback
 import importlib
 import importlib.util
 import urllib.parse
@@ -2189,7 +2190,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
 
         _post("/agent/local/kaggle-poll", {"closing": True, "heartbeat_only": False}, timeout=10)
     except Exception as exc:
-        err = _clean_err(exc)[:400]
+        # Sertakan ekor traceback supaya penyebab matinya kebaca di aplikasi
+        # (System log di kotak error), bukan cuma satu baris pesan error.
+        # Ekor log llama-server sudah ikut di dalam pesan RuntimeError saat
+        # server gagal start, jadi ikut terbawa ke sini.
+        tb_tail = "\n".join(traceback.format_exc().strip().splitlines()[-8:])
+        err = _clean_err(f"{exc}\n{tb_tail}")[:1500]
         print(f"[ai-local] FATAL: {err}", flush=True)
         _status("error", error=err)
     finally:

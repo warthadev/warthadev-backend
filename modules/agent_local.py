@@ -553,7 +553,11 @@ async def _enqueue_and_wait(uid: str, job_type: str, payload: dict[str, Any], ti
             async with _sessions_lock:
                 if sess.get("pending_job", {}).get("job_id") == job_id:
                     sess["pending_job"] = None
-            raise HTTPException(503, "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab.")
+            snap = kaggle_local_runner.worker_snapshot(uid)
+            msg = "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."
+            if snap.get("raw_status") == "error" and snap.get("error"):
+                msg += f" System log: {snap['error']}"
+            raise HTTPException(503, msg)
         await asyncio.sleep(0.5)
 
     async with _sessions_lock:
@@ -702,10 +706,18 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                                 pass
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
                     break
-                if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":
-                    yield ("data: " + json.dumps({"type": "error",
-                                                  "message": "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."},
-                                                 ensure_ascii=False) + "\n\n")
+                snap = kaggle_local_runner.worker_snapshot(uid)
+                if snap.get("status") != "ready":
+                    err_event: dict[str, Any] = {"type": "error",
+                                                 "message": "The AI Local worker stopped mid-request (Kaggle slept or stopped). Restart it from the Local tab."}
+                    # Worker sempat melaporkan penyebab matinya (FATAL / ekor log
+                    # llama-server): sertakan supaya aplikasi bisa menampilkannya
+                    # sebagai System log, bukan cuma pesan generik. Kalau kernel
+                    # mati diam-diam tanpa laporan, tidak ada detail yang bisa
+                    # ditampilkan — pesannya tetap generik seperti sebelumnya.
+                    if snap.get("raw_status") == "error" and snap.get("error"):
+                        err_event["detail"] = str(snap["error"])
+                    yield ("data: " + json.dumps(err_event, ensure_ascii=False) + "\n\n")
                     break
                 if time.time() >= deadline:
                     yield ("data: " + json.dumps({"type": "error", "message": "AI Local did not reply in time."},
