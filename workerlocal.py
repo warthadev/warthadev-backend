@@ -808,9 +808,8 @@ def build_system_prompt(base_dir):
         "Kalau typo itu bikin perintah jadi ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — "
         "tanyakan dulu ke user sebelum bertindak. Jangan menebak diam-diam untuk hal yang penting (hapus file, "
         "kirim sesuatu, ubah data).\n"
-        "KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta "
-        "wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat. Kamu tahu nama dan lokasi user dari awal; "
-        "kamu TIDAK berada di lokasi user. Jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya.\n"        "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. "
+        "KONTEKS: setiap giliran chat disertai catatan [KONTEKS SAAT INI] berisi waktu dan wilayah user serta "
+        "wilayahmu — pakai itu saat menjawab pertanyaan tentang waktu, tanggal, dan tempat.\n"        "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. "
         "Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n"
         "- card: {\"type\":\"card\",\"tone\":\"info|success|warning|error|tip\",\"icon\":\"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap\",\"title\":\"..\",\"body\":\"..\"} — sorotan/penting/peringatan.\n"
         "- steps: {\"type\":\"steps\",\"title\":\"..\",\"items\":[{\"title\":\"..\",\"text\":\"..\"}]} — langkah berurutan.\n"
@@ -1071,38 +1070,20 @@ def _fmt_tokens(n, language):
 
 
 def _build_context_note(context):
-    """Catatan [KONTEKS SAAT INI] di tiap giliran: siapa user (nama + lokasi),
-    waktu & tanggal user saat ini (real time, dari browser), dan wilayah worker
-    sendiri, supaya AI tahu nama, waktu, tanggal, dan tempat — dan tetap tahu
-    bahwa dirinya TIDAK berada di lokasi user."""
+    """Catatan [KONTEKS SAAT INI] di tiap giliran: waktu & wilayah user (dari browser)
+    dan wilayah worker sendiri, supaya AI tahu waktu, tanggal, dan tempat kedua belah pihak."""
     ctx = context if isinstance(context, dict) else {}
     tz = str(ctx.get("timezone") or "").strip()
     local_time = str(ctx.get("local_time") or "").strip()
-    date_str = str(ctx.get("date") or "").strip()
-    time_str = str(ctx.get("time") or "").strip()
-    user_name = str(ctx.get("user_name") or "").strip()
-    user_location = str(ctx.get("user_location") or "").strip()
     now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
     lines = ["[KONTEKS SAAT INI]"]
-    if user_name:
-        lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
-    if user_location:
-        lines.append(f"- Lokasi user: {user_location}.")
-    if tz or local_time or date_str or time_str:
-        when = "- Waktu user sekarang: "
-        if date_str:
-            when += date_str
-        if time_str:
-            when += (", " if date_str else "") + time_str
-        elif local_time:
-            when += local_time
-        when += f" (zona waktu {tz or 'tidak diketahui'})."
-        lines.append(when)
+    if tz or local_time:
+        lines.append(f"- Waktu user sekarang: {local_time or '?'} (zona waktu {tz or 'tidak diketahui'}).")
     lines.append(f"- Waktumu sekarang (worker Kaggle, UTC): {now_utc} UTC.")
-    lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat. Kamu TIDAK berada di lokasi user.")
-    if tz and not user_location:
+    lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat.")
+    if tz:
         lines.append(f"- Wilayah user: zona waktu {tz}.")
-    lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
+    lines.append("Pakai info ini untuk pertanyaan tentang waktu, tanggal, dan tempat. "
                  "Jangan menebak kota user dari zona waktu saja.")
     return "\n".join(lines)
 
