@@ -119,18 +119,52 @@ RULES = {
     },
     "diagnose": {
         "en": (
-            "DIAGNOSE BEFORE YOU GIVE UP: if a tool call fails, do not repeat the exact same call — change your approach, and if the approach keeps failing, report the original error as the final answer."
+            "DIAGNOSE FIRST, THEN FIX: when a tool fails, find the cause before doing "
+            "anything else — read the error message, check the file or the actual "
+            "state with a read tool, and only then try a different approach. Never "
+            "repeat the same failing call, and never report a failure without "
+            "investigating it first. After you try a fix, verify that it worked — "
+            "re-read the file or run the code and show the real result — before "
+            "declaring it done. If you discover a durable lesson (a fix or a way of "
+            "working that prevents the same mistake), save it with the remember tool "
+            "so you do not repeat the mistake in a later chat."
         ),
         "id": (
-            "JANGAN MENYERAH TANPA MENCOBA CARA LAIN: kalau sebuah tool call gagal, jangan mengulang panggilan yang sama persis — ganti pendekatan, dan kalau pendekatan itu terus gagal, laporkan error aslinya sebagai jawaban akhir."
+            "DIAGNOSA DULU, BARU PERBAIKI: kalau sebuah tool gagal, cari dulu "
+            "penyebabnya sebelum melakukan apa pun — baca pesan errornya, cek file "
+            "atau keadaan sebenarnya dengan tool baca, baru coba pendekatan lain. "
+            "Jangan pernah mengulang panggilan yang sama yang sudah gagal, dan jangan "
+            "pernah melaporkan kegagalan tanpa menyelidikinya dulu. Setelah mencoba "
+            "perbaikan, verifikasi bahwa perbaikan itu berhasil — baca ulang filenya "
+            "atau jalankan kodenya dan tunjukkan hasil benerannya — sebelum "
+            "menyatakan selesai. Kalau kamu menemukan pelajaran yang awet (cara "
+            "memperbaiki atau cara kerja yang mencegah kesalahan yang sama), simpan "
+            "dengan tool remember supaya kamu tidak mengulang kesalahan itu di chat "
+            "berikutnya."
         ),
     },
     "continue": {
         "en": (
-            "CONTINUE, DO NOT STOP: if the user asks for a folder/file tree, an archive listing, or any complete structure or list, ALWAYS give the COMPLETE thing without cutting, without '...' ellipsis, and without summarizing the rest. If an output is cut by a hard limit, state clearly where you stopped and continue from exactly that point in the next reply so nothing is lost."
+            "CONTINUE, DON'T STOP: a clipped or truncated tool result means 'not "
+            "finished yet', not 'stop' — continue from exactly where it stopped: read "
+            "the next page, or narrow the search with grep or a more specific query, "
+            "until you have what you need. If the user asks for a folder/file tree, "
+            "an archive listing, or any complete structure or list, ALWAYS give the "
+            "COMPLETE thing without cutting, without '...' ellipsis, and without "
+            "summarizing the rest. If an output is cut by a hard limit, state clearly "
+            "where you stopped and continue from exactly that point in the next reply "
+            "so nothing is lost."
         ),
         "id": (
-            "LANJUT, JANGAN BERHENTI: jika user meminta struktur folder/file tree, isi arsip, atau daftar lengkap apa pun, SELALU berikan yang LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisanya. Jika output terpaksa terpotong oleh batas, sebutkan dengan jelas di mana kamu berhenti lalu lanjutkan dari titik itu persis di balasan berikutnya supaya tidak ada yang hilang."
+            "LANJUT, JANGAN BERHENTI: hasil tool yang terpotong artinya 'belum selesai', "
+            "bukan 'berhenti' — lanjutkan dari titik tepatnya kepotong: baca halaman "
+            "berikutnya, atau persempit pencarian dengan grep atau query yang lebih "
+            "spesifik, sampai kamu mendapatkan yang kamu butuhkan. Jika user meminta "
+            "struktur folder/file tree, isi arsip, atau daftar lengkap apa pun, SELALU "
+            "berikan yang LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa "
+            "meringkas sisanya. Jika output terpaksa terpotong oleh batas, sebutkan "
+            "dengan jelas di mana kamu berhenti lalu lanjutkan dari titik itu persis "
+            "di balasan berikutnya supaya tidak ada yang hilang."
         ),
     },
     "verify": {
@@ -656,7 +690,12 @@ def clip_tool_result(text, lang):
     if not isinstance(text, str):
         text = str(text)
     if len(text) > TOOL_RESULT_LIMIT:
-        note = "\n[...dipotong, hasil tool dibatasi 12000 karakter...]" if lang == "id" else "\n[...truncated, tool result limited to 12000 characters...]"
+        note = ("\n[...dipotong, hasil tool dibatasi 12000 karakter. Ini BUKAN tanda "
+                "berhenti — lanjutkan dari titik ini: baca halaman berikutnya atau "
+                "persempit dengan grep/pencarian.]") if lang == "id" else (
+            "\n[...truncated, tool result limited to 12000 characters. This is NOT "
+            "a stop sign — continue from this point: read the next page or narrow "
+            "it down with grep/search.]")
         return text[:TOOL_RESULT_LIMIT] + note
     return text
 
