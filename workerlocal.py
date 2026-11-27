@@ -12,7 +12,6 @@ import time
 import base64
 import mimetypes
 import shutil
-import signal
 import subprocess
 import threading
 import importlib
@@ -162,7 +161,7 @@ TOOL_CALL_SIG_LIMIT = 2000
 TOOL_REPEAT_PREVIEW_CHARS = 400
 TOOL_ERROR_SIG_CHARS = 200
 
-SHARED_RULES_ID = {'natural': "BERSIKAP NATURAL: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user dan ikuti gayanya. Sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Setiap chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat, dan jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya; jangan pernah menanyakannya lagi. Pesan user yang terbaru adalah pembahasan yang sedang berjalan; kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Kalau pesan terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', 'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan apa selanjutnya. Putuskan sendiri: kalau typo jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsimu; kalau ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu. Jangan menebak diam-diam untuk hal yang penting atau destruktif.", 'act': "KERJAKAN, JANGAN JANJI: kalau user meminta sesuatu DIKERJAKAN, jawaban pertamamu HARUS memanggil tool — boleh sapa sebentar, tapi jangan pernah menjawab hanya dengan janji. Jangan pernah mengaku sudah menghapus, menulis, memindah, atau memperbaiki sesuatu kecuali tool barusan mengembalikan sukses. HAPUS / DELETE / REMOVE: kalau path-nya sudah jelas, panggil delete_path di giliran yang sama — jangan cuma menjelaskan apa yang akan dihapus. Kalau path ambigu, list_dir sekali, lalu hapus. Jangan mengarang pesan sukses. EDIT / PERBAIKI: untuk perubahan non-sepele, utamakan write_file dengan konten lengkap yang benar supaya hasilnya bersih dan bisa dikembalikan; pakai patch_file hanya untuk rentang baris kecil dan presisi. Kalau user minta kembali ke perbaikan/versi sebelumnya, kembalikan konten lengkap yang kamu tulis lebih dulu di percakapan ini; kalau sudah tidak ada, bilang jujur. Jangan mengulang tool call yang sama persis. Terus kerja selama kamu membuat progres, dan berhenti hanya kalau kamu mengulang dirimu sendiri atau mentok di kegagalan yang sama. Jangan berhenti di tengah: jika tugas berisi banyak file, kerjakan SATU PER SATU sampai semua selesai sebelum menjawab, dan tulis kode yang lengkap dan bisa langsung dipakai — bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'. Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai, lalu katakan dengan jelas apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.", 'diagnose': 'DIAGNOSA DULU, BARU PERBAIKI: kalau sebuah tool gagal, cari dulu penyebabnya sebelum melakukan apa pun — baca pesan errornya, cek file atau keadaan sebenarnya dengan tool baca, baru coba pendekatan lain. Jangan pernah mengulang panggilan yang sama yang sudah gagal, dan jangan pernah melaporkan kegagalan tanpa menyelidikinya dulu. Setelah mencoba perbaikan, verifikasi bahwa perbaikan itu berhasil — baca ulang filenya atau jalankan kodenya dan tunjukkan hasil benerannya — sebelum menyatakan selesai. Kalau kamu menemukan pelajaran yang awet (cara memperbaiki atau cara kerja yang mencegah kesalahan yang sama), simpan dengan tool remember supaya kamu tidak mengulang kesalahan itu di chat berikutnya.', 'continue': "LANJUT, JANGAN BERHENTI: hasil tool yang terpotong artinya 'belum selesai', bukan 'berhenti' — lanjutkan dari titik tepatnya kepotong: baca halaman berikutnya, atau persempit pencarian dengan grep atau query yang lebih spesifik, sampai kamu mendapatkan yang kamu butuhkan. Jika user meminta struktur folder/file tree, isi arsip, atau daftar lengkap apa pun, SELALU berikan yang LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisanya. Jika output terpaksa terpotong oleh batas, sebutkan dengan jelas di mana kamu berhenti lalu lanjutkan dari titik itu persis di balasan berikutnya supaya tidak ada yang hilang.", 'verify': 'VERIFIKASI DAN SERAHKAN: sebelum mengklaim apa pun tentang folder, file, atau hasil pencarian, jalankan tool dulu dan tunjukkan hasil benerannya — jangan pernah menyebut isi yang belum benar-benar kamu baca. Angka, nama, dan tanggal hanya dari hasil tool atau dari yang user benar-benar katakan; kalau kamu tidak tahu, bilang tidak tahu daripada menebak. Untuk tugas yang berlangkah, sebutkan rencananya secara singkat dulu, baru kerjakan langkah demi langkah. Sebelum menyerahkan hasil, periksa sendiri: baca ulang file yang kamu tulis atau ubah, atau jalankan kodenya dan tunjukkan kalau berhasil — buktikan, jangan cuma mengaku. AKSES KOMPUTER PENUH: kamu berjalan di komputer Linux beneran (worker GPU Kaggle); workspace kamu /kaggle/working. SEBELUM menyebut isi sebuah folder, panggil list_dir dan tunjukkan hasil list beneran — jangan pernah mengarang nama file dari riwayat chat. Kalau user jelas minta hapus atau pindah path yang sudah disebut, panggil delete_path atau move_path di giliran itu; list_dir dulu hanya jika path-nya masih ambigu. Hapus dan pindah hanya berlaku di dalam workspace; jangan pernah menghapus atau memindah apa pun di luar itu, dan jangan pernah menghapus workspace itu sendiri. Kalau target user ambigu, tanya sekali; begitu user menyebut targetnya, langsung kerjakan. Setelah berubah, laporkan persis apa yang dihapus, dipindah, atau dibuat. Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna; folder juga boleh (akan otomatis di-zip). Jangan PERNAH menyuruh pengguna \'download dari Kaggle\', \'cek output Kaggle\', \'buka notebook\', atau instruksi sejenis — mereka tidak punya akses ke situ. RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nPilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi nyata, jangan status \'lagi mengerjakan\', jangan body yang berakhir \'...\' atau frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Aturan pagar: tulis ```ui di barisnya sendiri, lalu JSON di baris-baris berikutnya, lalu ``` di barisnya sendiri. Jangan pernah pakai ```json atau pagar lain untuk blok ui, dan jangan taruh JSON di baris yang sama dengan ```ui. Di dalam JSON, pakai teks polos saja — jangan pakai format markdown seperti **tebal**, __garis bawah__, `kode`, atau [tautan](url). Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.'}
+SHARED_RULES_ID = {'natural': "BERSIKAP NATURAL: bersikaplah seperti rekan kerja manusia yang ahli, kompeten, dan profesional — ramah, jelas, to the point, dan percaya diri tanpa berlebihan. Jawab selalu dalam bahasa yang dipakai user dan ikuti gayanya. Sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari permintaan user dan apa yang akan kamu lakukan pertama. Setiap chat disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan tentang nama, waktu, tanggal, dan tempat, dan jangan pernah bilang tidak tahu nama atau lokasi user kalau catatannya menyebutkannya; jangan pernah menanyakannya lagi. Pesan user yang terbaru adalah pembahasan yang sedang berjalan; kalau user mengganti pembahasan, ikuti pembahasan yang baru dan jangan kembali ke topik lama kecuali user yang memintanya. Kalau pesan terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', 'lanjut', atau sejenisnya), JANGAN melanjutkan tugas sebelumnya dan JANGAN menjalankan tool lagi — jawab dengan satu kalimat singkat, atau tanyakan apa selanjutnya. Putuskan sendiri: kalau typo jelas dari konteks, kerjakan langsung sambil menyebutkan singkat asumsimu; kalau ambigu — ada dua kemungkinan arti, atau mengubah makna perintah — tanyakan dulu. Jangan menebak diam-diam untuk hal yang penting atau destruktif.", 'act': "KERJAKAN, JANGAN JANJI: kalau user meminta sesuatu DIKERJAKAN, jawaban pertamamu HARUS memanggil tool — boleh sapa sebentar, tapi jangan pernah menjawab hanya dengan janji. Jangan mengulang tool call yang sama persis. Terus kerja selama kamu membuat progres, dan berhenti hanya kalau kamu mengulang dirimu sendiri atau mentok di kegagalan yang sama. Jangan berhenti di tengah: jika tugas berisi banyak file, kerjakan SATU PER SATU sampai semua selesai sebelum menjawab, dan tulis kode yang lengkap dan bisa langsung dipakai — bukan potongan atau placeholder seperti '# TODO: lengkapi sisanya'. Jika proyek benar-benar terlalu besar untuk diselesaikan dalam satu giliran, kirim dulu file-file yang sudah selesai, lalu katakan dengan jelas apa yang masih akan menyusul di balasan berikutnya — jangan menyuruh pengguna menyelesaikannya sendiri.", 'diagnose': 'DIAGNOSA DULU, BARU PERBAIKI: kalau sebuah tool gagal, cari dulu penyebabnya sebelum melakukan apa pun — baca pesan errornya, cek file atau keadaan sebenarnya dengan tool baca, baru coba pendekatan lain. Jangan pernah mengulang panggilan yang sama yang sudah gagal, dan jangan pernah melaporkan kegagalan tanpa menyelidikinya dulu. Setelah mencoba perbaikan, verifikasi bahwa perbaikan itu berhasil — baca ulang filenya atau jalankan kodenya dan tunjukkan hasil benerannya — sebelum menyatakan selesai. Kalau kamu menemukan pelajaran yang awet (cara memperbaiki atau cara kerja yang mencegah kesalahan yang sama), simpan dengan tool remember supaya kamu tidak mengulang kesalahan itu di chat berikutnya.', 'continue': "LANJUT, JANGAN BERHENTI: hasil tool yang terpotong artinya 'belum selesai', bukan 'berhenti' — lanjutkan dari titik tepatnya kepotong: baca halaman berikutnya, atau persempit pencarian dengan grep atau query yang lebih spesifik, sampai kamu mendapatkan yang kamu butuhkan. Jika user meminta struktur folder/file tree, isi arsip, atau daftar lengkap apa pun, SELALU berikan yang LENGKAP tanpa memotong, tanpa ellipsis '...', dan tanpa meringkas sisanya. Jika output terpaksa terpotong oleh batas, sebutkan dengan jelas di mana kamu berhenti lalu lanjutkan dari titik itu persis di balasan berikutnya supaya tidak ada yang hilang.", 'verify': 'VERIFIKASI DAN SERAHKAN: sebelum mengklaim apa pun tentang folder, file, atau hasil pencarian, jalankan tool dulu dan tunjukkan hasil benerannya — jangan pernah menyebut isi yang belum benar-benar kamu baca. Angka, nama, dan tanggal hanya dari hasil tool atau dari yang user benar-benar katakan; kalau kamu tidak tahu, bilang tidak tahu daripada menebak. Untuk tugas yang berlangkah, sebutkan rencananya secara singkat dulu, baru kerjakan langkah demi langkah. Sebelum menyerahkan hasil, periksa sendiri: baca ulang file yang kamu tulis atau ubah, atau jalankan kodenya dan tunjukkan kalau berhasil — buktikan, jangan cuma mengaku. AKSES KOMPUTER PENUH: kamu berjalan di komputer Linux beneran (worker GPU Kaggle); workspace kamu /kaggle/working. SEBELUM menghapus, memindah, atau menyebut isi sebuah folder, SELALU panggil list_dir dulu dan tunjukkan hasil list beneran — jangan pernah mengarang nama file dari riwayat chat. Hapus dan pindah hanya berlaku di dalam workspace; jangan pernah menghapus atau memindah apa pun di luar itu, dan jangan pernah menghapus workspace itu sendiri. Kalau target user ambigu, tanya sekali; begitu user menyebut targetnya, langsung kerjakan. Setelah berubah, laporkan persis apa yang dihapus, dipindah, atau dibuat. Jika kamu membuat file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file di /kaggle/working/out/ lalu tulis [[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara mengirim file ke pengguna; folder juga boleh (akan otomatis di-zip). Jangan PERNAH menyuruh pengguna \'download dari Kaggle\', \'cek output Kaggle\', \'buka notebook\', atau instruksi sejenis — mereka tidak punya akses ke situ. RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks lain di dalam blok). Jenis yang tersedia:\n- card: {"type":"card","tone":"info|success|warning|error|tip","icon":"info|check|warning|lightbulb|rocket|globe|calendar|clock|book|database|shield|star|zap|cpu|memory|gauge|activity|terminal|wifi|battery|harddrive|server","title":"..","body":".."} — sorotan/penting/peringatan.\n- steps: {"type":"steps","title":"..","items":[{"title":"..","text":".."}]} — langkah berurutan.\n- flow: {"type":"flow","title":"..","items":[{"label":"..","text":".."}]} — alur/diagram bentuk.\n- timeline: {"type":"timeline","title":"..","items":[{"date":"..","title":"..","text":".."}]} — urutan waktu.\n- compare: {"type":"compare","title":"..","columns":[{"title":"..","tone":"good|bad|neutral","items":[".."]}]} — perbandingan.\n- chart: {"type":"chart","title":"..","labels":[".."],"values":[angka]} — grafik batang data.\n- checklist: {"type":"checklist","title":"..","items":[{"text":"..","done":true}]} — daftar centang.\n- stats: {"type":"stats","title":"..","items":[{"label":"..","value":"..","note":".."}]} — angka penting.\nPilih jenis sesuai isi: angka dan ukuran masuk ke stats atau chart, jangan jadi teks biasa di body card; prosedur langkah demi langkah masuk ke steps; card adalah SATU sorotan lengkap — body-nya harus kalimat selesai berisi informasi nyata, jangan status \'lagi mengerjakan\', jangan body yang berakhir \'...\' atau frasa gantung tanpa isi. Jangan pakai card untuk mengumumkan apa yang akan kamu kerjakan; kerjakan dulu, baru tunjukkan hasilnya.\nAturan: satu blok ui per struktur, JSON harus valid, teks singkat, maksimal 12 item per daftar. Aturan pagar: tulis ```ui di barisnya sendiri, lalu JSON di baris-baris berikutnya, lalu ``` di barisnya sendiri. Jangan pernah pakai ```json atau pagar lain untuk blok ui, dan jangan taruh JSON di baris yang sama dengan ```ui. Di dalam JSON, pakai teks polos saja — jangan pakai format markdown seperti **tebal**, __garis bawah__, `kode`, atau [tautan](url). Prosa biasa, penjelasan, dan kode tetap pakai markdown/code block seperti biasa. Jangan pakai blok ui untuk hal yang cukup dijelaskan dengan satu paragraf.'}
 SHARED_RULE_ORDER_ID = ['natural', 'act', 'diagnose', 'continue', 'verify']
 
 def _shared_rules_text():
@@ -170,7 +169,7 @@ def _shared_rules_text():
     separator — exactly how the worker prompt was already built."""
     return "\n".join(SHARED_RULES_ID[name] for name in SHARED_RULE_ORDER_ID)
 
-TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap. Utamakan ini daripada banyak patch kecil untuk edit non-sepele supaya file yang benar ditulis utuh sekali jalan. File yang sudah ada di-backup otomatis sebagai .bak sebelum ditimpa.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'delete_path', 'description': 'Menghapus permanen file atau seluruh folder di disk worker. Hanya berlaku di dalam workspace (/kaggle/working); root workspace tidak bisa dihapus. Kalau user sudah jelas menyebut targetnya, panggil tool ini langsung — jangan cuma menjelaskan penghapusan. Kalau path belum jelas, list_dir sekali untuk memastikan, lalu hapus. Laporkan sukses hanya dari hasil tool ini.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dihapus, misal /kaggle/working/out/lama.txt'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'move_path', 'description': 'Memindah atau me-rename file atau folder di disk worker Kaggle. Sumber dan tujuan harus di dalam workspace (/kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dipindah, misal /kaggle/working/out/a.txt'}, 'destination': {'type': 'string', 'description': 'Lokasi baru, misal /kaggle/working/arsip/a.txt'}}, 'required': ['path', 'destination']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_image_search', 'description': 'Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya. Hanya bilang gambar ditemukan kalau tool ini benar-benar mengembalikan thumbnail; kalau tidak ada hasil, bilang tidak ada gambar yang ditemukan, jangan mengaku sudah menemukannya.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'remember', 'description': 'Mengingat fakta awet tentang user untuk chat berikutnya: preferensi, detail proyek, nama, atau hal yang user minta diingat. Simpan HANYA fakta yang tetap benar antar chat — jangan pernah password, rahasia, API key, atau kode pribadi, jangan seluruh percakapan, dan jangan hal yang user sebut sekilas saja. Satu kalimat pendek per panggilan. User bisa melihat dan menghapus semua yang kamu simpan.', 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string', 'description': 'Satu fakta pendek yang diingat.'}}, 'required': ['text']}}}]
+TOOLS = [{'type': 'function', 'function': {'name': 'list_dir', 'description': 'Melihat daftar folder, file, dan ukuran/baris di direktori proyek (default workspace: /kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path direktori target, misal /kaggle/working atau /'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_file', 'description': 'Membaca isi file dengan nomor baris (hingga 7.500 baris sekaligus).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'patch_file', 'description': 'Mengganti baris tertentu pada file besar tanpa menulis ulang seluruh file (otomatis backup .bak).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}, 'new_code': {'type': 'string'}}, 'required': ['path', 'start_line', 'end_line', 'new_code']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Membuat file baru atau menimpa isi file kecil/menengah dengan konten lengkap.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'delete_path', 'description': 'Menghapus file atau seluruh folder di disk worker Kaggle. Hanya berlaku di dalam workspace (/kaggle/working); workspace itu sendiri tidak bisa dihapus. Selalu panggil list_dir dulu ke targetnya.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dihapus, misal /kaggle/working/out/lama.txt'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'move_path', 'description': 'Memindah atau me-rename file atau folder di disk worker Kaggle. Sumber dan tujuan harus di dalam workspace (/kaggle/working).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'File atau folder yang dipindah, misal /kaggle/working/out/a.txt'}, 'destination': {'type': 'string', 'description': 'Lokasi baru, misal /kaggle/working/arsip/a.txt'}}, 'required': ['path', 'destination']}}}, {'type': 'function', 'function': {'name': 'run_bash', 'description': 'Menjalankan perintah shell non-interaktif di kernel Kaggle ini.', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}, 'cwd': {'type': 'string'}}, 'required': ['command']}}}, {'type': 'function', 'function': {'name': 'web_search', 'description': 'Mencari informasi terkini di internet.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_image_search', 'description': 'Mencari gambar di internet. Mengembalikan URL thumbnail beserta halaman sumbernya. Thumbnail otomatis ditampilkan ke user sebagai strip — jelaskan hasilnya di jawaban, jangan tempel URL mentahnya. Hanya bilang gambar ditemukan kalau tool ini benar-benar mengembalikan thumbnail; kalau tidak ada hasil, bilang tidak ada gambar yang ditemukan, jangan mengaku sudah menemukannya.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}, {'type': 'function', 'function': {'name': 'web_fetch', 'description': 'Mengambil isi lengkap halaman web dari URL spesifik.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}}, {'type': 'function', 'function': {'name': 'inspect_image', 'description': 'Memuat file gambar dari disk agar dapat dianalisis secara visual.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'question': {'type': 'string'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'read_document', 'description': 'Membaca file di disk Kaggle tanpa menempel seluruh isi ke konteks: PDF (teks, atau OCR jika scan), DOCX, PPTX, XLSX/CSV (pandas bawaan), gambar (OCR), audio/video (ffmpeg + faster-whisper), dan arsip zip/tar/gz. Pakai ini untuk file di /kaggle/working/uploads. Jangan pakai read_file untuk PDF/biner.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path absolut file, misal /kaggle/working/uploads/nama.pdf'}, 'max_chars': {'type': 'integer', 'description': 'Batas karakter hasil, default 12000'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'remember', 'description': 'Mengingat fakta awet tentang user untuk chat berikutnya: preferensi, detail proyek, nama, atau hal yang user minta diingat. Simpan HANYA fakta yang tetap benar antar chat — jangan pernah password, rahasia, API key, atau kode pribadi, jangan seluruh percakapan, dan jangan hal yang user sebut sekilas saja. Satu kalimat pendek per panggilan. User bisa melihat dan menghapus semua yang kamu simpan.', 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string', 'description': 'Satu fakta pendek yang diingat.'}}, 'required': ['text']}}}]
 
 def _short_preview(text, limit, lang):
     """Truncate a preview the way the worker's _short does: strip, then cap with
@@ -633,94 +632,8 @@ def _is_dangerous_rm(command, base_dir):
     return False
 
 
-def _run_cancellable(cmd, timeout=180, cancelled=None, shell=False, cwd=None, env=None,
-                     stdin=None, capture_output=False):
-    """Jalankan subprocess yang bisa diinterupsi user (Berhenti/Trash) dengan
-    Ctrl+C (SIGINT) ke grup prosesnya — proses sempat beres-beres dulu; kalau
-    3 detik tidak mati -> SIGTERM, 3 detik lagi -> SIGKILL. Raises
-    _TurnCancelled kalau dibatalkan, subprocess.TimeoutExpired kalau kehabisan
-    waktu (sama seperti subprocess.run, tapi grup prosesnya ikut dimatikan
-    supaya tidak ada anak proses yang tertinggal)."""
-    if capture_output:
-        stdout_arg, stderr_arg = subprocess.PIPE, subprocess.STDOUT
-    else:
-        stdout_arg, stderr_arg = subprocess.DEVNULL, subprocess.DEVNULL
-    proc = subprocess.Popen(cmd, stdout=stdout_arg, stderr=stderr_arg, text=True,
-                            shell=shell, cwd=cwd, env=env, stdin=stdin,
-                            start_new_session=True)
-    chunks = []
-
-    def _drain(stream):
-        try:
-            data = stream.read()
-            if data:
-                chunks.append(data)
-        except Exception:
-            pass
-
-    threads = []
-    if capture_output:
-        t = threading.Thread(target=_drain, args=(proc.stdout,), daemon=True)
-        t.start()
-        threads.append(t)
-    deadline = time.monotonic() + timeout
-    sigint_at = None
-    term_at = None
-    while True:
-        rc = proc.poll()
-        if rc is not None:
-            if sigint_at is not None:
-                # Mati karena Ctrl+C yang kita kirim: ini pembatalan, bukan
-                # hasil normal — lempar supaya giliran langsung rollback,
-                # jangan kembalikan "EXIT CODE: -2" sebagai hasil tool.
-                for t in threads:
-                    t.join(timeout=1)
-                raise _TurnCancelled()
-            break
-        now = time.monotonic()
-        if cancelled and cancelled():
-            if sigint_at is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                sigint_at = now
-            elif now - sigint_at > 3 and term_at is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                term_at = now
-            elif term_at is not None and now - term_at > 3:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.wait()
-                for t in threads:
-                    t.join(timeout=1)
-                raise _TurnCancelled()
-        elif now > deadline:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            proc.wait()
-            for t in threads:
-                t.join(timeout=1)
-            raise subprocess.TimeoutExpired(cmd, timeout)
-        time.sleep(0.05)
-    for t in threads:
-        t.join(timeout=2)
-    return subprocess.CompletedProcess(cmd, proc.returncode,
-                                       stdout="".join(chunks) if capture_output else None,
-                                       stderr=None)
-
-
-def _run_quiet(cmd, timeout=180, cancelled=None):
-    if cancelled is None:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-    return _run_cancellable(cmd, timeout=timeout, cancelled=cancelled, capture_output=True)
+def _run_quiet(cmd, timeout=180):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
 
 
 _MEDIA_PACKAGES_READY = False
@@ -731,29 +644,22 @@ def _prepare_work_dirs():
     os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
 
 
-def _ensure_media_packages(cancelled=None):
+def _ensure_media_packages():
     """Pasang paket media berat (wheel offline + ffmpeg/tesseract) sekali saja,
     saat pertama kali benar-benar dibutuhkan (baca dokumen/media) — bukan di boot.
-    Sekali coba saja; gagal pun jangan ulangi di tiap baca. Dikecualikan:
-    kalau install ke-potong Ctrl+C, flag siap di-reset supaya baca berikutnya
-    nyoba install lagi dari awal, bukan ke-stuck setengah install."""
+    Sekali coba saja; gagal pun jangan ulangi di tiap baca."""
     global _MEDIA_PACKAGES_READY
     if _MEDIA_PACKAGES_READY:
         return
     _MEDIA_PACKAGES_READY = True
     try:
-        _prepare_media_packages(cancelled=cancelled)
-    except _TurnCancelled:
-        _MEDIA_PACKAGES_READY = False
-        raise
+        _prepare_media_packages()
     except Exception as exc:
         print(f"[setup] media packages gagal (diabaikan): {_clean_err(exc)[:200]}", flush=True)
 
 
-def _prepare_media_packages(cancelled=None):
+def _prepare_media_packages():
     """Pasang wheel offline seperti worker downloader, lalu lengkapi biner yang belum ada."""
-    if cancelled and cancelled():
-        raise _TurnCancelled()
     os.makedirs(BASE_DIR, exist_ok=True)
     os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
     wheels = next(iter(glob.glob("/kaggle/input/**/wheels", recursive=True)), None)
@@ -769,18 +675,16 @@ def _prepare_media_packages(cancelled=None):
             result = _run_quiet([
                 sys.executable, "-m", "pip", "install", "-q", "--no-index", "--no-deps",
                 "--target", _DOC_TARGET, *files,
-            ], timeout=300, cancelled=cancelled)
+            ], timeout=300)
             if result.returncode != 0:
                 print(f"[setup] pip offline gagal: {(result.stdout or '')[-400:]}", flush=True)
             else:
                 installed = [os.path.basename(path) for path in files]
-        if cancelled and cancelled():
-            raise _TurnCancelled()
         deb_dir = os.path.join(os.path.dirname(wheels), "deb")
         if not shutil.which("ffmpeg"):
             ffdebs = sorted(glob.glob(os.path.join(deb_dir, "ffmpeg*.deb")))
             if ffdebs:
-                _run_quiet(["dpkg", "-i", *ffdebs], timeout=180, cancelled=cancelled)
+                _run_quiet(["dpkg", "-i", *ffdebs], timeout=180)
     if _DOC_TARGET not in sys.path:
         sys.path.insert(0, _DOC_TARGET)
     os.environ["PYTHONPATH"] = _DOC_TARGET + os.pathsep + os.environ.get("PYTHONPATH", "")
@@ -792,8 +696,8 @@ def _prepare_media_packages(cancelled=None):
         missing_apt.extend(["tesseract-ocr", "tesseract-ocr-eng", "tesseract-ocr-ind"])
     if missing_apt:
         print(f"[setup] tidak ada di dataset, memasang dari image Kaggle: {', '.join(missing_apt)}", flush=True)
-        _run_quiet(["apt-get", "update", "-qq"], timeout=180, cancelled=cancelled)
-        _run_quiet(["apt-get", "install", "-y", "-qq", *missing_apt], timeout=300, cancelled=cancelled)
+        _run_quiet(["apt-get", "update", "-qq"], timeout=180)
+        _run_quiet(["apt-get", "install", "-y", "-qq", *missing_apt], timeout=300)
     ready = []
     for module_name, label in (
         ("fitz", "pymupdf"), ("docx", "python-docx"), ("pptx", "python-pptx"),
@@ -952,7 +856,7 @@ def _transcribe_audio(path):
     return text or "(tidak ada ucapan yang terdengar)"
 
 
-def _read_media(path, limit, cancelled=None):
+def _read_media(path, limit):
     ext = os.path.splitext(path)[1].lower()
     audio_path = path
     notes = []
@@ -961,20 +865,18 @@ def _read_media(path, limit, cancelled=None):
             return "Error: ffmpeg tidak tersedia untuk memisahkan audio video."
         audio_path = "/tmp/media_audio.wav"
         frame_path = "/tmp/media_frame.jpg"
-        _run_cancellable(
+        subprocess.run(
             ["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", audio_path],
-            timeout=180, cancelled=cancelled,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=False,
         )
-        _run_cancellable(
+        subprocess.run(
             ["ffmpeg", "-y", "-ss", "1", "-i", path, "-frames:v", "1", frame_path],
-            timeout=60, cancelled=cancelled,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
         )
         if os.path.isfile(frame_path):
             scanned = _ocr_image(frame_path)
             if scanned:
                 notes.append("Teks pada satu frame:\n" + scanned)
-    if cancelled and cancelled():
-        raise _TurnCancelled()
     transcript = _transcribe_audio(audio_path)
     body = "Transkrip:\n" + transcript
     if notes:
@@ -982,7 +884,7 @@ def _read_media(path, limit, cancelled=None):
     return _clip_text(body, limit)
 
 
-def read_document(path, max_chars=_DOC_TEXT_LIMIT, cancelled=None):
+def read_document(path, max_chars=_DOC_TEXT_LIMIT):
     if not path or not os.path.isfile(path):
         return f"Error: File '{path}' tidak ditemukan."
     if os.path.getsize(path) > 200 * 1024 * 1024:
@@ -990,7 +892,7 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT, cancelled=None):
     limit = max(1000, min(int(max_chars or _DOC_TEXT_LIMIT), 20000))
     ext = os.path.splitext(path)[1].lower()
     if ext in _MEDIA_EXTS:
-        _ensure_media_packages(cancelled=cancelled)
+        _ensure_media_packages()
     try:
         if ext == ".pdf":
             return _read_pdf(path, limit)
@@ -1027,7 +929,7 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT, cancelled=None):
                 return "OCR tidak menghasilkan teks. Untuk isi visual, pakai inspect_image."
             return _clip_text(scanned, limit)
         if ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".webm", ".mov", ".avi"}:
-            return _read_media(path, limit, cancelled=cancelled)
+            return _read_media(path, limit)
         if ext == ".ipynb":
             notebook = json.load(open(path, "r", encoding="utf-8"))
             cells = notebook.get("cells") if isinstance(notebook, dict) else None
@@ -1049,137 +951,7 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT, cancelled=None):
         return f"Error membaca {path}: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# Jurnal rollback: tiap perubahan file dalam satu giliran dicatat cara
-# membatalkannya, supaya Berhenti/Trash bisa mengembalikan keadaan seperti
-# sebelum giliran itu jalan. Jurnal hidup di memori worker saja (bukan
-# /kaggle/working), per turn_id; giliran Cloud memakai turn_id dari backend,
-# giliran Local memakai job_id chat-nya. File yang dihapus di-backup isinya
-# (maks 5 MB) sebelum dihapus; file yang ditulis/diedit sudah punya .bak.
-# run_bash sengaja TIDAK dicatat: perintah shell tidak bisa di-undo.
-# ---------------------------------------------------------------------------
-_ROLLBACK_MAX_JOURNALS = 8
-_ROLLBACK_MAX_BACKUP_BYTES = 5 * 1024 * 1024
-_journals: dict[str, list] = {}
-_cancelled_turns: set[str] = set()
-_active_journal_id: str | None = None
-
-
-def _journal_display(path, base_dir):
-    try:
-        rel = os.path.relpath(str(path), str(base_dir))
-        return rel if not rel.startswith("..") else str(path)
-    except Exception:
-        return str(path)
-
-
-def _journal_for(turn_id):
-    journal = _journals.get(turn_id)
-    if journal is None:
-        if len(_journals) >= _ROLLBACK_MAX_JOURNALS:
-            _journals.pop(next(iter(_journals)), None)  # buang jurnal tertua
-        journal = _journals[turn_id] = []
-    return journal
-
-
-def _journal_record(entry):
-    if _active_journal_id is None:
-        return
-    journal = _journal_for(_active_journal_id)
-    if entry.get("kind") == "restore_bak":
-        # Satu path cukup dicatat sekali: entri pertama memegang isi sebelum
-        # giliran ini. Tulis kedua ke path yang sama menimpa file .bak, jadi
-        # catatan kedua tidak boleh menggantikan yang pertama.
-        for old in journal:
-            if old.get("kind") == "restore_bak" and old.get("path") == entry.get("path"):
-                return
-    journal.append(entry)
-
-
-def _backup_deleted(target):
-    """Baca isi path yang mau dihapus ke memori (file <=5 MB, atau folder
-    total <=5 MB). Return ("file", bytes) / ("dir", {rel: bytes}) / None."""
-    try:
-        if target.is_symlink() or target.is_file():
-            if target.stat().st_size > _ROLLBACK_MAX_BACKUP_BYTES:
-                return None
-            return ("file", target.read_bytes())
-        if target.is_dir():
-            files: dict[str, bytes] = {}
-            total = 0
-            for p in sorted(target.rglob("*")):
-                if p.is_file() and not p.is_symlink():
-                    total += p.stat().st_size
-                    if total > _ROLLBACK_MAX_BACKUP_BYTES:
-                        return None
-                    files[str(p.relative_to(target))] = p.read_bytes()
-            return ("dir", files)
-    except Exception:
-        return None
-    return None
-
-
-def _rollback_journal(journal, base_dir):
-    """Jalankan jurnal terbalik (best-effort): kembalikan file yang diubah,
-    hapus file yang dibuat, kembalikan file yang dihapus/dipindah."""
-    reverted: list[str] = []
-    not_undone: list[dict[str, str]] = []
-    for entry in reversed(journal):
-        kind = entry.get("kind")
-        display = str(entry.get("display") or "?")
-        try:
-            if kind == "restore_bak":
-                fp = str(entry["path"])
-                bak = fp + ".bak"
-                data = entry.get("data")
-                if data is not None:
-                    # Isi sebelum giliran (ditangkap saat pertama ditulis):
-                    # tulis kembali, .bak dibiarkan apa adanya.
-                    _Path(fp).parent.mkdir(parents=True, exist_ok=True)
-                    _Path(fp).write_bytes(data)
-                    reverted.append(display)
-                elif os.path.isfile(bak):
-                    shutil.move(bak, fp)
-                    reverted.append(display)
-                else:
-                    not_undone.append({"item": display, "reason": "backup .bak tidak ditemukan"})
-            elif kind == "delete_created":
-                fp = str(entry["path"])
-                if os.path.isdir(fp) and not os.path.islink(fp):
-                    shutil.rmtree(fp, ignore_errors=True)
-                elif os.path.lexists(fp):
-                    os.remove(fp)
-                reverted.append(display)
-            elif kind == "restore_deleted":
-                fp = str(entry["path"])
-                if entry.get("is_dir"):
-                    dest_dir = _Path(fp)
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    for rel, data in (entry.get("files") or {}).items():
-                        dest = dest_dir / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(data)
-                else:
-                    _Path(fp).parent.mkdir(parents=True, exist_ok=True)
-                    _Path(fp).write_bytes(entry["data"])
-                reverted.append(display)
-            elif kind == "move_back":
-                src, dst = str(entry["src"]), str(entry["dst"])
-                _Path(src).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(dst, src)
-                reverted.append(display)
-            elif kind == "not_restorable":
-                not_undone.append({"item": display, "reason": str(entry.get("reason") or "tidak bisa dibatalkan")})
-        except Exception as exc:
-            not_undone.append({"item": display, "reason": str(exc)[:120]})
-    return {"reverted": reverted, "not_undone": not_undone}
-
-
-def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
-    """Eksekusi satu tool. `cancelled` (callable) diteruskan ke tool yang
-    blokir (run_bash, read_document): begitu user menekan Berhenti/Trash,
-    tool itu diinterupsi Ctrl+C (SIGINT) dan melempar _TurnCancelled — BUKAN
-    ditelan jadi string error, supaya giliran langsung rollback."""
+def exec_tool(name, args, base_dir=BASE_DIR):
     try:
         if name == "list_dir":
             target = args.get("path", base_dir)
@@ -1232,14 +1004,6 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
             if new_code and not new_code.endswith("\n"):
                 new_code += "\n"
             shutil.copy2(fp, fp + ".bak")
-            # Tangkap isi sebelum diubah (maks 5 MB): tulis kedua ke file yang
-            # sama menimpa .bak, jadi jurnal harus memegang isi aslinya sendiri.
-            old_data = None
-            try:
-                if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
-                    old_data = _Path(fp).read_bytes()
-            except Exception:
-                old_data = None
             with open(fp, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             if s < 1 or e > len(lines) or s > e:
@@ -1247,36 +1011,14 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
             lines[s - 1:e] = new_code.splitlines(keepends=True)
             with open(fp, "w", encoding="utf-8") as f:
                 f.writelines(lines)
-            _journal_record({"kind": "restore_bak", "path": fp, "data": old_data,
-                             "display": _journal_display(fp, base_dir)})
             return f"Sukses patch {fp} baris {s}-{e}. Total baris: {len(lines)} (backup {fp}.bak)."
 
         if name == "write_file":
             fp = args["path"]
-            parent = os.path.dirname(os.path.abspath(fp))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            existed = os.path.isfile(fp)
-            old_data = None
-            if existed:
-                try:
-                    if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
-                        old_data = _Path(fp).read_bytes()
-                except Exception:
-                    old_data = None
-            backup_note = ""
-            if existed:
-                try:
-                    shutil.copy2(fp, fp + ".bak")
-                    backup_note = f" (backup {fp}.bak)"
-                except Exception:
-                    backup_note = " (backup gagal, tetap menulis)"
+            os.makedirs(os.path.dirname(os.path.abspath(fp)), exist_ok=True)
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(args["content"])
-            _journal_record({"kind": "restore_bak" if existed else "delete_created",
-                             "path": fp, "data": old_data,
-                             "display": _journal_display(fp, base_dir)})
-            return f"Sukses menulis file {fp} ({args['content'].count(chr(10)) + 1} baris){backup_note}."
+            return f"Sukses menulis file {fp} ({args['content'].count(chr(10)) + 1} baris)."
 
         if name == "delete_path":
             target, root = _resolve_in_workspace(args.get("path") or "", base_dir)
@@ -1284,26 +1026,11 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
                 return "Error: Workspace itu sendiri tidak boleh dihapus."
             if not target.exists() and not target.is_symlink():
                 return f"Error: '{args.get('path')}' tidak ditemukan."
-            # Rollback: backup dulu sebelum hapus (isi di memori, maks 5 MB).
-            backup = _backup_deleted(target)
-            display = _journal_display(str(target), base_dir)
             if target.is_dir() and not target.is_symlink():
                 count = sum(1 for _ in target.rglob("*") if _.is_file())
                 shutil.rmtree(target)
-                if backup is not None:
-                    _journal_record({"kind": "restore_deleted", "path": str(target), "is_dir": True,
-                                     "files": backup[1], "display": display})
-                else:
-                    _journal_record({"kind": "not_restorable", "display": display,
-                                     "reason": "folder terlalu besar untuk di-backup (>5 MB)"})
                 return f"Sukses menghapus folder {target} ({count} file di dalamnya)."
             target.unlink()
-            if backup is not None:
-                _journal_record({"kind": "restore_deleted", "path": str(target), "is_dir": False,
-                                 "data": backup[1], "display": display})
-            else:
-                _journal_record({"kind": "not_restorable", "display": display,
-                                 "reason": "file terlalu besar untuk di-backup (>5 MB)"})
             return f"Sukses menghapus file {target}."
 
         if name == "move_path":
@@ -1315,8 +1042,6 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
                 return f"Error: '{args.get('path')}' tidak ditemukan."
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
-            _journal_record({"kind": "move_back", "src": str(src), "dst": str(dst),
-                             "display": _journal_display(str(src), base_dir)})
             return f"Sukses memindah {src} -> {dst}."
 
         if name == "run_bash":
@@ -1329,10 +1054,9 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
             bash_env = os.environ.copy()
             bash_env["CI"] = "true"
             bash_env["DEBIAN_FRONTEND"] = "noninteractive"
-            res = _run_cancellable(args["command"], shell=True, cwd=cwd, env=bash_env,
-                                   stdin=subprocess.DEVNULL, capture_output=True,
-                                   timeout=180, cancelled=cancelled)
-            output = (res.stdout or "").strip()
+            res = subprocess.run(args["command"], shell=True, cwd=cwd, env=bash_env,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
+            output = (res.stdout + "\n" + res.stderr).strip()
             if len(output) > 8000:
                 output = output[:3500] + "\n\n... [DIPOTONG] ...\n\n" + output[-3500:]
             return f"EXIT CODE: {res.returncode}\nOUTPUT:\n{output or '(kosong)'}"
@@ -1360,8 +1084,7 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
             return {"__image_payload__": fp, "question": args.get("question", "Analisis gambar ini.")}
 
         if name == "read_document":
-            return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT,
-                                 cancelled=cancelled)
+            return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT)
 
         if name == "remember":
             # Tidak menulis ke Firestore dari worker (kredensial tidak ada di
@@ -1373,8 +1096,6 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
             return {"__memory__": text[:500]}
 
         return f"Error: Tool '{name}' tidak dikenal."
-    except _TurnCancelled:
-        raise
     except Exception as ex:
         return f"Error eksekusi {name}: {ex}"
 
@@ -1382,23 +1103,19 @@ def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
 def build_system_prompt(base_dir):
     return (
         "Kamu adalah Autonomous AI Partner profesional yang berjalan lokal (GPU Kaggle). "
-        "Kamu menganalisis, merencanakan, lalu bertindak dengan tool — bukan cuma memberi saran.\n"
+        "Kamu bisa membaca/menulis file, menjalankan shell, mencari web, dan menganalisis gambar.\n"
         f"WORKSPACE UTAMA: `{base_dir}` (dan `/kaggle/input` untuk data read-only).\n"
         f"FILE UPLOAD PENGGUNA: `{base_dir}/uploads`. Untuk PDF, DOCX, PPTX, XLSX, CSV, gambar berisi teks, "
         "audio, video, dan arsip zip/tar gunakan tool read_document. Jangan memakai read_file pada file biner.\n"
         "TOOLS: list_dir, read_file, patch_file, write_file, delete_path, move_path, run_bash, web_search, web_image_search, web_fetch, inspect_image, read_document, remember.\n"
         "Cara kerja profesional:\n"
-        "- Analisis dulu dari bukti: baca file/error yang relevan, pahami root cause, baru perbaiki.\n"
-        "- Kalau user minta DIKERJAKAN (hapus, tulis, edit, jalankan), panggil tool di giliran pertama — "
-        "jangan hanya menjanjikan atau menjelaskan tanpa bertindak.\n"
-        "- Hapus: path jelas → delete_path langsung. Path ambigu → list_dir sekali, lalu delete_path.\n"
-        "- Edit non-sepele: utamakan write_file dengan konten lengkap (otomatis .bak). patch_file untuk rentang kecil.\n"
-        "- Rollback: kalau user minta kembali ke versi/perbaikan sebelumnya, kembalikan konten lengkap yang "
-        "pernah kamu tulis di percakapan ini; kalau sudah tidak ada, bilang jujur.\n"
-        "- Sebelum tugas besar: cek folder, baca file relevan, atau tanya user jika info penting kurang "
-        "(API key, target deploy, kredensial, dsb).\n"
-        "- Jangan mengarang fakta, isi file, atau hasil tool. Laporkan path, perintah, dan error asli.\n"
-        "- Struktur lengkap / tree / daftar file: keluarkan SELURUH hasil tanpa '...' di tengah.\n"
+        "- Sebelum mengerjakan tugas besar, pahami dulu konteks: cek folder, baca file relevan, atau tanya user "
+        "jika informasi penting kurang (nama proyek, API key, target deploy, kredensial, dsb).\n"
+        "- Jangan mengarang. Jika butuh token/API key/secret, minta user menuliskannya (atau pastikan sudah ada di env/secret) "
+        "sebelum menjalankan langkah yang bergantung padanya.\n"
+        "- Kerjakan langkah demi langkah: investigasi → rencana singkat → eksekusi → verifikasi hasil.\n"
+        "- Laporkan hasil yang konkret (path file, perintah yang dijalankan, error asli) tanpa basa-basi berlebih.\n"
+        "- Jika diminta struktur lengkap / tree / daftar file, keluarkan SELURUH hasil tanpa '...' atau potongan di tengah.\n"
         "Paket dokumen (pymupdf, python-docx, python-pptx, faster-whisper) dipasang offline dari dataset "
         "media-offline-pkgs ke /tmp/docpkgs tanpa menimpa numpy atau pillow bawaan Kaggle. "
         "pandas dan openpyxl memakai paket yang sudah ada di image Kaggle. ffmpeg dan tesseract dipakai jika sudah ada, "
@@ -1799,14 +1516,8 @@ _SELF_CHECK_MESSAGE = (
 )
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None, journal_id=None, rollback_out=None):
-    global _active_journal_id
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None):
     strings = _agent_strings(language)
-    # Jurnal rollback giliran ini: semua perubahan file dicatat di sini,
-    # dibatalkan kalau user menekan Berhenti/Trash di tengah jalan.
-    _turn_journal_id = journal_id or f"turn-{uuid.uuid4().hex[:8]}"
-    _turn_journal = _journal_for(_turn_journal_id)
-    _active_journal_id = _turn_journal_id
     def _act(msg):
         if on_activity:
             try:
@@ -1876,24 +1587,6 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             title = f"{strings['tokens_used']}: {' · '.join(parts)}"
         _step(_new_id(), kind="info", title=title, status="done")
 
-    def _finish_cancel():
-        # Berhenti/Trash di tengah giliran: batalkan + kembalikan semua
-        # perubahan file yang sudah dibuat giliran ini (urut terbalik).
-        report = _rollback_journal(_turn_journal, base_dir)
-        _journals.pop(_turn_journal_id, None)
-        if rollback_out is not None:
-            rollback_out.append(report)
-        history.append({"role": "assistant", "content": strings["cancelled"]})
-        _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
-        _report_tokens()
-        return strings["cancelled"]
-
-    def _finish_ok(text):
-        # Giliran selesai normal: jurnal tidak lagi dibutuhkan, buang supaya
-        # backup hapusan di memori tidak menumpuk antar giliran.
-        _journals.pop(_turn_journal_id, None)
-        return text
-
     # Loop jalan sampai model sendiri memutuskan menjawab — seperti manusia yang
     # berhenti saat merasa sudah cukup, bukan karena kuota langkah habis.
     while True:
@@ -1902,14 +1595,20 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         _step(think_id, kind="thinking", title=strings["thinking"], status="running")
         if cancelled and cancelled():
             # User menekan Berhenti selagi model sedang berpikir.
-            return _finish_cancel()
+            history.append({"role": "assistant", "content": strings["cancelled"]})
+            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+            _report_tokens()
+            return strings["cancelled"]
         try:
             message, usage = _stream_call(with_tools=True)
             total_tokens += int((usage or {}).get("total_tokens") or 0)
             prompt_tokens += int((usage or {}).get("prompt_tokens") or 0)
             completion_tokens += int((usage or {}).get("completion_tokens") or 0)
         except _TurnCancelled:
-            return _finish_cancel()
+            history.append({"role": "assistant", "content": strings["cancelled"]})
+            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+            _report_tokens()
+            return strings["cancelled"]
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
@@ -1964,7 +1663,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
             _report_tokens()
-            return _finish_ok(_append_missing_markers(visible or _fallback_summary(ran_tools), out_before, written_files))
+            return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before, written_files)
 
         # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
         for tc in tool_calls:
@@ -2013,12 +1712,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 # write_file) adalah pengecekan ulang yang sah dan harus
                 # mengembalikan hasil segar — terbukti 2026-11-26: turn "cek apa
                 # ada 4 file" malah dapat teks peringatan, bukan isi folder.
-                try:
-                    result = exec_tool(fn_name, parsed_args, base_dir=base_dir, cancelled=cancelled)
-                except _TurnCancelled:
-                    # Ctrl+C nangkep di tengah tool (mis. sleep/install): batal
-                    # + rollback sekarang, jangan lanjut ke tool berikut.
-                    return _finish_cancel()
+                result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
                 seen_calls[sig] = str(result)
                 # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
                 # di chat (dikirim balik lewat result_body, bukan ditempel di teks).
@@ -2057,10 +1751,6 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                                            else os.path.join(base_dir, _wp))
                     if _ap not in written_files:
                         written_files.append(_ap)
-            # Berhenti ditekan selagi tool jalan: batalkan + rollback sekarang,
-            # jangan tunggu ronde tool selesai (tool berikut tidak boleh jalan).
-            if cancelled and cancelled():
-                return _finish_cancel()
             if repeat_after_warning:
                 stuck_reason = f"panggilan '{fn_name}' yang sama diulang setelah diperingatkan"
             elif not ok:
@@ -2081,7 +1771,10 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             ]})
 
         if cancelled and cancelled():
-            return _finish_cancel()
+            history.append({"role": "assistant", "content": strings["cancelled"]})
+            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+            _report_tokens()
+            return strings["cancelled"]
         if stuck_reason:
             break
 
@@ -2097,8 +1790,6 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         prompt_tokens += int((final_usage or {}).get("prompt_tokens") or 0)
         completion_tokens += int((final_usage or {}).get("completion_tokens") or 0)
         final_visible, _ = _split_thinking(final_message)
-    except _TurnCancelled:
-        return _finish_cancel()
     except Exception:
         final_visible = ""
     if not final_visible:
@@ -2106,7 +1797,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     history.append({"role": "assistant", "content": final_visible})
     _step(final_id, status="done", title=strings["final_done"])
     _report_tokens()
-    return _finish_ok(_append_missing_markers(final_visible, out_before, written_files))
+    return _append_missing_markers(final_visible, out_before, written_files)
 
 
 def run_workspace_job(op, payload, base_dir):
@@ -2119,48 +1810,22 @@ def run_workspace_job(op, payload, base_dir):
         b64 = payload.get("content_base64")
         if b64:
             fp = payload["path"]
-            existed = os.path.isfile(fp)
-            old_data = None
-            if existed:
-                try:
-                    if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
-                        old_data = _Path(fp).read_bytes()
-                except Exception:
-                    old_data = None
             os.makedirs(os.path.dirname(os.path.abspath(fp)), exist_ok=True)
             with open(fp, "wb") as fh:
                 fh.write(base64.b64decode(b64))
-            _journal_record({"kind": "restore_bak" if existed else "delete_created",
-                             "path": fp, "data": old_data,
-                             "display": _journal_display(fp, base_dir)})
             return {"ok": True, "result": f"Sukses menulis file biner {fp} ({len(b64)} char base64)."}
         return {"ok": True, "result": exec_tool("write_file", {"path": payload["path"], "content": payload.get("content", "")}, base_dir)}
     if op == "move":
         src, dst = payload["source"], payload["destination"]
         os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
         shutil.move(src, dst)
-        _journal_record({"kind": "move_back", "src": str(src), "dst": str(dst),
-                         "display": _journal_display(str(src), base_dir)})
         return {"ok": True, "result": f"Dipindahkan {src} -> {dst}"}
     if op == "delete":
         fp = payload["path"]
-        target = _Path(fp)
-        existed = target.exists() or target.is_symlink()
-        backup = _backup_deleted(target) if existed else None
-        display = _journal_display(fp, base_dir)
         if os.path.isdir(fp):
             shutil.rmtree(fp, ignore_errors=True)
         elif os.path.exists(fp):
             os.remove(fp)
-        if not existed:
-            pass  # tidak ada yang dihapus -> tidak ada yang perlu dibatalkan
-        elif backup is not None:
-            _journal_record({"kind": "restore_deleted", "path": fp, "is_dir": backup[0] == "dir",
-                             "files": backup[1] if backup[0] == "dir" else None,
-                             "data": backup[1] if backup[0] == "file" else None, "display": display})
-        else:
-            _journal_record({"kind": "not_restorable", "display": display,
-                             "reason": "terlalu besar untuk di-backup (>5 MB)"})
         return {"ok": True, "result": f"Dihapus {fp}"}
     return {"ok": False, "error": f"Operasi workspace '{op}' tidak dikenal"}
 
@@ -2169,7 +1834,6 @@ def run_workspace_job(op, payload, base_dir):
 # Headless backend polling loop (this replaces codekaggle.py's input() loop)
 # ---------------------------------------------------------------------------
 def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
-    global _active_journal_id
     if not IS_KAGGLE:
         raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
     print(f"[ai-local] worker version: {WORKER_VERSION}", flush=True)
@@ -2227,9 +1891,6 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             if isinstance(res, dict) and res.get("control") == "stop":
                 _shutdown_now("stop diminta user")
             if isinstance(res, dict) and res.get("control") == "cancel":
-                _cancel_event.set()
-            if isinstance(res, dict) and isinstance(res.get("cancel_turn"), str) and res.get("cancel_turn"):
-                _cancelled_turns.add(res["cancel_turn"])
                 _cancel_event.set()
             if gone["count"] >= 6:
                 # Backend tidak mengenal sesi ini lagi (worker yatim / sesi diganti): jangan buang kuota GPU.
@@ -2289,12 +1950,6 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             job_res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": False}, timeout=10)
             job = job_res.get("job") if isinstance(job_res, dict) else None
             control = job_res.get("control") if isinstance(job_res, dict) else None
-            cancel_turn = job_res.get("cancel_turn") if isinstance(job_res, dict) else None
-            if isinstance(cancel_turn, str) and cancel_turn:
-                # Berhenti ditekan untuk giliran ini: tandai turn-nya supaya
-                # tool berikut tidak jalan dan rollback bisa menemukannya.
-                _cancelled_turns.add(cancel_turn)
-                _cancel_event.set()
             if control == "stop":
                 # Stop harus bekerja walau thread heartbeat sedang tertahan:
                 # loop utama juga melihat perintah stop di tiap poll-nya.
@@ -2421,22 +2076,15 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                                 synced.append({"role": role, "content": shared_content[:8000]})
                         history = synced
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
-                    # Cancel yang sudah datang sebelum job ini mulai (disampaikan
-                    # bareng job-nya di poll) jangan dihapus oleh clear() di bawah.
-                    if job_id not in _cancelled_turns:
-                        _cancel_event.clear()
+                    _cancel_event.clear()
                     search_images: list[str] = []
                     memories: list[str] = []
-                    rollback_report: list[dict] = []
                     answer = run_agent_turn(history, api_url, base_dir, content,
                                             on_activity=lambda _m: None, on_step=_report_step,
                                             language=payload.get("language"), on_opening=_report_opening,
                                             cancelled=_cancel_event.is_set, context=payload.get("context"),
                                             on_token=_report_stream, search_images_out=search_images,
-                                            memories_out=memories, journal_id=job_id,
-                                            rollback_out=rollback_report)
-                    _cancelled_turns.discard(job_id)
-                    _active_journal_id = None
+                                            memories_out=memories)
                     if _stream_state["buf"]:
                         try:
                             _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": _stream_state["seg"], "delta": _stream_state["buf"]}, timeout=5)
@@ -2455,51 +2103,15 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         result_body["search_images"] = search_images
                     if memories:
                         result_body["memories_saved"] = memories
-                    if rollback_report:
-                        # Giliran dibatalkan user: laporkan apa yang dikembalikan.
-                        result_body["rollback"] = rollback_report[0]
-                        result_body["cancelled"] = True
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": result_body})
                 elif job_type == "workspace":
-                    _active_journal_id = job_id
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)
-                    _active_journal_id = None
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": out.get("ok", False), "result": out})
-                elif job_type == "rollback":
-                    # Backend meminta: kembalikan perubahan file giliran turn_id
-                    # (giliran Cloud yang dibatalkan user).
-                    turn_id = payload.get("turn_id")
-                    report = _rollback_journal(_journals.pop(turn_id, []), base_dir) if turn_id else {"reverted": [], "not_undone": []}
-                    if turn_id:
-                        _cancelled_turns.discard(turn_id)
-                    _active_journal_id = None
-                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
-                          "result": {"content": "Rollback selesai.", "rollback": report}})
                 elif job_type == "tool":
                     # Satu tool call dari model cloud: eksekusi langsung, tanpa
                     # giliran agen. Tidak masuk ke history percakapan worker —
                     # cloud yang memegang pembahasannya dan menerima hasilnya.
-                    turn_id = payload.get("turn_id")
-                    if turn_id:
-                        _active_journal_id = turn_id
-                        _journal_for(turn_id)
-                    if turn_id and turn_id in _cancelled_turns:
-                        # Giliran ini sudah dibatalkan user: jangan jalankan
-                        # tool-nya, langsung kembalikan hasil batal.
-                        _active_journal_id = None
-                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
-                              "result": {"content": "Dibatalkan oleh user.", "cancelled": True}})
-                        continue
-                    try:
-                        result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir,
-                                                cancelled=lambda: bool(turn_id) and turn_id in _cancelled_turns)
-                    except _TurnCancelled:
-                        # Ctrl+C nangkep di tengah tool: kembalikan hasil batal
-                        # supaya backend memicu rollback giliran ini.
-                        _active_journal_id = None
-                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
-                              "result": {"content": "Dibatalkan oleh user.", "cancelled": True}})
-                        continue
+                    result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
                     if isinstance(result_text, dict) and "__memory__" in result_text:
                         # remember via tool job langsung: cloud tidak pernah
                         # mengirim ini (ditangani di backend), tapi jangan
@@ -2521,7 +2133,6 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": f"Image '{img_fp}' loaded for visual inspection.", "image": {"url": encode_image_b64(img_fp), "question": img_q, "path": img_fp}}})
                     else:
                         _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": result_text}})
-                    _active_journal_id = None
                 else:
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": f"unknown job type {job_type}"})
             except Exception as exc:
