@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -663,6 +665,10 @@ class _OpenRouterError(Exception):
         self.message = message
 
 
+class _TurnCancelled(Exception):
+    """User menekan Berhenti/Trash saat giliran Cloud jalan."""
+
+
 async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict[str, str]], api_key: str, selected_model: str, user_id: str):
     """No separate `warthadev-agent` runtime is configured (AGENT_RUNTIME_URL /
     AGENT_INTERNAL_API_KEY unset) - that service has nothing to do with Kaggle and
@@ -706,6 +712,12 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
     empty_retry = False
     stuck_reason: str | None = None
     timeout = aiohttp.ClientTimeout(total=float(os.getenv("AGENT_TIMEOUT", "210")), sock_read=120)
+    # Batal + rollback: tiap giliran Cloud punya id sendiri; Berhenti/Trash
+    # menandai flag waktu user, dicek tiap ronde dan tiap tool call.
+    turn_id = uuid.uuid4().hex[:12]
+    turn_start = time.monotonic()
+    remembered_ids: list[str] = []
+    agent_local.register_cloud_turn(user_id, turn_id)
 
     async def one_round(holder: dict[str, Any], with_tools: bool = True):
         """One streamed OpenRouter call. Yields token events live as they arrive
@@ -744,6 +756,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                     async for raw_chunk in upstream.content:
                         if not raw_chunk:
                             continue
+                        if agent_local.cancel_requested_since(user_id, turn_start):
+                            raise _TurnCancelled()
                         buffer += raw_chunk.decode("utf-8", errors="ignore")
                         lines = buffer.split("\n")
                         buffer = lines.pop()
@@ -808,6 +822,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
 
     try:
         while True:
+            if agent_local.cancel_requested_since(user_id, turn_start):
+                raise _TurnCancelled()
             holder: dict[str, Any] = {}
             async for event in one_round(holder, with_tools=True):
                 yield event
@@ -826,6 +842,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                                             "function": {"name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}} for c in tool_calls]})
             pending_images: list[dict[str, Any]] = []
             for call in tool_calls:
+                if agent_local.cancel_requested_since(user_id, turn_start):
+                    raise _TurnCancelled()
                 name = str(call["name"])
                 args = call["args"] if isinstance(call["args"], dict) else {}
                 yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'detail': agent_shared.tool_detail(name, args)})}\n\n"
@@ -845,9 +863,14 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                             # Runs here on the backend (Firestore), never on
                             # the worker — the worker has no Firestore access.
                             saved = agent_memory.save_memory(user_id, str(args.get("text") or ""), source="ai")
+                            if saved and saved.get("id"):
+                                # Kalau giliran ini dibatalkan, ingatan ini ikut dihapus (rollback).
+                                remembered_ids.append(str(saved["id"]))
                             raw_result = f"Saved memory: {saved['text']}" if saved else "Nothing saved (empty text)."
                         else:
-                            raw_result = await agent_local.run_kaggle_tool(user_id, name, args)
+                            raw_result = await agent_local.run_kaggle_tool(user_id, name, args, turn_id=turn_id)
+                    except agent_local.CloudTurnCancelled:
+                        raise _TurnCancelled()
                     except Exception as exc:
                         result_text = f"Error: {str(exc)[:500]}"
                     else:
@@ -868,6 +891,8 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
                             search_images.append(url)
                 ok = not agent_shared.is_error_result(result_text)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
+                if agent_local.cancel_requested_since(user_id, turn_start):
+                    raise _TurnCancelled()
                 ran_tools.append((name, "", ok, result_text))
                 preview = result_text if len(result_text) <= 1500 else result_text[:1500] + "…"
                 yield f"data: {json.dumps({'type': 'tool_result', 'name': name, 'output': preview})}\n\n"
@@ -898,10 +923,26 @@ async def _plain_chat_stream_events(payload: AgentChatPayload, images: list[dict
             async for event in one_round(holder2, with_tools=False):
                 yield event
             accumulated_text = str(holder2.get("text") or "")
+    except _TurnCancelled:
+        # User menekan Berhenti/Trash: kembalikan perubahan file giliran ini
+        # di worker, hapus ingatan yang sempat disimpan, simpan laporan
+        # rollback-nya untuk ringkasan di layar.
+        rollback = await agent_local.rollback_cloud_turn(user_id, turn_id)
+        for mem_id in remembered_ids:
+            try:
+                agent_memory.delete_memory(user_id, mem_id)
+            except Exception:
+                pass
+        await agent_local.store_rollback_report(user_id, rollback)
+        yield f"data: {json.dumps({'type': 'final', 'result': {'content': 'Dibatalkan oleh user.', 'cancelled': True, 'rollback': rollback}})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
     except _OpenRouterError as exc:
         yield f"data: {json.dumps({'type': 'error', 'status': exc.status, 'message': exc.message})}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        agent_local.unregister_cloud_turn(user_id, turn_id)
     if not accumulated_text.strip():
         accumulated_text = agent_shared.fallback_summary(ran_tools, "en")
     final_event = {

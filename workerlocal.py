@@ -951,6 +951,132 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT):
         return f"Error membaca {path}: {exc}"
 
 
+# ---------------------------------------------------------------------------
+# Jurnal rollback: tiap perubahan file dalam satu giliran dicatat cara
+# membatalkannya, supaya Berhenti/Trash bisa mengembalikan keadaan seperti
+# sebelum giliran itu jalan. Jurnal hidup di memori worker saja (bukan
+# /kaggle/working), per turn_id; giliran Cloud memakai turn_id dari backend,
+# giliran Local memakai job_id chat-nya. File yang dihapus di-backup isinya
+# (maks 5 MB) sebelum dihapus; file yang ditulis/diedit sudah punya .bak.
+# run_bash sengaja TIDAK dicatat: perintah shell tidak bisa di-undo.
+# ---------------------------------------------------------------------------
+_ROLLBACK_MAX_JOURNALS = 8
+_ROLLBACK_MAX_BACKUP_BYTES = 5 * 1024 * 1024
+_journals: dict[str, list] = {}
+_cancelled_turns: set[str] = set()
+_active_journal_id: str | None = None
+
+
+def _journal_display(path, base_dir):
+    try:
+        rel = os.path.relpath(str(path), str(base_dir))
+        return rel if not rel.startswith("..") else str(path)
+    except Exception:
+        return str(path)
+
+
+def _journal_for(turn_id):
+    journal = _journals.get(turn_id)
+    if journal is None:
+        if len(_journals) >= _ROLLBACK_MAX_JOURNALS:
+            _journals.pop(next(iter(_journals)), None)  # buang jurnal tertua
+        journal = _journals[turn_id] = []
+    return journal
+
+
+def _journal_record(entry):
+    if _active_journal_id is None:
+        return
+    journal = _journal_for(_active_journal_id)
+    if entry.get("kind") == "restore_bak":
+        # Satu path cukup dicatat sekali: entri pertama memegang isi sebelum
+        # giliran ini. Tulis kedua ke path yang sama menimpa file .bak, jadi
+        # catatan kedua tidak boleh menggantikan yang pertama.
+        for old in journal:
+            if old.get("kind") == "restore_bak" and old.get("path") == entry.get("path"):
+                return
+    journal.append(entry)
+
+
+def _backup_deleted(target):
+    """Baca isi path yang mau dihapus ke memori (file <=5 MB, atau folder
+    total <=5 MB). Return ("file", bytes) / ("dir", {rel: bytes}) / None."""
+    try:
+        if target.is_symlink() or target.is_file():
+            if target.stat().st_size > _ROLLBACK_MAX_BACKUP_BYTES:
+                return None
+            return ("file", target.read_bytes())
+        if target.is_dir():
+            files: dict[str, bytes] = {}
+            total = 0
+            for p in sorted(target.rglob("*")):
+                if p.is_file() and not p.is_symlink():
+                    total += p.stat().st_size
+                    if total > _ROLLBACK_MAX_BACKUP_BYTES:
+                        return None
+                    files[str(p.relative_to(target))] = p.read_bytes()
+            return ("dir", files)
+    except Exception:
+        return None
+    return None
+
+
+def _rollback_journal(journal, base_dir):
+    """Jalankan jurnal terbalik (best-effort): kembalikan file yang diubah,
+    hapus file yang dibuat, kembalikan file yang dihapus/dipindah."""
+    reverted: list[str] = []
+    not_undone: list[dict[str, str]] = []
+    for entry in reversed(journal):
+        kind = entry.get("kind")
+        display = str(entry.get("display") or "?")
+        try:
+            if kind == "restore_bak":
+                fp = str(entry["path"])
+                bak = fp + ".bak"
+                data = entry.get("data")
+                if data is not None:
+                    # Isi sebelum giliran (ditangkap saat pertama ditulis):
+                    # tulis kembali, .bak dibiarkan apa adanya.
+                    _Path(fp).parent.mkdir(parents=True, exist_ok=True)
+                    _Path(fp).write_bytes(data)
+                    reverted.append(display)
+                elif os.path.isfile(bak):
+                    shutil.move(bak, fp)
+                    reverted.append(display)
+                else:
+                    not_undone.append({"item": display, "reason": "backup .bak tidak ditemukan"})
+            elif kind == "delete_created":
+                fp = str(entry["path"])
+                if os.path.isdir(fp) and not os.path.islink(fp):
+                    shutil.rmtree(fp, ignore_errors=True)
+                elif os.path.lexists(fp):
+                    os.remove(fp)
+                reverted.append(display)
+            elif kind == "restore_deleted":
+                fp = str(entry["path"])
+                if entry.get("is_dir"):
+                    dest_dir = _Path(fp)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    for rel, data in (entry.get("files") or {}).items():
+                        dest = dest_dir / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(data)
+                else:
+                    _Path(fp).parent.mkdir(parents=True, exist_ok=True)
+                    _Path(fp).write_bytes(entry["data"])
+                reverted.append(display)
+            elif kind == "move_back":
+                src, dst = str(entry["src"]), str(entry["dst"])
+                _Path(src).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(dst, src)
+                reverted.append(display)
+            elif kind == "not_restorable":
+                not_undone.append({"item": display, "reason": str(entry.get("reason") or "tidak bisa dibatalkan")})
+        except Exception as exc:
+            not_undone.append({"item": display, "reason": str(exc)[:120]})
+    return {"reverted": reverted, "not_undone": not_undone}
+
+
 def exec_tool(name, args, base_dir=BASE_DIR):
     try:
         if name == "list_dir":
@@ -1004,6 +1130,14 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             if new_code and not new_code.endswith("\n"):
                 new_code += "\n"
             shutil.copy2(fp, fp + ".bak")
+            # Tangkap isi sebelum diubah (maks 5 MB): tulis kedua ke file yang
+            # sama menimpa .bak, jadi jurnal harus memegang isi aslinya sendiri.
+            old_data = None
+            try:
+                if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
+                    old_data = _Path(fp).read_bytes()
+            except Exception:
+                old_data = None
             with open(fp, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             if s < 1 or e > len(lines) or s > e:
@@ -1011,6 +1145,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             lines[s - 1:e] = new_code.splitlines(keepends=True)
             with open(fp, "w", encoding="utf-8") as f:
                 f.writelines(lines)
+            _journal_record({"kind": "restore_bak", "path": fp, "data": old_data,
+                             "display": _journal_display(fp, base_dir)})
             return f"Sukses patch {fp} baris {s}-{e}. Total baris: {len(lines)} (backup {fp}.bak)."
 
         if name == "write_file":
@@ -1018,8 +1154,16 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             parent = os.path.dirname(os.path.abspath(fp))
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            existed = os.path.isfile(fp)
+            old_data = None
+            if existed:
+                try:
+                    if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
+                        old_data = _Path(fp).read_bytes()
+                except Exception:
+                    old_data = None
             backup_note = ""
-            if os.path.isfile(fp):
+            if existed:
                 try:
                     shutil.copy2(fp, fp + ".bak")
                     backup_note = f" (backup {fp}.bak)"
@@ -1027,6 +1171,9 @@ def exec_tool(name, args, base_dir=BASE_DIR):
                     backup_note = " (backup gagal, tetap menulis)"
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(args["content"])
+            _journal_record({"kind": "restore_bak" if existed else "delete_created",
+                             "path": fp, "data": old_data,
+                             "display": _journal_display(fp, base_dir)})
             return f"Sukses menulis file {fp} ({args['content'].count(chr(10)) + 1} baris){backup_note}."
 
         if name == "delete_path":
@@ -1035,11 +1182,26 @@ def exec_tool(name, args, base_dir=BASE_DIR):
                 return "Error: Workspace itu sendiri tidak boleh dihapus."
             if not target.exists() and not target.is_symlink():
                 return f"Error: '{args.get('path')}' tidak ditemukan."
+            # Rollback: backup dulu sebelum hapus (isi di memori, maks 5 MB).
+            backup = _backup_deleted(target)
+            display = _journal_display(str(target), base_dir)
             if target.is_dir() and not target.is_symlink():
                 count = sum(1 for _ in target.rglob("*") if _.is_file())
                 shutil.rmtree(target)
+                if backup is not None:
+                    _journal_record({"kind": "restore_deleted", "path": str(target), "is_dir": True,
+                                     "files": backup[1], "display": display})
+                else:
+                    _journal_record({"kind": "not_restorable", "display": display,
+                                     "reason": "folder terlalu besar untuk di-backup (>5 MB)"})
                 return f"Sukses menghapus folder {target} ({count} file di dalamnya)."
             target.unlink()
+            if backup is not None:
+                _journal_record({"kind": "restore_deleted", "path": str(target), "is_dir": False,
+                                 "data": backup[1], "display": display})
+            else:
+                _journal_record({"kind": "not_restorable", "display": display,
+                                 "reason": "file terlalu besar untuk di-backup (>5 MB)"})
             return f"Sukses menghapus file {target}."
 
         if name == "move_path":
@@ -1051,6 +1213,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
                 return f"Error: '{args.get('path')}' tidak ditemukan."
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
+            _journal_record({"kind": "move_back", "src": str(src), "dst": str(dst),
+                             "display": _journal_display(str(src), base_dir)})
             return f"Sukses memindah {src} -> {dst}."
 
         if name == "run_bash":
@@ -1529,8 +1693,14 @@ _SELF_CHECK_MESSAGE = (
 )
 
 
-def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None):
+def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None, journal_id=None, rollback_out=None):
+    global _active_journal_id
     strings = _agent_strings(language)
+    # Jurnal rollback giliran ini: semua perubahan file dicatat di sini,
+    # dibatalkan kalau user menekan Berhenti/Trash di tengah jalan.
+    _turn_journal_id = journal_id or f"turn-{uuid.uuid4().hex[:8]}"
+    _turn_journal = _journal_for(_turn_journal_id)
+    _active_journal_id = _turn_journal_id
     def _act(msg):
         if on_activity:
             try:
@@ -1600,6 +1770,24 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             title = f"{strings['tokens_used']}: {' · '.join(parts)}"
         _step(_new_id(), kind="info", title=title, status="done")
 
+    def _finish_cancel():
+        # Berhenti/Trash di tengah giliran: batalkan + kembalikan semua
+        # perubahan file yang sudah dibuat giliran ini (urut terbalik).
+        report = _rollback_journal(_turn_journal, base_dir)
+        _journals.pop(_turn_journal_id, None)
+        if rollback_out is not None:
+            rollback_out.append(report)
+        history.append({"role": "assistant", "content": strings["cancelled"]})
+        _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
+        _report_tokens()
+        return strings["cancelled"]
+
+    def _finish_ok(text):
+        # Giliran selesai normal: jurnal tidak lagi dibutuhkan, buang supaya
+        # backup hapusan di memori tidak menumpuk antar giliran.
+        _journals.pop(_turn_journal_id, None)
+        return text
+
     # Loop jalan sampai model sendiri memutuskan menjawab — seperti manusia yang
     # berhenti saat merasa sudah cukup, bukan karena kuota langkah habis.
     while True:
@@ -1608,20 +1796,14 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         _step(think_id, kind="thinking", title=strings["thinking"], status="running")
         if cancelled and cancelled():
             # User menekan Berhenti selagi model sedang berpikir.
-            history.append({"role": "assistant", "content": strings["cancelled"]})
-            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
-            _report_tokens()
-            return strings["cancelled"]
+            return _finish_cancel()
         try:
             message, usage = _stream_call(with_tools=True)
             total_tokens += int((usage or {}).get("total_tokens") or 0)
             prompt_tokens += int((usage or {}).get("prompt_tokens") or 0)
             completion_tokens += int((usage or {}).get("completion_tokens") or 0)
         except _TurnCancelled:
-            history.append({"role": "assistant", "content": strings["cancelled"]})
-            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
-            _report_tokens()
-            return strings["cancelled"]
+            return _finish_cancel()
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
             raise
@@ -1676,7 +1858,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": visible})
             _act(strings["composing"])
             _report_tokens()
-            return _append_missing_markers(visible or _fallback_summary(ran_tools), out_before, written_files)
+            return _finish_ok(_append_missing_markers(visible or _fallback_summary(ran_tools), out_before, written_files))
 
         # Normalisasi tool_calls supaya riwayat selalu valid (id & arguments string).
         for tc in tool_calls:
@@ -1764,6 +1946,10 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                                            else os.path.join(base_dir, _wp))
                     if _ap not in written_files:
                         written_files.append(_ap)
+            # Berhenti ditekan selagi tool jalan: batalkan + rollback sekarang,
+            # jangan tunggu ronde tool selesai (tool berikut tidak boleh jalan).
+            if cancelled and cancelled():
+                return _finish_cancel()
             if repeat_after_warning:
                 stuck_reason = f"panggilan '{fn_name}' yang sama diulang setelah diperingatkan"
             elif not ok:
@@ -1784,10 +1970,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             ]})
 
         if cancelled and cancelled():
-            history.append({"role": "assistant", "content": strings["cancelled"]})
-            _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
-            _report_tokens()
-            return strings["cancelled"]
+            return _finish_cancel()
         if stuck_reason:
             break
 
@@ -1803,6 +1986,8 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
         prompt_tokens += int((final_usage or {}).get("prompt_tokens") or 0)
         completion_tokens += int((final_usage or {}).get("completion_tokens") or 0)
         final_visible, _ = _split_thinking(final_message)
+    except _TurnCancelled:
+        return _finish_cancel()
     except Exception:
         final_visible = ""
     if not final_visible:
@@ -1810,7 +1995,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     history.append({"role": "assistant", "content": final_visible})
     _step(final_id, status="done", title=strings["final_done"])
     _report_tokens()
-    return _append_missing_markers(final_visible, out_before, written_files)
+    return _finish_ok(_append_missing_markers(final_visible, out_before, written_files))
 
 
 def run_workspace_job(op, payload, base_dir):
@@ -1823,22 +2008,48 @@ def run_workspace_job(op, payload, base_dir):
         b64 = payload.get("content_base64")
         if b64:
             fp = payload["path"]
+            existed = os.path.isfile(fp)
+            old_data = None
+            if existed:
+                try:
+                    if os.path.getsize(fp) <= _ROLLBACK_MAX_BACKUP_BYTES:
+                        old_data = _Path(fp).read_bytes()
+                except Exception:
+                    old_data = None
             os.makedirs(os.path.dirname(os.path.abspath(fp)), exist_ok=True)
             with open(fp, "wb") as fh:
                 fh.write(base64.b64decode(b64))
+            _journal_record({"kind": "restore_bak" if existed else "delete_created",
+                             "path": fp, "data": old_data,
+                             "display": _journal_display(fp, base_dir)})
             return {"ok": True, "result": f"Sukses menulis file biner {fp} ({len(b64)} char base64)."}
         return {"ok": True, "result": exec_tool("write_file", {"path": payload["path"], "content": payload.get("content", "")}, base_dir)}
     if op == "move":
         src, dst = payload["source"], payload["destination"]
         os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
         shutil.move(src, dst)
+        _journal_record({"kind": "move_back", "src": str(src), "dst": str(dst),
+                         "display": _journal_display(str(src), base_dir)})
         return {"ok": True, "result": f"Dipindahkan {src} -> {dst}"}
     if op == "delete":
         fp = payload["path"]
+        target = _Path(fp)
+        existed = target.exists() or target.is_symlink()
+        backup = _backup_deleted(target) if existed else None
+        display = _journal_display(fp, base_dir)
         if os.path.isdir(fp):
             shutil.rmtree(fp, ignore_errors=True)
         elif os.path.exists(fp):
             os.remove(fp)
+        if not existed:
+            pass  # tidak ada yang dihapus -> tidak ada yang perlu dibatalkan
+        elif backup is not None:
+            _journal_record({"kind": "restore_deleted", "path": fp, "is_dir": backup[0] == "dir",
+                             "files": backup[1] if backup[0] == "dir" else None,
+                             "data": backup[1] if backup[0] == "file" else None, "display": display})
+        else:
+            _journal_record({"kind": "not_restorable", "display": display,
+                             "reason": "terlalu besar untuk di-backup (>5 MB)"})
         return {"ok": True, "result": f"Dihapus {fp}"}
     return {"ok": False, "error": f"Operasi workspace '{op}' tidak dikenal"}
 
@@ -1847,6 +2058,7 @@ def run_workspace_job(op, payload, base_dir):
 # Headless backend polling loop (this replaces codekaggle.py's input() loop)
 # ---------------------------------------------------------------------------
 def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
+    global _active_journal_id
     if not IS_KAGGLE:
         raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
     print(f"[ai-local] worker version: {WORKER_VERSION}", flush=True)
@@ -1904,6 +2116,9 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             if isinstance(res, dict) and res.get("control") == "stop":
                 _shutdown_now("stop diminta user")
             if isinstance(res, dict) and res.get("control") == "cancel":
+                _cancel_event.set()
+            if isinstance(res, dict) and isinstance(res.get("cancel_turn"), str) and res.get("cancel_turn"):
+                _cancelled_turns.add(res["cancel_turn"])
                 _cancel_event.set()
             if gone["count"] >= 6:
                 # Backend tidak mengenal sesi ini lagi (worker yatim / sesi diganti): jangan buang kuota GPU.
@@ -1963,6 +2178,12 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             job_res = _post("/agent/local/kaggle-poll", {"closing": False, "heartbeat_only": False}, timeout=10)
             job = job_res.get("job") if isinstance(job_res, dict) else None
             control = job_res.get("control") if isinstance(job_res, dict) else None
+            cancel_turn = job_res.get("cancel_turn") if isinstance(job_res, dict) else None
+            if isinstance(cancel_turn, str) and cancel_turn:
+                # Berhenti ditekan untuk giliran ini: tandai turn-nya supaya
+                # tool berikut tidak jalan dan rollback bisa menemukannya.
+                _cancelled_turns.add(cancel_turn)
+                _cancel_event.set()
             if control == "stop":
                 # Stop harus bekerja walau thread heartbeat sedang tertahan:
                 # loop utama juga melihat perintah stop di tiap poll-nya.
@@ -2089,15 +2310,22 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                                 synced.append({"role": role, "content": shared_content[:8000]})
                         history = synced
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
-                    _cancel_event.clear()
+                    # Cancel yang sudah datang sebelum job ini mulai (disampaikan
+                    # bareng job-nya di poll) jangan dihapus oleh clear() di bawah.
+                    if job_id not in _cancelled_turns:
+                        _cancel_event.clear()
                     search_images: list[str] = []
                     memories: list[str] = []
+                    rollback_report: list[dict] = []
                     answer = run_agent_turn(history, api_url, base_dir, content,
                                             on_activity=lambda _m: None, on_step=_report_step,
                                             language=payload.get("language"), on_opening=_report_opening,
                                             cancelled=_cancel_event.is_set, context=payload.get("context"),
                                             on_token=_report_stream, search_images_out=search_images,
-                                            memories_out=memories)
+                                            memories_out=memories, journal_id=job_id,
+                                            rollback_out=rollback_report)
+                    _cancelled_turns.discard(job_id)
+                    _active_journal_id = None
                     if _stream_state["buf"]:
                         try:
                             _post("/agent/local/kaggle-stream", {"job_id": job_id, "segment": _stream_state["seg"], "delta": _stream_state["buf"]}, timeout=5)
@@ -2116,14 +2344,41 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         result_body["search_images"] = search_images
                     if memories:
                         result_body["memories_saved"] = memories
+                    if rollback_report:
+                        # Giliran dibatalkan user: laporkan apa yang dikembalikan.
+                        result_body["rollback"] = rollback_report[0]
+                        result_body["cancelled"] = True
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": result_body})
                 elif job_type == "workspace":
+                    _active_journal_id = job_id
                     out = run_workspace_job(payload.get("op"), payload.get("op_payload") or {}, base_dir)
+                    _active_journal_id = None
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": out.get("ok", False), "result": out})
+                elif job_type == "rollback":
+                    # Backend meminta: kembalikan perubahan file giliran turn_id
+                    # (giliran Cloud yang dibatalkan user).
+                    turn_id = payload.get("turn_id")
+                    report = _rollback_journal(_journals.pop(turn_id, []), base_dir) if turn_id else {"reverted": [], "not_undone": []}
+                    if turn_id:
+                        _cancelled_turns.discard(turn_id)
+                    _active_journal_id = None
+                    _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
+                          "result": {"content": "Rollback selesai.", "rollback": report}})
                 elif job_type == "tool":
                     # Satu tool call dari model cloud: eksekusi langsung, tanpa
                     # giliran agen. Tidak masuk ke history percakapan worker —
                     # cloud yang memegang pembahasannya dan menerima hasilnya.
+                    turn_id = payload.get("turn_id")
+                    if turn_id:
+                        _active_journal_id = turn_id
+                        _journal_for(turn_id)
+                    if turn_id and turn_id in _cancelled_turns:
+                        # Giliran ini sudah dibatalkan user: jangan jalankan
+                        # tool-nya, langsung kembalikan hasil batal.
+                        _active_journal_id = None
+                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
+                              "result": {"content": "Dibatalkan oleh user.", "cancelled": True}})
+                        continue
                     result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
                     if isinstance(result_text, dict) and "__memory__" in result_text:
                         # remember via tool job langsung: cloud tidak pernah
@@ -2146,6 +2401,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                             _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": f"Image '{img_fp}' loaded for visual inspection.", "image": {"url": encode_image_b64(img_fp), "question": img_q, "path": img_fp}}})
                     else:
                         _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True, "result": {"content": result_text}})
+                    _active_journal_id = None
                 else:
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": f"unknown job type {job_type}"})
             except Exception as exc:

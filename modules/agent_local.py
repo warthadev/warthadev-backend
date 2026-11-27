@@ -49,6 +49,60 @@ _sessions_lock = asyncio.Lock()
 _PERSIST_FIELDS = ("session_id", "owner_uid", "worker_token", "created_at", "expires_at", "control")
 _last_persist_at = 0.0
 
+# Batal + rollback: Berhenti/Trash harus sampai ke giliran yang sedang jalan,
+# Cloud maupun Local. Sinyalnya dua jalur: (1) flag waktu per user — giliran
+# Cloud mengeceknya tiap ronde/tool dan berhenti sendiri; (2) control="cancel"
+# + cancel_turn di sesi — worker mengambilnya lewat poll dan membatalkan +
+# mengembalikan perubahan file giliran itu. Flag waktu menandai sendiri
+# (turn yang mulai sesudah cancel tidak kena), jadi tidak perlu dihapus.
+_cancel_requests: dict[str, float] = {}
+_active_cloud_turns: dict[str, str] = {}
+
+
+class CloudTurnCancelled(Exception):
+    """Satu tool job Cloud dibatalkan worker karena user menekan Berhenti."""
+
+
+def request_cancel(uid: str) -> None:
+    _cancel_requests[uid] = time.monotonic()
+
+
+def cancel_requested_since(uid: str, since: float) -> bool:
+    return _cancel_requests.get(uid, 0.0) >= since
+
+
+def register_cloud_turn(uid: str, turn_id: str) -> None:
+    _active_cloud_turns[uid] = turn_id
+
+
+def unregister_cloud_turn(uid: str, turn_id: str) -> None:
+    if _active_cloud_turns.get(uid) == turn_id:
+        _active_cloud_turns.pop(uid, None)
+
+
+async def store_rollback_report(uid: str, report: dict[str, Any]) -> None:
+    """Simpan laporan rollback giliran terakhir supaya frontend bisa
+    menampilkannya sebagai satu baris ringkasan setelah Berhenti/Trash."""
+    sess = await _get_session_for_uid(uid)
+    if not sess:
+        return
+    async with _sessions_lock:
+        sess["last_rollback"] = {"report": report, "at": time.time()}
+
+
+async def rollback_cloud_turn(uid: str, turn_id: str, timeout: float = 60.0) -> dict[str, Any]:
+    """Minta worker mengembalikan perubahan file giliran Cloud turn_id.
+    Best-effort: worker mati / tidak ada sesi -> laporan kosong."""
+    try:
+        result = await _enqueue_and_wait(uid, "rollback", {"turn_id": turn_id}, timeout)
+    except Exception:
+        return {"reverted": [], "not_undone": []}
+    if isinstance(result, dict) and result.get("ok"):
+        inner = result.get("result") or {}
+        if isinstance(inner, dict) and isinstance(inner.get("rollback"), dict):
+            return inner["rollback"]
+    return {"reverted": [], "not_undone": []}
+
 
 def _persist_sessions_unlocked() -> None:
     """Tulis sesi aktif ke disk (panggil saat memegang _sessions_lock). Hanya field kecil; job tidak disimpan."""
@@ -305,22 +359,48 @@ async def cancel_chat(authorization: str | None = Header(default=None)):
 
     Berbeda dengan /stop yang mematikan sesi worker Kaggle: cancel hanya menghentikan
     satu jawaban ini. Worker tetap ready untuk chat berikutnya.
+
+    Sinyal cancel dikirim dua arah: (1) flag waktu per user, dibaca giliran
+    Cloud di backend; (2) control="cancel" + cancel_turn di sesi, diambil
+    worker lewat poll. Job yang sedang jalan TIDAK langsung dijawab "batal"
+    di sini — worker sendiri yang mengembalikan hasil batal beserta laporan
+    rollback-nya, supaya frontend tahu apa yang dikembalikan.
     """
     uid = authenticate_user(authorization)
+    request_cancel(uid)
     sess = await _get_session_for_uid(uid)
     if not sess:
-        raise HTTPException(409, "AI Local is not connected yet. Start it from the Local tab first.")
+        # Cloud tanpa worker tetap bisa dibatalkan lewat flag waktu di atas.
+        return {"ok": True, "cancelled": True, "no_session": True}
     async with _sessions_lock:
         pending = sess.get("pending_job") or {}
-        lang = _normalize_agent_language((pending.get("payload") or {}).get("language"))
-        cancelled_text = "Dibatalkan oleh user." if lang == "id" else "Cancelled by user."
-        if pending:
-            job_id = pending.get("job_id")
-            sess["pending_job"] = None
-            sess["job_results"][job_id] = {"ok": True, "result": {"content": cancelled_text, "cancelled": True}}
+        # Giliran yang dibatalkan: Cloud yang sedang jalan (kalau ada),
+        # kalau tidak job yang sedang antre/dikerjakan worker.
+        cancel_turn = _active_cloud_turns.get(uid) or pending.get("job_id")
+        if cancel_turn:
+            sess["cancel_turn"] = cancel_turn
         sess["control"] = "cancel"
         _persist_sessions_unlocked()
     return {"ok": True, "cancelled": True}
+
+
+@router.get("/last-rollback")
+async def last_rollback(authorization: str | None = Header(default=None)):
+    """Satu baris ringkasan untuk frontend setelah Berhenti/Trash: apa yang
+    dikembalikan worker dari giliran yang dibatalkan. Sekali baca (one-shot);
+    laporan lebih tua dari 60 detik dianggap basi dan dibuang."""
+    uid = authenticate_user(authorization)
+    sess = await _get_session_for_uid(uid)
+    if not sess:
+        return {"ok": True, "rollback": None}
+    async with _sessions_lock:
+        entry = sess.pop("last_rollback", None)
+    if not entry or not isinstance(entry, dict):
+        return {"ok": True, "rollback": None}
+    if time.time() - float(entry.get("at") or 0) > 60:
+        return {"ok": True, "rollback": None}
+    report = entry.get("report")
+    return {"ok": True, "rollback": report if isinstance(report, dict) else None}
 
 
 @router.post("/stop")
@@ -580,17 +660,22 @@ async def local_tools_available(uid: str) -> bool:
     return kaggle_local_runner.worker_snapshot(uid).get("status") == "ready"
 
 
-async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: float = 300.0) -> str | dict[str, Any]:
+async def run_kaggle_tool(uid: str, name: str, args: dict[str, Any], timeout: float = 300.0, turn_id: str | None = None) -> str | dict[str, Any]:
     """Jalankan SATU tool di worker Kaggle user dan kembalikan hasil teksnya.
     Error (worker mati / timeout) dilempar sebagai exception supaya pemanggil
     bisa memberikannya ke model sebagai hasil tool yang gagal, bukan mematikan turn.
     Satu pengecualian: inspect_image mengembalikan dict {"content": ..., "image": {...}}
     supaya gambarnya bisa diteruskan ke model sebagai pesan visual, bukan sebagai
     teks mentah — sebelumnya cloud hanya menerima repr dict-nya dan gambar tidak
-    pernah sampai ke model."""
-    result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args}, timeout)
+    pernah sampai ke model.
+    turn_id mengikat tool ini ke jurnal rollback giliran Cloud-nya; kalau
+    giliran itu dibatalkan user, worker mengembalikan hasil batal dan
+    CloudTurnCancelled dilempar supaya giliran berhenti + rollback."""
+    result = await _enqueue_and_wait(uid, "tool", {"name": name, "args": args, "turn_id": turn_id}, timeout)
     if isinstance(result, dict) and result.get("ok"):
         inner = result.get("result") or {}
+        if isinstance(inner, dict) and inner.get("cancelled"):
+            raise CloudTurnCancelled("tool job cancelled by user")
         if isinstance(inner, dict):
             if isinstance(inner.get("image"), dict):
                 return {"content": str(inner.get("content") or ""), "image": inner["image"]}
@@ -612,16 +697,25 @@ async def local_chat(payload: LocalChatPayload, authorization: str | None = Head
     if not result.get("ok"):
         raise HTTPException(502, result.get("error") or "AI Local failed to process the message.")
     inner = result.get("result") or {}
-    # Memories the worker collected via the remember tool: persist them now
-    # (the worker has no Firestore access). Best-effort — never fail the chat.
-    for mem in (inner.get("memories_saved") or []):
-        try:
-            agent_memory.save_memory(uid, str(mem), source="ai")
-        except Exception:
-            pass
+    # Giliran dibatalkan user: memory yang sempat dikumpulkan TIDAK disimpan,
+    # dan laporan rollback disimpan untuk ringkasan di layar.
+    if not inner.get("cancelled"):
+        # Memories the worker collected via the remember tool: persist them now
+        # (the worker has no Firestore access). Best-effort — never fail the chat.
+        for mem in (inner.get("memories_saved") or []):
+            try:
+                agent_memory.save_memory(uid, str(mem), source="ai")
+            except Exception:
+                pass
+    if isinstance(inner.get("rollback"), dict):
+        await store_rollback_report(uid, inner["rollback"])
     content = inner.get("content") or ""
     attachments = inner.get("attachments") if isinstance(inner.get("attachments"), list) else []
     payload_out = {"content": content, "model": "ai-local", "usage": {}, "sources": []}
+    if inner.get("cancelled"):
+        payload_out["cancelled"] = True
+    if isinstance(inner.get("rollback"), dict):
+        payload_out["rollback"] = inner["rollback"]
     if attachments:
         payload_out["attachments"] = attachments
     if isinstance(inner.get("search_images"), list) and inner["search_images"]:
@@ -668,17 +762,26 @@ async def local_chat_stream(payload: LocalChatPayload, authorization: str | None
                         inner = result.get("result") or {}
                         out: dict[str, Any] = {"content": inner.get("content") or "", "model": "ai-local",
                                                "usage": {}, "sources": []}
+                        if inner.get("cancelled"):
+                            out["cancelled"] = True
+                        if isinstance(inner.get("rollback"), dict):
+                            out["rollback"] = inner["rollback"]
                         if isinstance(inner.get("attachments"), list) and inner["attachments"]:
                             out["attachments"] = inner["attachments"]
                         if isinstance(inner.get("search_images"), list) and inner["search_images"]:
                             out["search_images"] = inner["search_images"]
-                        # Memories the worker collected via remember: persist
-                        # them now (best-effort, never fail the chat).
-                        for mem in (inner.get("memories_saved") or []):
-                            try:
-                                agent_memory.save_memory(uid, str(mem), source="ai")
-                            except Exception:
-                                pass
+                        # Giliran dibatalkan user: memory yang sempat dikumpulkan
+                        # TIDAK disimpan; laporan rollback disimpan untuk ringkasan.
+                        if not inner.get("cancelled"):
+                            # Memories the worker collected via remember: persist
+                            # them now (best-effort, never fail the chat).
+                            for mem in (inner.get("memories_saved") or []):
+                                try:
+                                    agent_memory.save_memory(uid, str(mem), source="ai")
+                                except Exception:
+                                    pass
+                        if isinstance(inner.get("rollback"), dict):
+                            await store_rollback_report(uid, inner["rollback"])
                         yield ("data: " + json.dumps({"type": "final", "result": out}, ensure_ascii=False) + "\n\n")
                     break
                 if kaggle_local_runner.worker_snapshot(uid).get("status") != "ready":
@@ -837,18 +940,24 @@ async def kaggle_poll(payload: WorkerPollPayload, session_id: str = Query(...),
     if payload.heartbeat_only:
         # Heartbeat berjalan di thread terpisah (juga saat boot/muat model), jadi hanya "stop"
         # dan "cancel" yang dikirim lewat sini. Cancel sekali pakai: langsung dihapus setelah disampaikan.
+        cancel_turn = None
         if control == "cancel":
             async with _sessions_lock:
                 sess["control"] = None
+                cancel_turn = sess.pop("cancel_turn", None)
                 _persist_sessions_unlocked()
         return {"ok": True, "job": None,
-                "control": "stop" if control == "stop" else ("cancel" if control == "cancel" else None)}
+                "control": "stop" if control == "stop" else ("cancel" if control == "cancel" else None),
+                "cancel_turn": cancel_turn}
+    cancel_turn = None
     async with _sessions_lock:
         job = sess.get("pending_job")
         if control in ("restart", "cancel"):
             sess["control"] = None  # sekali pakai
+            if control == "cancel":
+                cancel_turn = sess.pop("cancel_turn", None)
             _persist_sessions_unlocked()
-    return {"ok": True, "job": job, "control": control}
+    return {"ok": True, "job": job, "control": control, "cancel_turn": cancel_turn}
 
 
 @router.post("/kaggle-result")
