@@ -12,6 +12,7 @@ import time
 import base64
 import mimetypes
 import shutil
+import signal
 import subprocess
 import threading
 import importlib
@@ -632,8 +633,94 @@ def _is_dangerous_rm(command, base_dir):
     return False
 
 
-def _run_quiet(cmd, timeout=180):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+def _run_cancellable(cmd, timeout=180, cancelled=None, shell=False, cwd=None, env=None,
+                     stdin=None, capture_output=False):
+    """Jalankan subprocess yang bisa diinterupsi user (Berhenti/Trash) dengan
+    Ctrl+C (SIGINT) ke grup prosesnya — proses sempat beres-beres dulu; kalau
+    3 detik tidak mati -> SIGTERM, 3 detik lagi -> SIGKILL. Raises
+    _TurnCancelled kalau dibatalkan, subprocess.TimeoutExpired kalau kehabisan
+    waktu (sama seperti subprocess.run, tapi grup prosesnya ikut dimatikan
+    supaya tidak ada anak proses yang tertinggal)."""
+    if capture_output:
+        stdout_arg, stderr_arg = subprocess.PIPE, subprocess.STDOUT
+    else:
+        stdout_arg, stderr_arg = subprocess.DEVNULL, subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, stdout=stdout_arg, stderr=stderr_arg, text=True,
+                            shell=shell, cwd=cwd, env=env, stdin=stdin,
+                            start_new_session=True)
+    chunks = []
+
+    def _drain(stream):
+        try:
+            data = stream.read()
+            if data:
+                chunks.append(data)
+        except Exception:
+            pass
+
+    threads = []
+    if capture_output:
+        t = threading.Thread(target=_drain, args=(proc.stdout,), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.monotonic() + timeout
+    sigint_at = None
+    term_at = None
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            if sigint_at is not None:
+                # Mati karena Ctrl+C yang kita kirim: ini pembatalan, bukan
+                # hasil normal — lempar supaya giliran langsung rollback,
+                # jangan kembalikan "EXIT CODE: -2" sebagai hasil tool.
+                for t in threads:
+                    t.join(timeout=1)
+                raise _TurnCancelled()
+            break
+        now = time.monotonic()
+        if cancelled and cancelled():
+            if sigint_at is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                sigint_at = now
+            elif now - sigint_at > 3 and term_at is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                term_at = now
+            elif term_at is not None and now - term_at > 3:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait()
+                for t in threads:
+                    t.join(timeout=1)
+                raise _TurnCancelled()
+        elif now > deadline:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            for t in threads:
+                t.join(timeout=1)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        time.sleep(0.05)
+    for t in threads:
+        t.join(timeout=2)
+    return subprocess.CompletedProcess(cmd, proc.returncode,
+                                       stdout="".join(chunks) if capture_output else None,
+                                       stderr=None)
+
+
+def _run_quiet(cmd, timeout=180, cancelled=None):
+    if cancelled is None:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    return _run_cancellable(cmd, timeout=timeout, cancelled=cancelled, capture_output=True)
 
 
 _MEDIA_PACKAGES_READY = False
@@ -644,22 +731,29 @@ def _prepare_work_dirs():
     os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
 
 
-def _ensure_media_packages():
+def _ensure_media_packages(cancelled=None):
     """Pasang paket media berat (wheel offline + ffmpeg/tesseract) sekali saja,
     saat pertama kali benar-benar dibutuhkan (baca dokumen/media) — bukan di boot.
-    Sekali coba saja; gagal pun jangan ulangi di tiap baca."""
+    Sekali coba saja; gagal pun jangan ulangi di tiap baca. Dikecualikan:
+    kalau install ke-potong Ctrl+C, flag siap di-reset supaya baca berikutnya
+    nyoba install lagi dari awal, bukan ke-stuck setengah install."""
     global _MEDIA_PACKAGES_READY
     if _MEDIA_PACKAGES_READY:
         return
     _MEDIA_PACKAGES_READY = True
     try:
-        _prepare_media_packages()
+        _prepare_media_packages(cancelled=cancelled)
+    except _TurnCancelled:
+        _MEDIA_PACKAGES_READY = False
+        raise
     except Exception as exc:
         print(f"[setup] media packages gagal (diabaikan): {_clean_err(exc)[:200]}", flush=True)
 
 
-def _prepare_media_packages():
+def _prepare_media_packages(cancelled=None):
     """Pasang wheel offline seperti worker downloader, lalu lengkapi biner yang belum ada."""
+    if cancelled and cancelled():
+        raise _TurnCancelled()
     os.makedirs(BASE_DIR, exist_ok=True)
     os.makedirs(os.path.join(BASE_DIR, "uploads"), exist_ok=True)
     wheels = next(iter(glob.glob("/kaggle/input/**/wheels", recursive=True)), None)
@@ -675,16 +769,18 @@ def _prepare_media_packages():
             result = _run_quiet([
                 sys.executable, "-m", "pip", "install", "-q", "--no-index", "--no-deps",
                 "--target", _DOC_TARGET, *files,
-            ], timeout=300)
+            ], timeout=300, cancelled=cancelled)
             if result.returncode != 0:
                 print(f"[setup] pip offline gagal: {(result.stdout or '')[-400:]}", flush=True)
             else:
                 installed = [os.path.basename(path) for path in files]
+        if cancelled and cancelled():
+            raise _TurnCancelled()
         deb_dir = os.path.join(os.path.dirname(wheels), "deb")
         if not shutil.which("ffmpeg"):
             ffdebs = sorted(glob.glob(os.path.join(deb_dir, "ffmpeg*.deb")))
             if ffdebs:
-                _run_quiet(["dpkg", "-i", *ffdebs], timeout=180)
+                _run_quiet(["dpkg", "-i", *ffdebs], timeout=180, cancelled=cancelled)
     if _DOC_TARGET not in sys.path:
         sys.path.insert(0, _DOC_TARGET)
     os.environ["PYTHONPATH"] = _DOC_TARGET + os.pathsep + os.environ.get("PYTHONPATH", "")
@@ -696,8 +792,8 @@ def _prepare_media_packages():
         missing_apt.extend(["tesseract-ocr", "tesseract-ocr-eng", "tesseract-ocr-ind"])
     if missing_apt:
         print(f"[setup] tidak ada di dataset, memasang dari image Kaggle: {', '.join(missing_apt)}", flush=True)
-        _run_quiet(["apt-get", "update", "-qq"], timeout=180)
-        _run_quiet(["apt-get", "install", "-y", "-qq", *missing_apt], timeout=300)
+        _run_quiet(["apt-get", "update", "-qq"], timeout=180, cancelled=cancelled)
+        _run_quiet(["apt-get", "install", "-y", "-qq", *missing_apt], timeout=300, cancelled=cancelled)
     ready = []
     for module_name, label in (
         ("fitz", "pymupdf"), ("docx", "python-docx"), ("pptx", "python-pptx"),
@@ -856,7 +952,7 @@ def _transcribe_audio(path):
     return text or "(tidak ada ucapan yang terdengar)"
 
 
-def _read_media(path, limit):
+def _read_media(path, limit, cancelled=None):
     ext = os.path.splitext(path)[1].lower()
     audio_path = path
     notes = []
@@ -865,18 +961,20 @@ def _read_media(path, limit):
             return "Error: ffmpeg tidak tersedia untuk memisahkan audio video."
         audio_path = "/tmp/media_audio.wav"
         frame_path = "/tmp/media_frame.jpg"
-        subprocess.run(
+        _run_cancellable(
             ["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", audio_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=False,
+            timeout=180, cancelled=cancelled,
         )
-        subprocess.run(
+        _run_cancellable(
             ["ffmpeg", "-y", "-ss", "1", "-i", path, "-frames:v", "1", frame_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
+            timeout=60, cancelled=cancelled,
         )
         if os.path.isfile(frame_path):
             scanned = _ocr_image(frame_path)
             if scanned:
                 notes.append("Teks pada satu frame:\n" + scanned)
+    if cancelled and cancelled():
+        raise _TurnCancelled()
     transcript = _transcribe_audio(audio_path)
     body = "Transkrip:\n" + transcript
     if notes:
@@ -884,7 +982,7 @@ def _read_media(path, limit):
     return _clip_text(body, limit)
 
 
-def read_document(path, max_chars=_DOC_TEXT_LIMIT):
+def read_document(path, max_chars=_DOC_TEXT_LIMIT, cancelled=None):
     if not path or not os.path.isfile(path):
         return f"Error: File '{path}' tidak ditemukan."
     if os.path.getsize(path) > 200 * 1024 * 1024:
@@ -892,7 +990,7 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT):
     limit = max(1000, min(int(max_chars or _DOC_TEXT_LIMIT), 20000))
     ext = os.path.splitext(path)[1].lower()
     if ext in _MEDIA_EXTS:
-        _ensure_media_packages()
+        _ensure_media_packages(cancelled=cancelled)
     try:
         if ext == ".pdf":
             return _read_pdf(path, limit)
@@ -929,7 +1027,7 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT):
                 return "OCR tidak menghasilkan teks. Untuk isi visual, pakai inspect_image."
             return _clip_text(scanned, limit)
         if ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".webm", ".mov", ".avi"}:
-            return _read_media(path, limit)
+            return _read_media(path, limit, cancelled=cancelled)
         if ext == ".ipynb":
             notebook = json.load(open(path, "r", encoding="utf-8"))
             cells = notebook.get("cells") if isinstance(notebook, dict) else None
@@ -1077,7 +1175,11 @@ def _rollback_journal(journal, base_dir):
     return {"reverted": reverted, "not_undone": not_undone}
 
 
-def exec_tool(name, args, base_dir=BASE_DIR):
+def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
+    """Eksekusi satu tool. `cancelled` (callable) diteruskan ke tool yang
+    blokir (run_bash, read_document): begitu user menekan Berhenti/Trash,
+    tool itu diinterupsi Ctrl+C (SIGINT) dan melempar _TurnCancelled — BUKAN
+    ditelan jadi string error, supaya giliran langsung rollback."""
     try:
         if name == "list_dir":
             target = args.get("path", base_dir)
@@ -1227,9 +1329,10 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             bash_env = os.environ.copy()
             bash_env["CI"] = "true"
             bash_env["DEBIAN_FRONTEND"] = "noninteractive"
-            res = subprocess.run(args["command"], shell=True, cwd=cwd, env=bash_env,
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
-            output = (res.stdout + "\n" + res.stderr).strip()
+            res = _run_cancellable(args["command"], shell=True, cwd=cwd, env=bash_env,
+                                   stdin=subprocess.DEVNULL, capture_output=True,
+                                   timeout=180, cancelled=cancelled)
+            output = (res.stdout or "").strip()
             if len(output) > 8000:
                 output = output[:3500] + "\n\n... [DIPOTONG] ...\n\n" + output[-3500:]
             return f"EXIT CODE: {res.returncode}\nOUTPUT:\n{output or '(kosong)'}"
@@ -1257,7 +1360,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             return {"__image_payload__": fp, "question": args.get("question", "Analisis gambar ini.")}
 
         if name == "read_document":
-            return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT)
+            return read_document(args.get("path") or "", args.get("max_chars") or _DOC_TEXT_LIMIT,
+                                 cancelled=cancelled)
 
         if name == "remember":
             # Tidak menulis ke Firestore dari worker (kredensial tidak ada di
@@ -1269,6 +1373,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             return {"__memory__": text[:500]}
 
         return f"Error: Tool '{name}' tidak dikenal."
+    except _TurnCancelled:
+        raise
     except Exception as ex:
         return f"Error eksekusi {name}: {ex}"
 
@@ -1907,7 +2013,12 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 # write_file) adalah pengecekan ulang yang sah dan harus
                 # mengembalikan hasil segar — terbukti 2026-11-26: turn "cek apa
                 # ada 4 file" malah dapat teks peringatan, bukan isi folder.
-                result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
+                try:
+                    result = exec_tool(fn_name, parsed_args, base_dir=base_dir, cancelled=cancelled)
+                except _TurnCancelled:
+                    # Ctrl+C nangkep di tengah tool (mis. sleep/install): batal
+                    # + rollback sekarang, jangan lanjut ke tool berikut.
+                    return _finish_cancel()
                 seen_calls[sig] = str(result)
                 # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
                 # di chat (dikirim balik lewat result_body, bukan ditempel di teks).
@@ -2379,7 +2490,16 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                         _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
                               "result": {"content": "Dibatalkan oleh user.", "cancelled": True}})
                         continue
-                    result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
+                    try:
+                        result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir,
+                                                cancelled=lambda: bool(turn_id) and turn_id in _cancelled_turns)
+                    except _TurnCancelled:
+                        # Ctrl+C nangkep di tengah tool: kembalikan hasil batal
+                        # supaya backend memicu rollback giliran ini.
+                        _active_journal_id = None
+                        _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": True,
+                              "result": {"content": "Dibatalkan oleh user.", "cancelled": True}})
+                        continue
                     if isinstance(result_text, dict) and "__memory__" in result_text:
                         # remember via tool job langsung: cloud tidak pernah
                         # mengirim ini (ditangani di backend), tapi jangan
