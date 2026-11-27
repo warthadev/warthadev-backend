@@ -13,6 +13,8 @@ import base64
 import mimetypes
 import shutil
 import subprocess
+import signal
+import tempfile
 import threading
 import importlib
 import importlib.util
@@ -21,7 +23,9 @@ import urllib.request
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-WORKER_VERSION = "2026-11-25-ai-local-cloud-bridge"
+WORKER_VERSION = "2026-11-27-ai-local-cancel-process-group"
+_ACTIVE_COMMAND_GROUPS: set[int] = set()
+_ACTIVE_TURN_JOURNAL: dict | None = None
 IS_KAGGLE = os.path.isdir("/kaggle") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 BASE_DIR = "/kaggle/working"
 DEFAULT_PORT = 8080
@@ -951,7 +955,61 @@ def read_document(path, max_chars=_DOC_TEXT_LIMIT):
         return f"Error membaca {path}: {exc}"
 
 
-def exec_tool(name, args, base_dir=BASE_DIR):
+def _journal_snapshot(path):
+    """Keep the first pre-turn copy of a managed workspace path for rollback."""
+    journal = _ACTIVE_TURN_JOURNAL
+    if journal is None:
+        return
+    target = os.path.abspath(path)
+    if target in journal["entries"]:
+        return
+    exists = os.path.lexists(target)
+    backup = None
+    if exists:
+        backup = os.path.join(journal["dir"], str(len(journal["entries"])))
+        if os.path.islink(target):
+            os.symlink(os.readlink(target), backup)
+        elif os.path.isdir(target):
+            shutil.copytree(target, backup, symlinks=True)
+        else:
+            shutil.copy2(target, backup)
+    journal["entries"][target] = (exists, backup)
+
+
+def _rollback_turn_changes():
+    global _ACTIVE_TURN_JOURNAL
+    journal = _ACTIVE_TURN_JOURNAL
+    if journal is None:
+        return
+    for target, (existed, backup) in reversed(list(journal["entries"].items())):
+        try:
+            if os.path.islink(target) or os.path.isfile(target):
+                os.remove(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+            if existed and backup:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if os.path.islink(backup):
+                    os.symlink(os.readlink(backup), target)
+                elif os.path.isdir(backup):
+                    shutil.copytree(backup, target, symlinks=True)
+                else:
+                    shutil.copy2(backup, target)
+        except Exception as exc:
+            print(f"[ai-local] rollback warning for {target}: {exc}", flush=True)
+    shutil.rmtree(journal["dir"], ignore_errors=True)
+    _ACTIVE_TURN_JOURNAL = None
+
+
+def _discard_turn_changes():
+    global _ACTIVE_TURN_JOURNAL
+    journal = _ACTIVE_TURN_JOURNAL
+    if journal is not None:
+        shutil.rmtree(journal["dir"], ignore_errors=True)
+    _ACTIVE_TURN_JOURNAL = None
+
+
+def exec_tool(name, args, base_dir=BASE_DIR, cancelled=None):
     try:
         if name == "list_dir":
             target = args.get("path", base_dir)
@@ -1003,6 +1061,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             s, e, new_code = int(args["start_line"]), int(args["end_line"]), args["new_code"]
             if new_code and not new_code.endswith("\n"):
                 new_code += "\n"
+            _journal_snapshot(fp)
+            _journal_snapshot(fp + ".bak")
             shutil.copy2(fp, fp + ".bak")
             with open(fp, "r", encoding="utf-8") as f:
                 lines = f.readlines()
@@ -1015,6 +1075,7 @@ def exec_tool(name, args, base_dir=BASE_DIR):
 
         if name == "write_file":
             fp = args["path"]
+            _journal_snapshot(fp)
             os.makedirs(os.path.dirname(os.path.abspath(fp)), exist_ok=True)
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(args["content"])
@@ -1024,6 +1085,7 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             target, root = _resolve_in_workspace(args.get("path") or "", base_dir)
             if target == root:
                 return "Error: Workspace itu sendiri tidak boleh dihapus."
+            _journal_snapshot(target)
             if not target.exists() and not target.is_symlink():
                 return f"Error: '{args.get('path')}' tidak ditemukan."
             if target.is_dir() and not target.is_symlink():
@@ -1038,6 +1100,8 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             dst, _ = _resolve_in_workspace(args.get("destination") or "", base_dir)
             if src == root:
                 return "Error: Workspace itu sendiri tidak boleh dipindah."
+            _journal_snapshot(src)
+            _journal_snapshot(dst)
             if not src.exists() and not src.is_symlink():
                 return f"Error: '{args.get('path')}' tidak ditemukan."
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1054,12 +1118,45 @@ def exec_tool(name, args, base_dir=BASE_DIR):
             bash_env = os.environ.copy()
             bash_env["CI"] = "true"
             bash_env["DEBIAN_FRONTEND"] = "noninteractive"
-            res = subprocess.run(args["command"], shell=True, cwd=cwd, env=bash_env,
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
-            output = (res.stdout + "\n" + res.stderr).strip()
+            # Start a separate process group so cancellation behaves like Ctrl+C
+            # for the command and all child processes, not only the shell wrapper.
+            proc = subprocess.Popen(
+                args["command"], shell=True, cwd=cwd, env=bash_env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
+            )
+            _ACTIVE_COMMAND_GROUPS.add(proc.pid)
+            deadline = time.monotonic() + 180
+            try:
+                while proc.poll() is None:
+                    if cancelled and cancelled():
+                        try:
+                            os.killpg(proc.pid, signal.SIGINT)
+                            proc.wait(timeout=2)
+                        except Exception:
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                                proc.wait(timeout=2)
+                            except Exception:
+                                try: os.killpg(proc.pid, signal.SIGKILL)
+                                except Exception: pass
+                        return "CANCELLED: command process group interrupted by user."
+                    if time.monotonic() >= deadline:
+                        try: os.killpg(proc.pid, signal.SIGTERM)
+                        except Exception: pass
+                        try: proc.wait(timeout=2)
+                        except Exception:
+                            try: os.killpg(proc.pid, signal.SIGKILL)
+                            except Exception: pass
+                        return "ERROR: command timed out after 180 seconds."
+                    time.sleep(0.15)
+                stdout, stderr = proc.communicate()
+            finally:
+                _ACTIVE_COMMAND_GROUPS.discard(proc.pid)
+            output = (stdout + "\n" + stderr).strip()
             if len(output) > 8000:
                 output = output[:3500] + "\n\n... [DIPOTONG] ...\n\n" + output[-3500:]
-            return f"EXIT CODE: {res.returncode}\nOUTPUT:\n{output or '(kosong)'}"
+            return f"EXIT CODE: {proc.returncode}\nOUTPUT:\n{output or '(kosong)'}"
 
         if name == "web_search":
             q = args["query"]
@@ -1114,6 +1211,7 @@ def build_system_prompt(base_dir):
         "- Jangan mengarang. Jika butuh token/API key/secret, minta user menuliskannya (atau pastikan sudah ada di env/secret) "
         "sebelum menjalankan langkah yang bergantung padanya.\n"
         "- Kerjakan langkah demi langkah: investigasi → rencana singkat → eksekusi → verifikasi hasil.\n"
+        "- Jika membuat atau mengubah rencana multi-langkah yang ingin dilanjutkan di chat lain, simpan ringkasan berjudul PLAN: melalui tool remember; catat status, progres terverifikasi, dan langkah berikutnya. Perbarui saat milestone penting, jangan setiap langkah kecil. Jangan pernah simpan credential/secret di rencana.\n"
         "- Laporkan hasil yang konkret (path file, perintah yang dijalankan, error asli) tanpa basa-basi berlebih.\n"
         "- Jika diminta struktur lengkap / tree / daftar file, keluarkan SELURUH hasil tanpa '...' atau potongan di tengah.\n"
         "Paket dokumen (pymupdf, python-docx, python-pptx, faster-whisper) dipasang offline dari dataset "
@@ -1517,6 +1615,9 @@ _SELF_CHECK_MESSAGE = (
 
 
 def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, on_step=None, language="id", on_opening=None, cancelled=None, context=None, on_token=None, search_images_out=None, memories_out=None):
+    global _ACTIVE_TURN_JOURNAL
+    _discard_turn_changes()
+    _ACTIVE_TURN_JOURNAL = {"dir": tempfile.mkdtemp(prefix="wartha-agent-rollback-"), "entries": {}}
     strings = _agent_strings(language)
     def _act(msg):
         if on_activity:
@@ -1598,6 +1699,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": strings["cancelled"]})
             _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
             _report_tokens()
+            _rollback_turn_changes()
             return strings["cancelled"]
         try:
             message, usage = _stream_call(with_tools=True)
@@ -1608,6 +1710,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": strings["cancelled"]})
             _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
             _report_tokens()
+            _rollback_turn_changes()
             return strings["cancelled"]
         except Exception as exc:
             _step(think_id, status="error", title=strings["model_failed"], output=_short(_clean_err(exc)))
@@ -1712,7 +1815,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
                 # write_file) adalah pengecekan ulang yang sah dan harus
                 # mengembalikan hasil segar — terbukti 2026-11-26: turn "cek apa
                 # ada 4 file" malah dapat teks peringatan, bukan isi folder.
-                result = exec_tool(fn_name, parsed_args, base_dir=base_dir)
+                result = exec_tool(fn_name, parsed_args, base_dir=base_dir, cancelled=cancelled)
                 seen_calls[sig] = str(result)
                 # Pencarian gambar: kumpulkan thumbnail-nya untuk strip gambar
                 # di chat (dikirim balik lewat result_body, bukan ditempel di teks).
@@ -1774,6 +1877,7 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
             history.append({"role": "assistant", "content": strings["cancelled"]})
             _step(_new_id(), kind="info", title=strings["cancelled"], status="done")
             _report_tokens()
+            _rollback_turn_changes()
             return strings["cancelled"]
         if stuck_reason:
             break
@@ -1797,7 +1901,9 @@ def run_agent_turn(history, api_url, base_dir, user_content, on_activity=None, o
     history.append({"role": "assistant", "content": final_visible})
     _step(final_id, status="done", title=strings["final_done"])
     _report_tokens()
-    return _append_missing_markers(final_visible, out_before, written_files)
+    final_result = _append_missing_markers(final_visible, out_before, written_files)
+    _discard_turn_changes()
+    return final_result
 
 
 def run_workspace_job(op, payload, base_dir):
@@ -1834,6 +1940,7 @@ def run_workspace_job(op, payload, base_dir):
 # Headless backend polling loop (this replaces codekaggle.py's input() loop)
 # ---------------------------------------------------------------------------
 def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
+    global _ACTIVE_TURN_JOURNAL
     if not IS_KAGGLE:
         raise RuntimeError("Worker ini hanya dapat dijalankan dari Kaggle.")
     print(f"[ai-local] worker version: {WORKER_VERSION}", flush=True)
@@ -1877,6 +1984,15 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             _post("/agent/local/kaggle-poll", {"closing": True, "heartbeat_only": False, "reason": reason[:40]}, timeout=8)
         except Exception:
             pass
+        # Stop is a hard worker shutdown: interrupt every shell process group
+        # spawned by run_bash, then terminate the model server as well.
+        for pgid in list(_ACTIVE_COMMAND_GROUPS):
+            try: os.killpg(pgid, signal.SIGINT)
+            except Exception: pass
+            try: os.killpg(pgid, signal.SIGTERM)
+            except Exception: pass
+            try: os.killpg(pgid, signal.SIGKILL)
+            except Exception: pass
         try:
             proc_now = state.get("proc")
             if proc_now and proc_now.poll() is None:
@@ -1895,7 +2011,7 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
             if gone["count"] >= 6:
                 # Backend tidak mengenal sesi ini lagi (worker yatim / sesi diganti): jangan buang kuota GPU.
                 _shutdown_now("sesi backend hilang")
-            if _stop.wait(8):
+            if _stop.wait(2):
                 break
 
     # Stop saat kernel masih antre: kalau backend sudah tidak mengenal sesi ini
@@ -2012,6 +2128,9 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                 _status("ready", model_id=model_id)
                 continue
             if not job:
+                # A cancel received while no job was active is stale; do not
+                # let it cancel the next request from the user.
+                _cancel_event.clear()
                 time.sleep(2.5)
                 continue
             job_id = job.get("job_id")
@@ -2076,7 +2195,6 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                                 synced.append({"role": role, "content": shared_content[:8000]})
                         history = synced
                     _post("/agent/local/kaggle-activity", {"activity": job_strings["understanding"], "reset": True}, timeout=5)
-                    _cancel_event.clear()
                     search_images: list[str] = []
                     memories: list[str] = []
                     answer = run_agent_turn(history, api_url, base_dir, content,
@@ -2111,7 +2229,18 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     # Satu tool call dari model cloud: eksekusi langsung, tanpa
                     # giliran agen. Tidak masuk ke history percakapan worker —
                     # cloud yang memegang pembahasannya dan menerima hasilnya.
-                    result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir)
+                    _discard_turn_changes()
+                    _ACTIVE_TURN_JOURNAL = {"dir": tempfile.mkdtemp(prefix="wartha-agent-tool-rollback-"), "entries": {}}
+                    if _cancel_event.is_set():
+                        _rollback_turn_changes()
+                        result_text = "CANCELLED: tool was interrupted before execution."
+                    else:
+                        result_text = exec_tool(payload.get("name") or "", payload.get("args") or {}, base_dir, cancelled=_cancel_event.is_set)
+                        if _cancel_event.is_set():
+                            _rollback_turn_changes()
+                            result_text = "CANCELLED: tool interrupted; managed workspace file changes were rolled back."
+                        else:
+                            _discard_turn_changes()
                     if isinstance(result_text, dict) and "__memory__" in result_text:
                         # remember via tool job langsung: cloud tidak pernah
                         # mengirim ini (ditangani di backend), tapi jangan
@@ -2137,6 +2266,10 @@ def run_kaggle_worker(session_id=None, backend_url=None, worker_token=None):
                     _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": f"unknown job type {job_type}"})
             except Exception as exc:
                 _post("/agent/local/kaggle-result", {"job_id": job_id, "ok": False, "error": _clean_err(exc)[:500]})
+            finally:
+                # Cancellation is scoped to one job. Clear it only after that
+                # job has finished so a late signal cannot be lost at startup.
+                _cancel_event.clear()
 
         _post("/agent/local/kaggle-poll", {"closing": True, "heartbeat_only": False}, timeout=10)
     except Exception as exc:
