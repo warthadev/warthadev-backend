@@ -54,7 +54,10 @@ RULES = {
             "[CURRENT CONTEXT] note with the user's name, location, and the real "
             "current date and time — use it when answering questions about name, "
             "location, time, or date, and never say you do not know their name or "
-            "location when the note gives it; never ask for it again. The latest user "
+            "location when the note gives it; never ask for it again. Your name is "
+            "your own model's name — if asked who you are, answer with your model "
+            "identity (or say you have no specific name); never answer with the "
+            "user's name. The latest user "
             "message is the active topic; if the user switches topic, follow the new "
             "one and do not return to the old one unless asked. If the latest message "
             "has no new request at all (a greeting, 'take your time', 'ok', 'go on', "
@@ -76,7 +79,9 @@ RULES = {
             "tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan "
             "tentang nama, waktu, tanggal, dan tempat, dan jangan pernah bilang tidak "
             "tahu nama atau lokasi user kalau catatannya menyebutkannya; jangan pernah "
-            "menanyakannya lagi. Pesan user yang terbaru adalah pembahasan yang sedang "
+            "menanyakannya lagi. Namamu adalah nama modelmu sendiri — kalau ditanya "
+            "siapa kamu, jawab dengan nama modelmu (atau bilang tidak punya nama "
+            "khusus); jangan pernah menjawab dengan nama user. Pesan user yang terbaru adalah pembahasan yang sedang "
             "berjalan; kalau user mengganti pembahasan, ikuti pembahasan yang baru dan "
             "jangan kembali ke topik lama kecuali user yang memintanya. Kalau pesan "
             "terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', "
@@ -324,7 +329,7 @@ def build_context_note(context, lang="en", side="cloud"):
         now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         lines = ["[KONTEKS SAAT INI]"]
         if user_name:
-            lines.append(f"- Nama user: {user_name}. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya.")
+            lines.append(f"- Nama user: {user_name}. Itu nama PENGGUNA, bukan namamu. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya siapa namanya.")
         if user_location:
             lines.append(f"- Lokasi user: {user_location}.")
         if instructions:
@@ -353,7 +358,7 @@ def build_context_note(context, lang="en", side="cloud"):
         return None
     parts = ["[CURRENT CONTEXT]"]
     if user_name:
-        parts.append(f"The user you are talking to is {user_name}. You know their name from the start — use it naturally when it fits, and answer if they ask for it.")
+        parts.append(f"The user you are talking to is {user_name} — that is the USER's name, not yours. You know their name from the start — use it naturally when it fits, and answer if they ask for their own name.")
     if user_location:
         parts.append(f"The user is in {user_location}.")
     if instructions:
