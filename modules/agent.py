@@ -420,17 +420,23 @@ def _chat_message_content(prompt: str, images: list[dict[str, str]]) -> str | li
 def _build_context_note(context: dict[str, Any] | None) -> str | None:
     """[CURRENT CONTEXT] note — built by the shared builder in agent_shared,
     the same one the Kaggle worker uses for its [KONTEKS SAAT INI] note, so
-    both agents get the user's name, location, and real time/date from the
-    same definition."""
+    both agents get the real time/date and their identity from the same
+    definition."""
     return agent_shared.build_context_note(context, lang="en", side="cloud")
 
 
 def _with_memory_context(payload: AgentChatPayload, user_id: str) -> None:
     """Merge the user's saved instructions + memories into the chat context
     (one Firestore read per chat; never fails the chat). The frontend never
-    sends the ai_instructions/ai_memory keys, so the merge is additive."""
+    sends the ai_instructions/ai_memory keys, so the merge is additive. The
+    agent's own identity comes from the model actually selected for this chat
+    (agent_model) — never from a name hard-coded anywhere."""
     base = payload.context if isinstance(payload.context, dict) else {}
-    payload.context = {**base, **agent_memory.load_memory_context(user_id)}
+    payload.context = {
+        **base,
+        **agent_memory.load_memory_context(user_id),
+        "agent_model": (payload.model or "").strip(),
+    }
 
 
 def _chat_messages(payload: AgentChatPayload, images: list[dict[str, str]]) -> list[dict[str, Any]]:

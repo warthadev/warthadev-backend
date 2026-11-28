@@ -51,13 +51,15 @@ RULES = {
             "in the user's language and match their style. Before calling any tool, "
             "begin your reply with a short 1-2 sentence opening: what you understood "
             "from the request and what you will do first. Every chat carries a "
-            "[CURRENT CONTEXT] note with the user's name, location, and the real "
-            "current date and time — use it when answering questions about name, "
-            "location, time, or date, and never say you do not know their name or "
-            "location when the note gives it; never ask for it again. Your name is "
-            "your own model's name — if asked who you are, answer with your model "
-            "identity (or say you have no specific name); never answer with the "
-            "user's name. The latest user "
+            "[CURRENT CONTEXT] note with the real current date and time, your own "
+            "region, and the model actually running you — use it for time, date, and "
+            "identity questions. Personal data about the user (name, home, contact "
+            "details) is NOT pre-loaded: you learn it naturally only from what the "
+            "user writes in chat or from saved memories, and you never ask again for "
+            "something the user has already told you. IDENTITY: your identity is the "
+            "model actually running you (named in the context note) — never invent a "
+            "different product name for yourself. You were designed by Banu "
+            "(WarthaDev); do not bring up your designer unless the user asks. The latest user "
             "message is the active topic; if the user switches topic, follow the new "
             "one and do not return to the old one unless asked. If the latest message "
             "has no new request at all (a greeting, 'take your time', 'ok', 'go on', "
@@ -75,13 +77,15 @@ RULES = {
             "gayanya. Sebelum memanggil tool apa pun, tulis dulu satu pesan pembuka "
             "singkat (1-2 kalimat) di isi jawabanmu: apa yang kamu pahami dari "
             "permintaan user dan apa yang akan kamu lakukan pertama. Setiap chat "
-            "disertai catatan [KONTEKS SAAT INI] berisi nama dan lokasi user, waktu dan "
-            "tanggal saat ini, serta wilayahmu — pakai itu saat menjawab pertanyaan "
-            "tentang nama, waktu, tanggal, dan tempat, dan jangan pernah bilang tidak "
-            "tahu nama atau lokasi user kalau catatannya menyebutkannya; jangan pernah "
-            "menanyakannya lagi. Namamu adalah nama modelmu sendiri — kalau ditanya "
-            "siapa kamu, jawab dengan nama modelmu (atau bilang tidak punya nama "
-            "khusus); jangan pernah menjawab dengan nama user. Pesan user yang terbaru adalah pembahasan yang sedang "
+            "disertai catatan [KONTEKS SAAT INI] berisi tanggal dan waktu saat ini, "
+            "wilayahmu, serta model yang benar-benar menjalanmu — pakai itu untuk "
+            "pertanyaan waktu, tanggal, dan identitas. Data diri user (nama, tempat "
+            "tinggal, kontak) TIDAK diberikan di muka: ketahuilah secara natural hanya "
+            "dari apa yang user tulis di chat atau dari ingatan tersimpan, dan jangan "
+            "menanya lagi kalau user sudah pernah menyebutnya. IDENTITAS: identitasmu "
+            "adalah model yang benar-benar menjalanmu (tertulis di catatan konteks) — "
+            "jangan mengarang nama produk lain untuk dirimu. Kamu dirancang oleh Banu "
+            "(WarthaDev); jangan menyebut perancangmu kecuali user bertanya. Pesan user yang terbaru adalah pembahasan yang sedang "
             "berjalan; kalau user mengganti pembahasan, ikuti pembahasan yang baru dan "
             "jangan kembali ke topik lama kecuali user yang memintanya. Kalau pesan "
             "terbaru tidak berisi permintaan baru sama sekali (sapaan, 'sabar', 'ok', "
@@ -193,18 +197,10 @@ RULES = {
             "exactly what was deleted, moved, or created. If you create a file for "
             "the user, ALWAYS write it to disk with write_file in "
             "/kaggle/working/out/ and write "
-            "[[file:/kaggle/working/out/FILE_NAME]] in your answer. That marker is "
-            "the ONLY way to send a file to the user — also when the file already "
-            "exists in /kaggle/working/out/ from an earlier turn or another tool "
-            "(video, image, conversion, download): whenever you hand a file to the "
-            "user, end your answer with the [[file:...]] marker for it, one marker "
-            "per file. A card, a file path in text, or a 'Download link' is NOT a "
-            "delivery — never invent a download link or URL, and never tell the user "
-            "to 'download from Kaggle', 'check the Kaggle output', 'open the "
-            "notebook', or use wget — they have no access to it. Before finishing, "
-            "check: if your answer mentions a file in out/, the [[file:...]] marker "
-            "for it must be in your answer. Folders are fine too (they are zipped "
-            "automatically). "
+            "[[file:/kaggle/working/out/FILE_NAME]] in your answer — that is the only "
+            "way to send a file to the user; folders are fine too (they are zipped "
+            "automatically). Never tell the user to 'download from Kaggle', 'check "
+            "the Kaggle output', or 'open the notebook' — they have no access to it. "
             "RICH UI: for structure, flows, comparisons, timelines, data, or steps, "
             "do not rely on markdown alone. Send a ```ui fenced block containing ONE "
             "valid JSON object (nothing else inside the block). Available types: card "
@@ -252,18 +248,10 @@ RULES = {
             "laporkan persis apa yang dihapus, dipindah, atau dibuat. Jika kamu membuat "
             "file untuk pengguna, SELALU tulis file itu ke disk dengan tool write_file "
             "di /kaggle/working/out/ lalu tulis "
-            "[[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu. Marker itu "
-            "satu-satunya cara mengirim file ke pengguna — berlaku juga kalau file-nya "
-            "sudah ada di /kaggle/working/out/ dari giliran sebelumnya atau dari tool "
-            "lain (video, gambar, konversi, download): kapan pun kamu menyerahkan file "
-            "ke pengguna, akhiri jawabanmu dengan marker [[file:...]] untuk file itu, "
-            "satu marker per file. Kartu, path file di teks, atau 'Download link' "
-            "BUKAN pengiriman — jangan pernah mengarang link atau URL download, dan "
-            "jangan PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output "
-            "Kaggle', 'buka notebook', atau pakai wget — mereka tidak punya akses ke "
-            "situ. Sebelum selesai, periksa: kalau jawabanmu menyebut file di out/, "
-            "marker [[file:...]] untuk file itu harus ada di jawabanmu. Folder juga "
-            "boleh (akan otomatis di-zip). "
+            "[[file:/kaggle/working/out/NAMA_FILE]] di jawabanmu — ini satu-satunya cara "
+            "mengirim file ke pengguna; folder juga boleh (akan otomatis di-zip). Jangan "
+            "PERNAH menyuruh pengguna 'download dari Kaggle', 'cek output Kaggle', "
+            "'buka notebook', atau instruksi sejenis — mereka tidak punya akses ke situ. "
             "RICH UI: untuk struktur, alur, perbandingan, linimasa, data, atau langkah — "
             "jangan hanya pakai markdown. Kirim blok ```ui berisi SATU objek JSON (tanpa teks "
             "lain di dalam blok). Jenis yang tersedia:\n"
@@ -310,28 +298,28 @@ def rules_text(lang, order=RULE_ORDER, sep="\n\n"):
 # ---------------------------------------------------------------------------
 
 def build_context_note(context, lang="en", side="cloud"):
-    """[CURRENT CONTEXT] (cloud, en) / [KONTEKS SAAT INI] (worker, id): who the
-    user is, where they are, and their real time/date right now, plus where the
-    agent itself runs. Cloud returns None when the context carries nothing at
-    all; the worker always returns the note (it also carries its own clock)."""
+    """[CURRENT CONTEXT] (cloud, en) / [KONTEKS SAAT INI] (worker, id): the real
+    time/date right now, where the agent itself runs, which model runs the
+    agent, saved instructions, and saved memories. Personal data about the user
+    (name, home, contact details) is deliberately NOT included: the agent learns
+    it only from what the user writes in chat or from saved memories. Cloud
+    returns None when the context carries nothing at all; the worker always
+    returns the note (it also carries its own clock)."""
     ctx = context if isinstance(context, dict) else {}
     tz = str(ctx.get("timezone") or "").strip()
     local_time = str(ctx.get("local_time") or "").strip()
     date_str = str(ctx.get("date") or "").strip()
     time_str = str(ctx.get("time") or "").strip()
-    user_name = str(ctx.get("user_name") or "").strip()
-    user_location = str(ctx.get("user_location") or "").strip()
     instructions = str(ctx.get("ai_instructions") or "").strip()
+    agent_model = str(ctx.get("agent_model") or "").strip()
     raw_memories = ctx.get("ai_memory") or []
     mem_lines = [str(m).strip() for m in raw_memories
                  if isinstance(raw_memories, list) and str(m).strip()]
     if side == "worker":
         now_utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
         lines = ["[KONTEKS SAAT INI]"]
-        if user_name:
-            lines.append(f"- Nama user: {user_name}. Itu nama PENGGUNA, bukan namamu. Kamu tahu namanya dari awal — pakai secara natural kalau cocok, dan jawab kalau dia bertanya siapa namanya.")
-        if user_location:
-            lines.append(f"- Lokasi user: {user_location}.")
+        if agent_model:
+            lines.append(f"- Model yang menjalanmu: {agent_model}. Itulah identitasmu — saat ditanya siapa atau kamu itu apa, jawab dengan nama model ini, jangan mengarang nama lain.")
         if instructions:
             lines.append(f"- Instruksi khusus dari user (disimpan, selalu patuhi): {instructions}")
         if mem_lines:
@@ -349,18 +337,16 @@ def build_context_note(context, lang="en", side="cloud"):
             lines.append(when)
         lines.append(f"- Waktumu sekarang (worker Kaggle, UTC): {now_utc} UTC.")
         lines.append("- Wilayahmu: kernel Kaggle (cloud Google), zona waktu UTC; backend di Oregon, Amerika Serikat. Kamu TIDAK berada di lokasi user.")
-        if tz and not user_location:
-            lines.append(f"- Wilayah user: zona waktu {tz}.")
-        lines.append("Pakai info ini untuk pertanyaan tentang nama, waktu, tanggal, dan tempat. "
-                     "Jangan menebak kota user dari zona waktu saja.")
+        lines.append("Pakai info ini untuk pertanyaan tentang waktu, tanggal, dan identitasmu. "
+                     "Data diri user (nama, tempat tinggal, kontak) tidak disertakan di sini — "
+                     "ketahuilah hanya dari apa yang user tulis sendiri di chat atau dari ingatan "
+                     "tersimpan, dan jangan menebaknya dari zona waktu.")
         return "\n".join(lines)
-    if not local_time and not tz and not date_str and not time_str and not user_name and not user_location and not instructions and not mem_lines:
+    if not local_time and not tz and not date_str and not time_str and not instructions and not agent_model and not mem_lines:
         return None
     parts = ["[CURRENT CONTEXT]"]
-    if user_name:
-        parts.append(f"The user you are talking to is {user_name} — that is the USER's name, not yours. You know their name from the start — use it naturally when it fits, and answer if they ask for their own name.")
-    if user_location:
-        parts.append(f"The user is in {user_location}.")
+    if agent_model:
+        parts.append(f"You are running as the model {agent_model}. That model name is your identity — when asked who or what you are, answer with it; never invent a different name.")
     if instructions:
         parts.append(f"Saved instructions from the user (always follow them): {instructions}")
     if mem_lines:
@@ -377,8 +363,11 @@ def build_context_note(context, lang="en", side="cloud"):
             when += f" ({tz})"
         parts.append(when + ".")
     elif tz:
-        parts.append(f"User's timezone: {tz}.")
-    parts.append("Backend runs in Oregon, USA. Use this for time, date, and place questions; do not guess the user's city from the timezone alone.")
+        parts.append(f"Current timezone: {tz}.")
+    parts.append("Backend runs in Oregon, USA. Use this for time, date, and identity questions. "
+                 "Personal data about the user (name, home, contact details) is not provided here — "
+                 "learn it only from what the user writes in chat or from saved memories, and never "
+                 "guess it from the timezone.")
     return "\n".join(parts)
 
 
